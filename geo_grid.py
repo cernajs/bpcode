@@ -7,6 +7,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
@@ -27,6 +28,8 @@ SEQ_LEN = 50
 
 LATENT_DIM = 32
 HIDDEN_DIM = 128
+RECON_LOSS_WEIGHT = 1.0
+IMG_DOWNSAMPLE = 3  # simple stride downsample of rendered frames
 
 GAMMA = 0.99
 
@@ -78,18 +81,54 @@ def set_seed(seed: int = 0):
     torch.manual_seed(seed)
 
 
+def downsample_image(img: np.ndarray, factor: int = IMG_DOWNSAMPLE):
+    if factor <= 1:
+        return img
+    return img[::factor, ::factor]
+
+
+class PixelObsWrapper(gym.Wrapper):
+    """
+    Replace state observations with rendered RGB frames (downsampled).
+    """
+    def __init__(self, env_id: str, downsample: int = IMG_DOWNSAMPLE):
+        env = gym.make(env_id, render_mode="rgb_array")
+        super().__init__(env)
+        self.downsample = downsample
+        # Probe to set observation space
+        obs, _ = self.env.reset()
+        img = downsample_image(self.env.render(), self.downsample)
+        self.obs_shape = img.shape
+        self.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=self.obs_shape, dtype=np.uint8
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        img = downsample_image(self.env.render(), self.downsample)
+        return img, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        img = downsample_image(self.env.render(), self.downsample)
+        return img, reward, terminated, truncated, info
+
+
 # ===============================
 #  Replay Buffer
 # ===============================
 
 class ReplayBuffer:
-    def __init__(self, capacity: int, obs_dim: int, act_dim: int):
+    def __init__(self, capacity: int, obs_shape, act_dim: int):
+        """
+        obs_shape: (H, W, C) pixel observations stored as uint8 for memory efficiency.
+        """
         self.capacity = capacity
-        self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.obs = np.zeros((capacity, *obs_shape), dtype=np.uint8)
         self.actions = np.zeros((capacity, act_dim), dtype=np.float32)
         self.rews = np.zeros(capacity, dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.float32)
-        self.next_obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, *obs_shape), dtype=np.uint8)
 
         self.idx = 0
         self.size = 0
@@ -160,20 +199,85 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class Encoder(nn.Module):
-    def __init__(self, obs_dim, latent_dim=LATENT_DIM):
+class ConvEncoder(nn.Module):
+    """
+    Lightweight CNN encoder for pixel observations (C, H, W) -> latent.
+    Uses three stride-2 conv blocks to downsample.
+    """
+    def __init__(self, obs_shape, latent_dim=LATENT_DIM):
         super().__init__()
-        self.net = MLP(obs_dim, latent_dim)
+        c, h, w = obs_shape
+        self.conv = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+        )
+        # determine flattened size dynamically
+        with torch.no_grad():
+            dummy = torch.zeros(1, c, h, w)
+            out = self.conv(dummy)
+            self.conv_out_shape = out.shape[1:]  # (C, H, W)
+            conv_out_size = out.view(1, -1).size(1)
+        self.fc = nn.Linear(conv_out_size, latent_dim)
 
     def forward(self, obs):
-        # obs: [B, T, obs_dim] or [B, obs_dim]
-        if obs.dim() == 3:
-            B, T, D = obs.shape
-            x = obs.reshape(B * T, D)
-            z = self.net(x)
-            return torch.tanh(z).reshape(B, T, -1)
-        else:  # [B, D]
-            return torch.tanh(self.net(obs))
+        """
+        obs: [B, T, C, H, W] or [B, C, H, W]
+        """
+        if obs.dim() == 5:
+            B, T, C, H, W = obs.shape
+            x = obs.reshape(B * T, C, H, W)
+            x = x.contiguous()
+            z = self.fc(self.conv(x).view(B * T, -1))
+            return torch.tanh(z).view(B, T, -1)
+        else:
+            obs = obs.contiguous()
+            z = self.fc(self.conv(obs).view(obs.size(0), -1))
+            return torch.tanh(z)
+
+
+class ConvDecoder(nn.Module):
+    """
+    Lightweight CNN decoder: latent -> reconstructed pixels in [0,1].
+    Mirrors ConvEncoder with transposed convolutions.
+    """
+    def __init__(self, latent_dim: int, conv_out_shape):
+        super().__init__()
+        c, h, w = conv_out_shape
+        self.h = h
+        self.w = w
+        self.fc = nn.Linear(latent_dim, c * h * w)
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose2d(c, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z):
+        """
+        z: [B, T, latent_dim] or [B, latent_dim]
+        """
+        if z.dim() == 3:
+            B, T, D = z.shape
+            x = z.reshape(B * T, D)
+        else:
+            B, D = z.shape
+            x = z
+        x = x.contiguous()
+        x = self.fc(x)
+        x = x.view(x.size(0), -1, self.h, self.w)
+        x = self.deconv(x)
+        x = x.contiguous()
+        if z.dim() == 3:
+            return x.view(B, T, 3, x.size(-2), x.size(-1)).contiguous()
+        else:
+            return x.contiguous()
 
 
 class DynamicsModel(nn.Module):
@@ -253,7 +357,8 @@ def pearsonr_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def world_model_loss(batch: ReplayBuffer.Batch,
-                     encoder: Encoder,
+                     encoder: ConvEncoder,
+                     decoder: ConvDecoder,
                      dynamics: DynamicsModel,
                      reward_model: RewardModel,
                      device,
@@ -270,12 +375,13 @@ def world_model_loss(batch: ReplayBuffer.Batch,
       extras: optional tensors for visualization (latent histograms)
     """
 
-    obs = torch.tensor(batch.obs, dtype=torch.float32, device=device)              # [B, T, obs_dim]
+    obs = torch.tensor(batch.obs, dtype=torch.float32, device=device) / 255.0      # [B, T, H, W, C]
+    obs = obs.permute(0, 1, 4, 2, 3)                                               # [B, T, C, H, W]
     actions = torch.tensor(batch.actions, dtype=torch.float32, device=device)      # [B, T, act_dim]
     rews = torch.tensor(batch.rews, dtype=torch.float32, device=device)            # [B, T]
     dones = torch.tensor(batch.dones, dtype=torch.float32, device=device)          # [B, T]
 
-    B, T, _ = obs.shape
+    B, T, C, H, W = obs.shape
 
     # Encode observations to latent
     z = encoder(obs)                      # [B, T, latent_dim]
@@ -304,12 +410,22 @@ def world_model_loss(batch: ReplayBuffer.Batch,
                           a_t.reshape(-1, a_t.size(-1)))
     r_pred = r_pred.view(B, T - 1)
 
+    # Reconstruction loss (decoder)
+    recon = decoder(z)  # [B, T, 3, H_dec, W_dec] or [B, 3, H_dec, W_dec]
+    if recon.dim() == 5:
+        recon = recon.view(B * T, 3, recon.size(-2), recon.size(-1))
+    target = obs.reshape(B * T, 3, H, W)
+    # Adjust recon size to match target if needed
+    if recon.shape[-2:] != target.shape[-2:]:
+        recon = F.interpolate(recon, size=target.shape[-2:], mode="bilinear", align_corners=False)
+    mse = nn.MSELoss()
+    L_recon = mse(recon, target)
+
     # One-step dynamics loss with masking over valid transitions
     dyn_err = (z_tp1_pred - z_tp1_target.detach()).pow(2).sum(-1)  # [B, T-1]
     L_dyn = (dyn_err * mask).sum() / mask.sum().clamp_min(1.0)
 
     # Reward loss (no masking needed: last reward before done is still valid)
-    mse = nn.MSELoss()
     L_r = mse(r_pred, r_t)
 
     # Geodesic rollout alignment (multi-step) with mask
@@ -320,7 +436,7 @@ def world_model_loss(batch: ReplayBuffer.Batch,
 
     # Euclidean distance as proxy for latent geodesic
     geo_dist = torch.sqrt(torch.clamp((z_roll - z_true_seq.detach()).pow(2).sum(-1), min=1e-8))  # [B, T-1]
-    geo_dist = torch.clamp(geo_dist, max=BISIM_CLIP_VALUE)
+    #geo_dist = torch.clamp(geo_dist, max=BISIM_CLIP_VALUE)
     geo_err = (geo_dist ** 2) * mask
     L_geo = geo_err.sum() / mask.sum().clamp_min(1.0)
 
@@ -338,9 +454,9 @@ def world_model_loss(batch: ReplayBuffer.Batch,
     v1, v2 = v_flat[idx1], v_flat[idx2]
     value_diff = (v1 - v2).abs()
 
-    value_diff = torch.clamp(value_diff, max=BISIM_CLIP_VALUE)
+    #value_diff = torch.clamp(value_diff, max=BISIM_CLIP_VALUE)
     dist = torch.sqrt(torch.clamp((z1 - z2).pow(2).sum(-1), min=1e-8))
-    dist = torch.clamp(dist, max=BISIM_CLIP_VALUE)
+    #dist = torch.clamp(dist, max=BISIM_CLIP_VALUE)
     # Regress distance toward value difference
     L_bisim = ((dist - value_diff.detach()) ** 2).mean()
 
@@ -377,6 +493,7 @@ def world_model_loss(batch: ReplayBuffer.Batch,
     loss = L_dyn + REWARD_LOSS_WEIGHT * L_r
     loss = loss + alpha_geo * L_geo + alpha_bisim * L_bisim
     loss = loss + LATENT_NORM_WEIGHT * latent_reg + LATENT_STD_WEIGHT * latent_std_loss
+    loss = loss + RECON_LOSS_WEIGHT * L_recon
 
     # Collect scalar logs (loss components)
     logs.update({
@@ -386,6 +503,7 @@ def world_model_loss(batch: ReplayBuffer.Batch,
         "L_bisim": L_bisim.item(),
         "L_latent_reg": latent_reg.item(),
         "L_latent_std": latent_std_loss.item(),
+        "L_recon": L_recon.item(),
     })
 
     # Optional extras for histograms
@@ -477,7 +595,7 @@ def cem_plan(z0: torch.Tensor,
 # ===============================
 
 def visualize_geometry(batch: ReplayBuffer.Batch,
-                       encoder: Encoder,
+                       encoder: ConvEncoder,
                        device,
                        gamma: float,
                        save_path: str,
@@ -490,7 +608,8 @@ def visualize_geometry(batch: ReplayBuffer.Batch,
     scale used in training for L_bisim. This makes the relationship much clearer.
     """
 
-    obs = torch.tensor(batch.obs, dtype=torch.float32, device=device)    # [B, T, obs_dim]
+    obs = torch.tensor(batch.obs, dtype=torch.float32, device=device) / 255.0  # [B, T, H, W, C]
+    obs = obs.permute(0, 1, 4, 2, 3)  # [B, T, C, H, W]
     rews = torch.tensor(batch.rews, dtype=torch.float32, device=device)  # [B, T]
     dones = torch.tensor(batch.dones, dtype=torch.float32, device=device)# [B, T]
 
@@ -512,9 +631,10 @@ def visualize_geometry(batch: ReplayBuffer.Batch,
         dist = torch.sqrt(torch.clamp((z1 - z2).pow(2).sum(-1), min=1e-8)).cpu().numpy()
         val_diff = (v1 - v2).abs().cpu().numpy()
 
+    """
     if clip_to_bisim:
         val_diff = np.minimum(val_diff, BISIM_CLIP_VALUE)
-
+    """
     # Build binned profile: mean |Δvalue| per distance bin
     if dist.max() > 0:
         bins = np.linspace(0.0, dist.max(), num_bins + 1)
@@ -539,7 +659,7 @@ def visualize_geometry(batch: ReplayBuffer.Batch,
     plt.figure(figsize=(7, 6))
     plt.scatter(dist, val_diff, alpha=0.05, s=5, label="pairs")
     plt.xlabel("Latent distance ||z_i - z_j||")
-    plt.ylabel(f"Value difference |G_i - G_j| (clipped to {BISIM_CLIP_VALUE})"
+    plt.ylabel(f"Value difference |G_i - G_j| )"
                if clip_to_bisim else "Value difference |G_i - G_j|")
 
     # Overlay line for bins
@@ -565,14 +685,14 @@ def visualize_geometry(batch: ReplayBuffer.Batch,
 # ===============================
 
 def evaluate_env(env_id,
-                 encoder: Encoder,
+                 encoder: ConvEncoder,
                  dynamics: DynamicsModel,
                  reward_model: RewardModel,
                  horizon: int,
                  episodes: int = 5,
                  device=None):
     device = device or get_device()
-    env = gym.make(env_id)
+    env = PixelObsWrapper(env_id, downsample=IMG_DOWNSAMPLE)
     returns = []
 
     for _ in range(episodes):
@@ -581,7 +701,8 @@ def evaluate_env(env_id,
         ep_ret = 0.0
 
         while not done:
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)  # [1, obs_dim]
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device) / 255.0
+            obs_t = obs_t.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
             with torch.no_grad():
                 z0 = encoder(obs_t)  # [1, latent_dim]
                 action = cem_plan(z0, dynamics, reward_model, env.action_space,
@@ -601,12 +722,15 @@ def main():
     device = get_device()
     print("Using device:", device)
 
-    env = gym.make(ENV_ID)
+    env = PixelObsWrapper(ENV_ID, downsample=IMG_DOWNSAMPLE)
     obs, _ = env.reset()
-    obs_dim = env.observation_space.shape[0]
+    obs_shape = env.observation_space.shape  # (H, W, C)
+    # Convert to (C, H, W) for model shapes
+    c, h, w = obs_shape[2], obs_shape[0], obs_shape[1]
     act_dim = env.action_space.shape[0]
 
-    encoder = Encoder(obs_dim, LATENT_DIM).to(device)
+    encoder = ConvEncoder((c, h, w), LATENT_DIM).to(device)
+    decoder = ConvDecoder(LATENT_DIM, encoder.conv_out_shape).to(device)
     dynamics = DynamicsModel(LATENT_DIM, act_dim).to(device)
     reward_model = RewardModel(LATENT_DIM, act_dim).to(device)
 
@@ -621,11 +745,12 @@ def main():
         run_name = f"{RUN_BASE_NAME}_baseline"
 
     world_model_params = list(encoder.parameters()) + \
+                         list(decoder.parameters()) + \
                          list(dynamics.parameters()) + \
                          list(reward_model.parameters())
     optimizer = torch.optim.Adam(world_model_params, lr=1e-4, weight_decay=1e-4)
 
-    replay = ReplayBuffer(capacity=100_000, obs_dim=obs_dim, act_dim=act_dim)
+    replay = ReplayBuffer(capacity=100_000, obs_shape=obs_shape, act_dim=act_dim)
 
     writer = SummaryWriter(log_dir=f"runs/{run_name}")
 
@@ -641,7 +766,8 @@ def main():
         if global_step < RANDOM_STEPS:
             action = env.action_space.sample()
         else:
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device) / 255.0
+            obs_t = obs_t.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
             with torch.no_grad():
                 z0 = encoder(obs_t)
                 action = cem_plan(z0, dynamics, reward_model, env.action_space,
@@ -650,10 +776,10 @@ def main():
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
 
-        replay.add(np.asarray(obs, dtype=np.float32),
+        replay.add(np.asarray(obs, dtype=np.uint8),
                    np.asarray(action, dtype=np.float32),
                    float(reward),
-                   np.asarray(next_obs, dtype=np.float32),
+                   np.asarray(next_obs, dtype=np.uint8),
                    done)
 
         episode_return += reward
@@ -679,6 +805,7 @@ def main():
                 loss, logs, extras = world_model_loss(
                     batch,
                     encoder,
+                    decoder,
                     dynamics,
                     reward_model,
                     device=device,
