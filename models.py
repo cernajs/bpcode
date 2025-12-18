@@ -174,9 +174,9 @@ class RSSM(nn.Module):
         a_t = torch.zeros(N, self.act_dim).to(dev) if a_t is None else a_t
         h_tp1 = self.deterministic_state_fwd(h_t, s_t, a_t)
         if mean:
-            s_tp1 = self.state_posterior(h_tp1, enc)
+            s_tp1, _ = self.state_posterior(h_tp1, enc)
         else:
-            s_tp1, _ = self.state_posterior(h_tp1, enc, sample=True)
+            s_tp1 = self.state_posterior(h_tp1, enc, sample=True)
         return h_tp1, s_tp1
 
     def observe(self, embeds, actions):
