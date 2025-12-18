@@ -4,10 +4,11 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
+from torch.utils.tensorboard import SummaryWriter
 
 from utils import PixelObsWrapper, ReplayBuffer, get_device, set_seed, preprocess_img, bottle
 
-from models import VisualEncoder, VisualDecoder, RSSM, RewardModel
+from models import ConvEncoder, ConvDecoder, RSSM, RewardModel
 
 # ===============================
 #  Losses / Regularizers
@@ -238,6 +239,10 @@ def build_parser():
     p.add_argument("--plan_every", type=int, default=1)
     p.add_argument("--explore_noise", type=float, default=0.3)  # exploration noise (reference uses 0.3)
 
+    # TensorBoard logging
+    p.add_argument("--run_name", type=str, default="geojacobreg", help="Name for TensorBoard run")
+    p.add_argument("--log_dir", type=str, default="runs", help="Directory for TensorBoard logs")
+
     return p
 
 
@@ -250,6 +255,13 @@ def main(args):
     device = get_device()
     print("Using device:", device)
 
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir=f"{args.log_dir}/{args.run_name}")
+    
+    # Log hyperparameters
+    hparams = vars(args)
+    writer.add_text("hyperparameters", str(hparams), 0)
+
     # Use num_stack=1 like reference (single frame, not stacked)
     env = PixelObsWrapper(args.env_id, img_size=(args.img_size, args.img_size), num_stack=1)
     obs, _ = env.reset()
@@ -260,8 +272,8 @@ def main(args):
     act_high = env.action_space.high
 
     # Models matching reference architecture
-    encoder = VisualEncoder(embedding_size=args.embed_dim, in_channels=C).to(device)
-    decoder = VisualDecoder(
+    encoder = ConvEncoder(embedding_size=args.embed_dim, in_channels=C).to(device)
+    decoder = ConvDecoder(
         state_size=args.deter_dim,
         latent_size=args.stoch_dim,
         embedding_size=args.embed_dim,
@@ -296,6 +308,7 @@ def main(args):
 
     step = 0
     episode_return = 0.0
+    episode_count = 0
     
     # Initialize belief state
     with torch.no_grad():
@@ -365,6 +378,11 @@ def main(args):
             h_state, s_state, _, _ = rssm.observe_step(enc, act_t, h_state, s_state, sample=False)
 
         if done:
+            episode_count += 1
+            # Log episode metrics to TensorBoard
+            writer.add_scalar("train/episode_return", episode_return, step)
+            writer.add_scalar("train/episode_count", episode_count, step)
+            
             obs, _ = env.reset()
             episode_return = 0.0
             with torch.no_grad():
@@ -377,6 +395,9 @@ def main(args):
         # -------- train --------
         if step >= args.start_steps and step % args.update_every == 0 and replay.size > (args.seq_len + 2):
             encoder.train(); decoder.train(); rssm.train(); reward_model.train()
+            
+            # Accumulators for logging average losses over updates
+            loss_accum = {"total": 0.0, "rec": 0.0, "kl": 0.0, "rew": 0.0, "pb": 0.0, "bisim": 0.0}
 
             for upd in range(args.updates_per_step):
                 # Sample sequences: obs[0:T], actions[0:T-1], rewards[0:T-1]
@@ -497,6 +518,14 @@ def main(args):
                     torch.nn.utils.clip_grad_norm_(params, args.grad_clip_norm, norm_type=2)
                 optim.step()
 
+                # Accumulate losses for logging
+                loss_accum["total"] += total.item()
+                loss_accum["rec"] += rec_loss.item()
+                loss_accum["kl"] += kld_loss.item()
+                loss_accum["rew"] += rew_loss.item()
+                loss_accum["pb"] += pb_loss.item()
+                loss_accum["bisim"] += bisim_loss_val.item()
+
                 if (upd + 1) % 10 == 0:
                     print(
                         f"[step={step}] upd={upd+1}/{args.updates_per_step} "
@@ -504,6 +533,15 @@ def main(args):
                         f"kl={kld_loss.item():.4f} r={rew_loss.item():.4f} "
                         f"pb={pb_loss.item():.4f} bisim={bisim_loss_val.item():.4f}"
                     )
+            
+            # Log average losses to TensorBoard
+            n_updates = args.updates_per_step
+            writer.add_scalar("loss/total", loss_accum["total"] / n_updates, step)
+            writer.add_scalar("loss/reconstruction", loss_accum["rec"] / n_updates, step)
+            writer.add_scalar("loss/kl_divergence", loss_accum["kl"] / n_updates, step)
+            writer.add_scalar("loss/reward", loss_accum["rew"] / n_updates, step)
+            writer.add_scalar("loss/pullback_curvature", loss_accum["pb"] / n_updates, step)
+            writer.add_scalar("loss/bisimulation", loss_accum["bisim"] / n_updates, step)
 
         # -------- eval --------
         if step % 5_000 == 0:
@@ -528,8 +566,14 @@ def main(args):
                 bit_depth=args.bit_depth,
             )
             print(f"[step={step}] Eval return: {mean_ret:.2f} ± {std_ret:.2f}")
+            
+            # Log evaluation metrics to TensorBoard
+            writer.add_scalar("eval/mean_return", mean_ret, step)
+            writer.add_scalar("eval/std_return", std_ret, step)
 
     env.close()
+    writer.close()
+    print(f"TensorBoard logs saved to: {args.log_dir}/{args.run_name}")
 
 
 if __name__ == "__main__":
