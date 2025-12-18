@@ -1,0 +1,6 @@
+gymnasium==1.1.1
+gymnasium==1.0.0
+matplotlib==3.10.8
+numpy==2.3.5
+opencv_python==4.11.0.86
+torch==2.6.0
