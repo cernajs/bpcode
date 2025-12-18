@@ -154,7 +154,7 @@ def evaluate_planner_rssm(
         ep_ret = 0.0
         
         # Initialize state
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+        obs_t = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
         preprocess_img(obs_t, depth=bit_depth)
         enc = encoder(obs_t)
         h_state, s_state = rssm.get_init_state(enc)
@@ -182,7 +182,7 @@ def evaluate_planner_rssm(
             ep_ret += total_reward
             
             # Update state with observation
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+            obs_t = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
             preprocess_img(obs_t, depth=bit_depth)
             enc = encoder(obs_t)
             act_t = torch.tensor(action, dtype=torch.float32, device=device).unsqueeze(0)
@@ -377,10 +377,10 @@ def main(args):
             done = bool(term or trunc)
             
             replay.add(
-                obs=np.asarray(obs, dtype=np.uint8),
+                obs=np.ascontiguousarray(obs, dtype=np.uint8),
                 action=np.asarray(action, dtype=np.float32),
                 reward=total_reward,
-                next_obs=np.asarray(next_obs, dtype=np.uint8),
+                next_obs=np.ascontiguousarray(next_obs, dtype=np.uint8),
                 done=done
             )
             ep_return += total_reward
@@ -402,7 +402,7 @@ def main(args):
         
         # Initialize belief state for this episode
         with torch.no_grad():
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+            obs_t = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
             preprocess_img(obs_t, depth=args.bit_depth)
             enc = encoder(obs_t)
             h_state, s_state = rssm.get_init_state(enc)
@@ -437,10 +437,10 @@ def main(args):
             done = bool(term or trunc)
 
             replay.add(
-                obs=np.asarray(obs, dtype=np.uint8),
+                obs=np.ascontiguousarray(obs, dtype=np.uint8),
                 action=action,
                 reward=total_reward,
-                next_obs=np.asarray(next_obs, dtype=np.uint8),
+                next_obs=np.ascontiguousarray(next_obs, dtype=np.uint8),
                 done=done
             )
 
@@ -451,7 +451,7 @@ def main(args):
 
             # Update belief state
             with torch.no_grad():
-                obs_t = torch.tensor(obs, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+                obs_t = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
                 preprocess_img(obs_t, depth=args.bit_depth)
                 enc = encoder(obs_t)
                 act_t = torch.tensor(action, dtype=torch.float32, device=device).unsqueeze(0)
