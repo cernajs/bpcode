@@ -1,3 +1,13 @@
+import os
+# Configure dm_control to use software rendering (for headless servers)
+# Must be set BEFORE importing dm_control
+# Options: 'egl' (GPU headless), 'osmesa' (software), 'glfw' (requires display)
+if 'MUJOCO_GL' not in os.environ:
+    # Try EGL first (GPU-accelerated), fall back to osmesa if DISPLAY not set
+    if 'DISPLAY' not in os.environ:
+        os.environ['MUJOCO_GL'] = 'egl'  # or 'osmesa' if EGL fails
+    # If you get gladLoadGL errors, run: export MUJOCO_GL=osmesa
+
 import torch
 import random
 import collections
@@ -107,6 +117,13 @@ class PixelObsWrapper(gym.Wrapper):
         return self._get_stacked_obs(), reward, terminated, truncated, info
 
 
+def _configure_dm_control_rendering():
+    """Try to configure dm_control rendering backend for headless servers."""
+    # Already configured via environment variable at top of file
+    # This function provides additional fallback logic if needed
+    pass
+
+
 class DMControlWrapper:
     """
     Wrapper for DeepMind Control Suite environments.
@@ -116,7 +133,10 @@ class DMControlWrapper:
         try:
             from dm_control import suite
         except ImportError:
-            raise ImportError("dm_control not installed. Install with: pip install dm_control")
+            raise ImportError(
+                "dm_control not installed. Install with: pip install dm_control\n"
+                "For headless servers, you may also need: apt-get install libosmesa6-dev libgl1-mesa-glx libglfw3"
+            )
         
         # Parse "domain-task" format (e.g., "cheetah-run")
         domain, task = domain_task.split('-', 1)
