@@ -109,11 +109,13 @@ class RSSM(nn.Module):
         self.lat_act_layer = nn.Linear(stoch_dim + act_dim, deter_dim)
         
         # Prior network: h -> (mean, std) - single hidden layer
+        # latent state prediction no observation
         self.fc_prior_1 = nn.Linear(deter_dim, hidden_dim)
         self.fc_prior_m = nn.Linear(hidden_dim, stoch_dim)
         self.fc_prior_s = nn.Linear(hidden_dim, stoch_dim)
         
         # Posterior network: [h, e] -> (mean, std) - single hidden layer  
+        # latent state pred with observation
         self.fc_posterior_1 = nn.Linear(deter_dim + embed_dim, hidden_dim)
         self.fc_posterior_m = nn.Linear(hidden_dim, stoch_dim)
         self.fc_posterior_s = nn.Linear(hidden_dim, stoch_dim)

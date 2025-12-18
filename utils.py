@@ -6,8 +6,21 @@ import numpy as np
 import cv2
 from dataclasses import dataclass
 
-__all__ = ['PixelObsWrapper', 'ReplayBuffer', 'get_device', 'set_seed', 
-           'preprocess_img', 'postprocess_img', 'bottle']
+__all__ = ['PixelObsWrapper', 'DMControlWrapper', 'ReplayBuffer', 'get_device', 'set_seed', 
+           'preprocess_img', 'postprocess_img', 'bottle', 'make_env', 'ENV_ACTION_REPEAT']
+
+# Reference PlaNet action repeat settings per environment
+ENV_ACTION_REPEAT = {
+    'cartpole-swingup': 8,
+    'reacher-easy': 4,
+    'cheetah-run': 4,
+    'finger-spin': 2,
+    'ball_in_cup-catch': 4,
+    'walker-walk': 2,
+    # Gymnasium fallbacks
+    'Pendulum-v1': 2,
+    'MountainCarContinuous-v0': 4,
+}
 
 def get_device():
     if torch.backends.mps.is_available():
@@ -52,6 +65,7 @@ def bottle(func, *tensors):
 
 
 class PixelObsWrapper(gym.Wrapper):
+    """Wrapper for Gymnasium environments to provide pixel observations."""
     def __init__(self, env_id: str, img_size=(64, 64), num_stack=1):
         env = gym.make(env_id, render_mode="rgb_array")
         super().__init__(env)
@@ -91,6 +105,84 @@ class PixelObsWrapper(gym.Wrapper):
         img = self._get_obs()
         self.frames.append(img)
         return self._get_stacked_obs(), reward, terminated, truncated, info
+
+
+class DMControlWrapper:
+    """
+    Wrapper for DeepMind Control Suite environments.
+    Standard benchmark for PlaNet: cheetah-run, reacher-easy, ball_in_cup-catch, finger-spin, cartpole-swingup, walker-walk
+    """
+    def __init__(self, domain_task: str, img_size=(64, 64), num_stack=1):
+        try:
+            from dm_control import suite
+        except ImportError:
+            raise ImportError("dm_control not installed. Install with: pip install dm_control")
+        
+        # Parse "domain-task" format (e.g., "cheetah-run")
+        domain, task = domain_task.split('-', 1)
+        self.env = suite.load(domain, task)
+        
+        self.img_size = img_size
+        self.num_stack = num_stack
+        self.frames = collections.deque(maxlen=num_stack)
+        
+        # Get action spec
+        action_spec = self.env.action_spec()
+        self.action_space = gym.spaces.Box(
+            low=action_spec.minimum.astype(np.float32),
+            high=action_spec.maximum.astype(np.float32),
+            dtype=np.float32
+        )
+        
+        # Observation space (pixel-based)
+        obs_shape = (img_size[0], img_size[1], 3 * num_stack)
+        self.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=obs_shape, dtype=np.uint8
+        )
+
+    def _get_obs(self):
+        img = self.env.physics.render(height=self.img_size[0], width=self.img_size[1], camera_id=0)
+        return img  # Returns (H, W, C) uint8
+
+    def _get_stacked_obs(self):
+        if self.num_stack == 1:
+            return list(self.frames)[0]
+        return np.concatenate(list(self.frames), axis=-1)
+
+    def reset(self, **kwargs):
+        time_step = self.env.reset()
+        img = self._get_obs()
+        for _ in range(self.num_stack):
+            self.frames.append(img)
+        return self._get_stacked_obs(), {}
+
+    def step(self, action):
+        time_step = self.env.step(action)
+        img = self._get_obs()
+        self.frames.append(img)
+        
+        reward = time_step.reward or 0.0
+        terminated = time_step.last()
+        truncated = False
+        
+        return self._get_stacked_obs(), reward, terminated, truncated, {}
+
+    def close(self):
+        pass
+
+
+def make_env(env_id: str, img_size=(64, 64), num_stack=1):
+    """
+    Create environment - supports both dm_control (domain-task format) and gymnasium.
+    
+    dm_control envs: "cheetah-run", "reacher-easy", "ball_in_cup-catch", "finger-spin", "cartpole-swingup", "walker-walk"
+    gymnasium envs: "Pendulum-v1", "MountainCarContinuous-v0", etc.
+    """
+    # Check if it's a dm_control env (contains hyphen but no version suffix like -v1)
+    if '-' in env_id and not any(env_id.endswith(f'-v{i}') for i in range(10)):
+        return DMControlWrapper(env_id, img_size=img_size, num_stack=num_stack)
+    else:
+        return PixelObsWrapper(env_id, img_size=img_size, num_stack=num_stack)
 
 
 # ===============================
