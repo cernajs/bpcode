@@ -51,12 +51,17 @@ def compute_pullback_curvature_loss(decoder, h, s, num_projections=4, detach_fea
 
     return loss / float(num_projections)
 
+def normalize_z(z, eps=1e-8):
+    return z / (torch.norm(z, p=2, dim=1, keepdim=True) + eps)
 
 def bisimulation_loss(z1, z2, r1, r2, next_z1, next_z2, gamma=0.99):
+    z1 = normalize_z(z1); z2 = normalize_z(z2);
     dz = torch.norm(z1 - z2, p=2, dim=1)              # [B]
-    dnext = torch.norm(next_z1 - next_z2, p=2, dim=1) # [B]
-    dr = torch.abs(r1 - r2).view(-1)                  # [B]
-    target = dr + gamma * dnext
+    with torch.no_grad():
+        next_z1 = normalize_z(next_z1); next_z2 = normalize_z(next_z2);
+        dnext = torch.norm(next_z1 - next_z2, p=2, dim=1) # [B]
+        dr = torch.abs(r1 - r2).view(-1)                  # [B]
+        target = dr + gamma * dnext
     return F.mse_loss(dz, target)
 
 
