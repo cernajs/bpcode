@@ -242,6 +242,8 @@ def build_parser():
     p.add_argument("--pb_detach_features", action="store_true")
 
     p.add_argument("--bisimulation_weight", type=float, default=0.0, help="Bisimulation loss weight")
+    p.add_argument("--bisimulation_warmup", type=int, default=50_000, help="Bisimulation warmup steps")
+    p.add_argument("--bisimulation_ramp", type=int, default=100_000, help="Bisimulation ramp steps")
 
     # CEM planner (reference defaults)
     p.add_argument("--plan_horizon", type=int, default=12, help="Reference: 12")
@@ -545,22 +547,40 @@ def main(args):
                         )
 
                     bisim_loss_val = torch.zeros((), device=device)
-                    if args.bisimulation_weight > 0.0 and T > 1:
-                        z = torch.cat([h_seq, s_seq], dim=-1)
-                        z_tm1 = z[:, :-1].reshape(-1, z.size(-1))
-                        z_tp1 = z[:, 1:].reshape(-1, z.size(-1))
-                        rew_flat = rew_seq[:, :T-1].reshape(-1)
-                        
-                        n = z_tm1.size(0)
-                        if n >= 2:
-                            idx1 = torch.randint(0, n, (n,), device=device)
-                            idx2 = torch.randint(0, n, (n,), device=device)
-                            bisim_loss_val = bisimulation_loss(
-                                z_tm1[idx1], z_tm1[idx2],
-                                rew_flat[idx1], rew_flat[idx2],
-                                z_tp1[idx1], z_tp1[idx2],
-                                gamma=args.gamma
-                            )
+                    if args.bisimulation_weight > 0.0 and T > 2:
+                        # use only stochastic state
+                        z = s_seq[:, :-1]        # [B, T-1, Ds]
+                        zn = s_seq[:, 1:]        # [B, T-1, Ds]
+                        r  = rew_seq[:, :T-1]    # [B, T-1]
+
+                        # layernorm on last dim
+                        z  = F.layer_norm(z,  (z.size(-1),))
+                        zn = F.layer_norm(zn, (zn.size(-1),))
+
+                        perm = torch.randperm(B, device=device)
+
+                        z1  = z.reshape(-1, z.size(-1))
+                        z2  = z[perm].reshape(-1, z.size(-1))
+                        n1  = zn.reshape(-1, zn.size(-1))
+                        n2  = zn[perm].reshape(-1, zn.size(-1))
+                        r1  = r.reshape(-1)
+                        r2  = r[perm].reshape(-1)
+
+                        # asymmetric dz
+                        dz = torch.norm(z1 - z2.detach(), p=2, dim=1)
+
+                        with torch.no_grad():
+                            dnext = torch.norm(n1 - n2, p=2, dim=1)
+                            dr = (r1 - r2).abs()
+                            target = dr + args.gamma * dnext
+
+                        bisim_loss_val = F.mse_loss(dz, target)
+
+                    def bisim_lambda(total_steps, warmup=50_000, ramp=100_000, target=0.03):
+                        if total_steps < warmup:
+                            return 0.0
+                        t = min(1.0, (total_steps - warmup) / float(ramp))
+                        return target * t
 
                     # Total loss
                     total = (
@@ -568,7 +588,10 @@ def main(args):
                         + rec_loss 
                         + rew_loss
                         + args.pb_curvature_weight * pb_loss
-                        + args.bisimulation_weight * bisim_loss_val
+                        + bisim_lambda(total_steps,
+                         warmup=args.bisimulation_warmup,
+                         ramp=args.bisimulation_ramp,
+                         target=args.bisimulation_weight) * bisim_loss_val
                     )
 
                     optim.zero_grad()
