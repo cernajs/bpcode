@@ -53,7 +53,7 @@ def compute_pullback_curvature_loss(decoder, h, s, num_projections=4, detach_fea
 
 
 def bisimulation_loss(z1, z2, r1, r2, next_z1, next_z2, gamma=0.99):
-    dz = torch.norm(z1 - z2, p=2, dim=1)              # [B]
+    dz = torch.norm(z1 - z2.detach(), p=2, dim=1)              # [B]
     with torch.no_grad():
         dnext = torch.norm(next_z1 - next_z2, p=2, dim=1) # [B]
         dr = torch.abs(r1 - r2).view(-1)                  # [B]
@@ -62,7 +62,7 @@ def bisimulation_loss(z1, z2, r1, r2, next_z1, next_z2, gamma=0.99):
 
 
 # ===============================
-#  CEM Planner (reference implementation)
+#  CEM Planner
 # ===============================
 
 @torch.no_grad()
