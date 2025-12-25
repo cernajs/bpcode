@@ -241,6 +241,8 @@ def build_parser():
     p.add_argument("--pb_curvature_projections", type=int, default=2)
     p.add_argument("--pb_detach_features", action="store_true")
 
+    p.add_argument("--pullback_bisim", action="store_true")
+
     p.add_argument("--bisimulation_weight", type=float, default=0.0, help="Bisimulation loss weight")
     p.add_argument("--bisimulation_warmup", type=int, default=50_000, help="Bisimulation warmup steps")
     p.add_argument("--bisimulation_ramp", type=int, default=100_000, help="Bisimulation ramp steps")
@@ -282,11 +284,33 @@ def make_run_name(args):
         parts.append(f"jacobreg{args.pb_curvature_weight}")
     else:
         parts.append("no_jacobreg")
+
+    if args.pullback_bisim:
+        parts.append("pullback_bisim")
     
     # Add seed for reproducibility tracking
     parts.append(f"seed{args.seed}")
     
     return "_".join(parts)
+
+def pullback_distance_s(decoder, h, s1, s2):
+    """
+    Computes || J_s g(h, s1) · (s1 - s2) ||_2  (pullback metric at (h, s1))
+    h:  [N, Dh] treated as constant
+    s1: [N, Ds] point where Jacobian is evaluated
+    s2: [N, Ds] reference point (can be detached)
+    """
+    delta = (s1 - s2)  # [N, Ds]
+
+    # JVP wrt s only, holding h fixed
+    _, Jdelta = torch.autograd.functional.jvp(
+        lambda ss: decoder(h, ss),
+        (s1,),
+        (delta,),
+        create_graph=True,
+    )
+    Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
+    return torch.norm(Jdelta, dim=1)
 
 
 def main(args):
@@ -549,16 +573,22 @@ def main(args):
                     bisim_loss_val = torch.zeros((), device=device)
                     if args.bisimulation_weight > 0.0 and T > 2:
                         # use only stochastic state
+                        h = h_seq[:, :-1]        # [B, T-1, Dh]
+                        hn = h_seq[:, 1:]        # [B, T-1, Dh]
                         z = s_seq[:, :-1]        # [B, T-1, Ds]
                         zn = s_seq[:, 1:]        # [B, T-1, Ds]
                         r  = rew_seq[:, :T-1]    # [B, T-1]
 
-                        # layernorm on last dim
-                        z  = F.layer_norm(z,  (z.size(-1),))
-                        zn = F.layer_norm(zn, (zn.size(-1),))
+                        # layernorm on last dim if not args.pullback_bisim
+                        # then we would change geometry of decoder
+                        if not args.pullback_bisim:
+                            z  = F.layer_norm(z,  (z.size(-1),))
+                            zn = F.layer_norm(zn, (zn.size(-1),))
 
                         perm = torch.randperm(B, device=device)
 
+                        h1  = h.reshape(-1, h.size(-1))
+                        h2  = hn.reshape(-1, hn.size(-1))
                         z1  = z.reshape(-1, z.size(-1))
                         z2  = z[perm].reshape(-1, z.size(-1))
                         n1  = zn.reshape(-1, zn.size(-1))
@@ -567,10 +597,16 @@ def main(args):
                         r2  = r[perm].reshape(-1)
 
                         # asymmetric dz
-                        dz = torch.norm(z1 - z2.detach(), p=2, dim=1)
+                        if args.pullback_bisim:
+                            dz = pullback_distance_s(decoder, h1, z1, z2.detach())
+                        else:
+                            dz = torch.norm(z1 - z2.detach(), p=2, dim=1)
 
                         with torch.no_grad():
-                            dnext = torch.norm(n1 - n2, p=2, dim=1)
+                            if args.pullback_bisim:
+                                dnext = pullback_distance_s(decoder, h2, n1, n2.detach())
+                            else:
+                                dnext = torch.norm(n1 - n2, p=2, dim=1)
                             dr = (r1 - r2).abs()
                             target = dr + args.gamma * dnext
 
