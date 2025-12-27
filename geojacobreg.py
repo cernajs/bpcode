@@ -470,6 +470,12 @@ def main(args):
         list(reward_model.parameters())
     )
     optim = torch.optim.Adam(params, lr=args.lr, eps=args.adam_eps)
+    
+    # Store parameter groups for gradient norm computation
+    encoder_params = list(encoder.parameters())
+    decoder_params = list(decoder.parameters())
+    rssm_params = list(rssm.parameters())
+    reward_params = list(reward_model.parameters())
 
     replay = ReplayBuffer(args.replay_buff_capacity, obs_shape=(H, W, C), act_dim=act_dim)
 
@@ -589,6 +595,10 @@ def main(args):
                     "dz_mean": 0.0, "dz_std": 0.0,
                     "target_mean": 0.0, "target_std": 0.0,
                     "abs_err_mean": 0.0, "rel_err": 0.0, "corr": 0.0
+                }
+                grad_norm_accum = {
+                    "total": 0.0, "encoder": 0.0, "decoder": 0.0, 
+                    "rssm": 0.0, "reward": 0.0, "bisim_weighted": 0.0
                 }
                 n_bisim_computations = 0
 
@@ -782,8 +792,39 @@ def main(args):
                          target=args.bisimulation_weight) * bisim_loss_val
                     )
 
+                    # Compute bisim gradient contribution separately if needed
+                    bisim_weight = bisim_lambda(total_steps,
+                                               warmup=args.bisimulation_warmup,
+                                               ramp=args.bisimulation_ramp,
+                                               target=args.bisimulation_weight)
+                    bisim_grad_norm = 0.0
+                    if bisim_weight > 0.0 and bisim_loss_val.requires_grad:
+                        # Compute gradient norm from weighted bisim loss alone
+                        optim.zero_grad()
+                        weighted_bisim = bisim_weight * bisim_loss_val
+                        weighted_bisim.backward(retain_graph=False)
+                        bisim_grad_norm = torch.nn.utils.clip_grad_norm_(params, float('inf'), norm_type=2)
+                        optim.zero_grad()
+                    
+                    # Now compute total loss gradients
                     optim.zero_grad()
                     total.backward()
+                    
+                    # Compute gradient norms for each component (before clipping)
+                    with torch.no_grad():
+                        total_grad_norm = torch.nn.utils.clip_grad_norm_(params, float('inf'), norm_type=2)
+                        encoder_grad_norm = torch.nn.utils.clip_grad_norm_(encoder_params, float('inf'), norm_type=2) if encoder_params else torch.tensor(0.0)
+                        decoder_grad_norm = torch.nn.utils.clip_grad_norm_(decoder_params, float('inf'), norm_type=2) if decoder_params else torch.tensor(0.0)
+                        rssm_grad_norm = torch.nn.utils.clip_grad_norm_(rssm_params, float('inf'), norm_type=2) if rssm_params else torch.tensor(0.0)
+                        reward_grad_norm = torch.nn.utils.clip_grad_norm_(reward_params, float('inf'), norm_type=2) if reward_params else torch.tensor(0.0)
+                        
+                        grad_norm_accum["total"] += total_grad_norm.item()
+                        grad_norm_accum["encoder"] += encoder_grad_norm.item()
+                        grad_norm_accum["decoder"] += decoder_grad_norm.item()
+                        grad_norm_accum["rssm"] += rssm_grad_norm.item()
+                        grad_norm_accum["reward"] += reward_grad_norm.item()
+                        grad_norm_accum["bisim_weighted"] += bisim_grad_norm if isinstance(bisim_grad_norm, (int, float)) else bisim_grad_norm.item()
+                    
                     if args.grad_clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(params, args.grad_clip_norm, norm_type=2)
                     optim.step()
@@ -815,6 +856,25 @@ def main(args):
                     writer.add_scalar("bisim_stats/abs_err_mean", bisim_stats_accum["abs_err_mean"] / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/rel_err", bisim_stats_accum["rel_err"] / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/corr", bisim_stats_accum["corr"] / n_bisim_updates, total_steps)
+                
+                # Log gradient norms
+                n_updates = args.train_steps
+                writer.add_scalar("grad_norm/total", grad_norm_accum["total"] / n_updates, total_steps)
+                writer.add_scalar("grad_norm/encoder", grad_norm_accum["encoder"] / n_updates, total_steps)
+                writer.add_scalar("grad_norm/decoder", grad_norm_accum["decoder"] / n_updates, total_steps)
+                writer.add_scalar("grad_norm/rssm", grad_norm_accum["rssm"] / n_updates, total_steps)
+                writer.add_scalar("grad_norm/reward", grad_norm_accum["reward"] / n_updates, total_steps)
+                writer.add_scalar("grad_norm/bisim_weighted", grad_norm_accum["bisim_weighted"] / n_updates, total_steps)
+                
+                # Log bisim gradient contribution ratio
+                if grad_norm_accum["total"] > 0:
+                    bisim_ratio = grad_norm_accum["bisim_weighted"] / grad_norm_accum["total"]
+                    writer.add_scalar("grad_norm/bisim_ratio", bisim_ratio, total_steps)
+                
+                # Log bisim gradient contribution to decoder (since bisim affects decoder most)
+                if grad_norm_accum["decoder"] > 0:
+                    decoder_bisim_ratio = grad_norm_accum["bisim_weighted"] / grad_norm_accum["decoder"]
+                    writer.add_scalar("grad_norm/bisim_to_decoder_ratio", decoder_bisim_ratio, total_steps)
         
         # -------- End of episode --------
         writer.add_scalar("train/episode_return", ep_return, episode)
