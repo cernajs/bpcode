@@ -585,6 +585,12 @@ def main(args):
                 encoder.train(); decoder.train(); rssm.train(); reward_model.train()
                 
                 loss_accum = {"total": 0.0, "rec": 0.0, "kl": 0.0, "rew": 0.0, "pb": 0.0, "bisim": 0.0}
+                bisim_stats_accum = {
+                    "dz_mean": 0.0, "dz_std": 0.0,
+                    "target_mean": 0.0, "target_std": 0.0,
+                    "abs_err_mean": 0.0, "rel_err": 0.0, "corr": 0.0
+                }
+                n_bisim_computations = 0
 
                 for upd in range(args.train_steps):
                     # Sample sequences
@@ -724,6 +730,39 @@ def main(args):
 
                         scale = target.detach().abs().mean().clamp_min(1e-6)
                         bisim_loss_val = F.mse_loss(dz / scale, target / scale)
+                        
+                        # Compute statistics for pullback bisim logging
+                        if args.pullback_bisim:
+                            with torch.no_grad():
+                                dz_detached = dz.detach()
+                                target_detached = target.detach()
+                                
+                                dz_mean = dz_detached.mean().item()
+                                dz_std = dz_detached.std().item()
+                                target_mean = target_detached.mean().item()
+                                target_std = target_detached.std().item()
+                                
+                                abs_err = (dz_detached - target_detached).abs()
+                                abs_err_mean = abs_err.mean().item()
+                                
+                                rel_err = abs_err_mean / (target_mean + 1e-6)
+                                
+                                # Pearson correlation
+                                dz_centered = dz_detached - dz_detached.mean()
+                                target_centered = target_detached - target_detached.mean()
+                                numerator = (dz_centered * target_centered).mean()
+                                dz_var = dz_centered.pow(2).mean()
+                                target_var = target_centered.pow(2).mean()
+                                corr = (numerator / (dz_var.sqrt() * target_var.sqrt() + 1e-8)).item()
+                                
+                                bisim_stats_accum["dz_mean"] += dz_mean
+                                bisim_stats_accum["dz_std"] += dz_std
+                                bisim_stats_accum["target_mean"] += target_mean
+                                bisim_stats_accum["target_std"] += target_std
+                                bisim_stats_accum["abs_err_mean"] += abs_err_mean
+                                bisim_stats_accum["rel_err"] += rel_err
+                                bisim_stats_accum["corr"] += corr
+                                n_bisim_computations += 1
 
                     def bisim_lambda(total_steps, warmup=50_000, ramp=100_000, target=0.03):
                         if total_steps < warmup:
@@ -765,6 +804,17 @@ def main(args):
                 writer.add_scalar("loss/reward", loss_accum["rew"] / n_updates, total_steps)
                 writer.add_scalar("loss/pullback_curvature", loss_accum["pb"] / n_updates, total_steps)
                 writer.add_scalar("loss/bisimulation", loss_accum["bisim"] / n_updates, total_steps)
+                
+                # Log pullback bisim statistics if enabled
+                if args.pullback_bisim and args.bisimulation_weight > 0.0 and n_bisim_computations > 0:
+                    n_bisim_updates = n_bisim_computations
+                    writer.add_scalar("bisim_stats/dz_mean", bisim_stats_accum["dz_mean"] / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/dz_std", bisim_stats_accum["dz_std"] / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/target_mean", bisim_stats_accum["target_mean"] / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/target_std", bisim_stats_accum["target_std"] / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/abs_err_mean", bisim_stats_accum["abs_err_mean"] / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/rel_err", bisim_stats_accum["rel_err"] / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/corr", bisim_stats_accum["corr"] / n_bisim_updates, total_steps)
         
         # -------- End of episode --------
         writer.add_scalar("train/episode_return", ep_return, episode)
