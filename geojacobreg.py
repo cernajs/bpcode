@@ -293,7 +293,7 @@ def make_run_name(args):
     
     return "_".join(parts)
 
-def pullback_distance_s(decoder, h, s1, s2):
+def pullback_distance_s(decoder, h, s1, s2, create_graph=True):
     """
     Computes || J_s g(h, s1) · (s1 - s2) ||_2  (pullback metric at (h, s1))
     h:  [N, Dh] treated as constant
@@ -302,16 +302,112 @@ def pullback_distance_s(decoder, h, s1, s2):
     """
     delta = (s1 - s2)  # [N, Ds]
 
+    def decoder_wrapper(s):
+        return decoder(h, s)
+
     # JVP wrt s only, holding h fixed
     _, Jdelta = torch.autograd.functional.jvp(
-        lambda ss: decoder(h, ss),
+        decoder_wrapper,
         (s1,),
         (delta,),
-        create_graph=True,
+        create_graph=create_graph,
     )
     Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
     return torch.norm(Jdelta, dim=1)
 
+def floyd_warshall_minplus(W):
+    """
+    W: [B, B] directed edge weights with large INF for missing edges and 0 on diag.
+    Returns all-pairs shortest path distances D: [B, B].
+    """
+    D = W
+    B = D.size(0)
+    for k in range(B):
+        D = torch.minimum(D, D[:, k:k+1] + D[k:k+1, :])
+    return D
+
+def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, inf=1e9):
+    """
+    h_t: [B, Dh]
+    z_t: [B, Ds]
+    targets: [B] indices in [0..B-1] (your perm)
+    k: number of neighbors per node in the kNN graph
+    create_graph: True for dz, False for dnext
+    Returns: dz_t: [B] geodesic approx from i -> targets[i]
+    """
+    B = z_t.size(0)
+    device = z_t.device
+    dtype = z_t.dtype
+
+    # --- Build kNN graph by cheap Euclidean distance in latent (locality) ---
+    with torch.no_grad():
+        # squared distances [B,B]
+        dist2 = torch.cdist(z_t, z_t, p=2).pow(2)
+        dist2.fill_diagonal_(float("inf"))
+        knn = dist2.topk(k, largest=False).indices  # [B,k]
+
+    # edges: i -> knn[i, j]
+    src = torch.arange(B, device=device).repeat_interleave(k)       # [B*k]
+    dst = knn.reshape(-1)                                          # [B*k]
+
+    # --- Edge weights: pullback length at source (asymmetric: detach destination) ---
+    w = pullback_distance_s(
+        decoder,
+        h=h_t[src],
+        s1=z_t[src],
+        s2=z_t[dst].detach(),
+        create_graph=create_graph
+    )  # [B*k]
+
+    # --- Assemble adjacency matrix W ---
+    W = torch.full((B, B), inf, device=device, dtype=dtype)
+    W.fill_diagonal_(0.0)
+    W[src, dst] = w
+
+    # --- All-pairs shortest paths ---
+    D = floyd_warshall_minplus(W)  # [B,B]
+
+    # distance i -> targets[i]
+    dz_t = D[torch.arange(B, device=device), targets]
+    return dz_t
+
+def geodesic_pb_knn(decoder, h, z, perm, k=3, time_subsample=None, create_graph=True):
+    """
+    h: [B, T, Dh]  (here you’ll pass h = h_seq[:, :-1])
+    z: [B, T, Ds]  (here z = s_seq[:, :-1])
+    perm: [B] permutation used for pairing within each time slice
+    k: kNN degree
+    time_subsample: None or int number of time indices to sample
+    create_graph: True for dz, False for dnext
+    Returns: dz_flat: [B*T]
+    """
+    B, Tm1, _ = z.shape
+    device = z.device
+
+    if time_subsample is None or time_subsample >= Tm1:
+        t_idx = torch.arange(Tm1, device=device)
+    else:
+        t_idx = torch.randint(0, Tm1, (time_subsample,), device=device)
+
+    # Compute per-slice and scatter back into [B,Tm1]
+    dz = torch.zeros((B, Tm1), device=device, dtype=z.dtype)
+    for t in t_idx.tolist():
+        dz[:, t] = geodesic_pb_knn_slice(
+            decoder=decoder,
+            h_t=h[:, t],
+            z_t=z[:, t],
+            targets=perm,
+            k=k,
+            create_graph=create_graph
+        )
+
+    # If subsampled, average over sampled times and broadcast (keeps scale similar)
+    if len(t_idx) != Tm1:
+        # replace non-computed times by the mean of computed ones (or leave as 0 and mask)
+        mean_dz = dz[:, t_idx].mean(dim=1, keepdim=True)  # [B,1]
+        dz = mean_dz.expand(-1, Tm1)
+
+    return dz.reshape(-1)
 
 def main(args):
     set_seed(args.seed)
@@ -598,19 +694,36 @@ def main(args):
 
                         # asymmetric dz
                         if args.pullback_bisim:
-                            dz = pullback_distance_s(decoder, h1, z1, z2.detach())
+                            dz = geodesic_pb_knn(
+                                decoder=decoder,
+                                h=h,
+                                z=z,
+                                perm=perm,
+                                k=getattr(args, "geo_knn_k", 3),
+                                time_subsample=getattr(args, "geo_time_subsample", 8),  # TODO: change later
+                                create_graph=True
+                            )
                         else:
                             dz = torch.norm(z1 - z2.detach(), p=2, dim=1)
 
                         with torch.no_grad():
                             if args.pullback_bisim:
-                                dnext = pullback_distance_s(decoder, h2, n1, n2.detach())
+                                dnext = geodesic_pb_knn(
+                                    decoder=decoder,
+                                    h=hn,
+                                    z=zn,
+                                    perm=perm,
+                                    k=getattr(args, "geo_knn_k", 3),
+                                    time_subsample=getattr(args, "geo_time_subsample", 8),
+                                    create_graph=False
+                                )
                             else:
                                 dnext = torch.norm(n1 - n2, p=2, dim=1)
                             dr = (r1 - r2).abs()
                             target = dr + args.gamma * dnext
 
-                        bisim_loss_val = F.mse_loss(dz, target)
+                        scale = target.detach().abs().mean().clamp_min(1e-6)
+                        bisim_loss_val = F.mse_loss(dz / scale, target / scale)
 
                     def bisim_lambda(total_steps, warmup=50_000, ramp=100_000, target=0.03):
                         if total_steps < warmup:
