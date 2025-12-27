@@ -286,7 +286,7 @@ def make_run_name(args):
         parts.append("no_jacobreg")
 
     if args.pullback_bisim:
-        parts.append("pullback_bisim")
+        parts.append("pullback_bisim_knn")
     
     # Add seed for reproducibility tracking
     parts.append(f"seed{args.seed}")
