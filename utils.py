@@ -208,7 +208,7 @@ def make_env(env_id: str, img_size=(64, 64), num_stack=1):
 # ===============================
 #  Replay Buffer
 # ===============================
-
+# currently buggy, if we get more than self.capacity we wrap around doing teleportation
 class ReplayBuffer:
     def __init__(self, capacity: int, obs_shape, act_dim: int):
         """

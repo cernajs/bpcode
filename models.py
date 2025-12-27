@@ -105,7 +105,7 @@ class RSSM(nn.Module):
         # GRU for deterministic state (takes transformed input, hidden state)
         self.grucell = nn.GRUCell(deter_dim, deter_dim)
         
-        # Linear layer to transform [s, a] before GRU (key difference from incorrect impl)
+        # Linear layer to transform [s, a] before GRU
         self.lat_act_layer = nn.Linear(stoch_dim + act_dim, deter_dim)
         
         # Prior network: h -> (mean, std) - single hidden layer
@@ -147,7 +147,7 @@ class RSSM(nn.Module):
         """
         z = self.act_fn(self.fc_prior_1(h_t))
         m = self.fc_prior_m(z)
-        s = F.softplus(self.fc_prior_s(z)) + 0.1  # min_std = 0.1 as in reference
+        s = F.softplus(self.fc_prior_s(z)) + 0.1  # min_std = 0.1
         if sample:
             return m + torch.randn_like(m) * s
         return m, s
@@ -160,7 +160,7 @@ class RSSM(nn.Module):
         z = torch.cat([h_t, e_t], dim=-1)
         z = self.act_fn(self.fc_posterior_1(z))
         m = self.fc_posterior_m(z)
-        s = F.softplus(self.fc_posterior_s(z)) + 0.1  # min_std = 0.1 as in reference
+        s = F.softplus(self.fc_posterior_s(z)) + 0.1  # min_std = 0.1
         if sample:
             return m + torch.randn_like(m) * s
         return m, s
@@ -191,7 +191,7 @@ class RSSM(nn.Module):
         B, T, E = embeds.shape
         device = embeds.device
         
-        # Initialize from zeros (reference uses e_t[0] for first posterior)
+        # Initialize from zeros
         h_t, s_t = self.init_state(batch_size=B, device=device)
         a_prev = torch.zeros(B, self.act_dim, device=device)
         

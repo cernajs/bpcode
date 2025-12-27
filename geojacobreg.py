@@ -113,7 +113,7 @@ def cem_plan_action_rssm(
         _, k = torch.topk(rwds, top_k, dim=0, largest=True, sorted=False)
         elite_actions = actions[k]
         
-        # Update distribution (no alpha blending like reference)
+        # Update distribution (no alpha blending)
         mu = elite_actions.mean(dim=0)
         stddev = elite_actions.std(dim=0, unbiased=False)
     
@@ -236,7 +236,7 @@ def build_parser():
     p.add_argument("--kl_weight", type=float, default=1.0, help="Reference (beta): 1.0")
     p.add_argument("--kl_free_nats", type=float, default=3.0, help="Reference: 3.0")
 
-    # Optional regularizers (our additions)
+    # Optional regularizers
     p.add_argument("--pb_curvature_weight", type=float, default=0.0, help="Jacobian/pullback regularizer weight")
     p.add_argument("--pb_curvature_projections", type=int, default=2)
     p.add_argument("--pb_detach_features", action="store_true")
@@ -366,7 +366,7 @@ def main(args):
         hidden_dim=args.hidden_dim
     ).to(device)
 
-    # Single optimizer for all parameters (like reference)
+    # Single optimizer for all parameters
     params = (
         list(encoder.parameters()) + 
         list(decoder.parameters()) + 
@@ -383,7 +383,7 @@ def main(args):
     total_steps = 0
     
     # ========================================
-    # Phase 1: Seed buffer with random episodes (reference: 5 episodes)
+    # Phase 1: Seed buffer with random episodes
     # ========================================
     print(f"Seeding replay buffer with {args.seed_episodes} random episodes...")
     for seed_ep in range(args.seed_episodes):
@@ -417,7 +417,7 @@ def main(args):
         print(f"  Seed episode {seed_ep + 1}/{args.seed_episodes}: return = {ep_return:.2f}, buffer size = {replay.size}")
     
     # ========================================
-    # Phase 2: Main training loop (episode-based like reference)
+    # Phase 2: Main training loop
     # ========================================
     print(f"\nStarting training for {args.max_episodes} episodes...")
     
