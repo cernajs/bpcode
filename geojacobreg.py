@@ -830,7 +830,7 @@ def main(args):
                     optim.step()
 
                     # Accumulate losses for logging
-                    loss_accum["total"] += total_loss_value.item()
+                    loss_accum["total"] += total_loss_value
                     loss_accum["rec"] += rec_loss.item()
                     loss_accum["kl"] += kld_loss.item()
                     loss_accum["rew"] += rew_loss.item()
