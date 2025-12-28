@@ -786,10 +786,6 @@ def main(args):
                         + rec_loss 
                         + rew_loss
                         + args.pb_curvature_weight * pb_loss
-                        + bisim_lambda(total_steps,
-                         warmup=args.bisimulation_warmup,
-                         ramp=args.bisimulation_ramp,
-                         target=args.bisimulation_weight) * bisim_loss_val
                     )
 
                     # Compute bisim gradient contribution separately if needed
@@ -797,21 +793,24 @@ def main(args):
                                                warmup=args.bisimulation_warmup,
                                                ramp=args.bisimulation_ramp,
                                                target=args.bisimulation_weight)
+
+                    weighted_bisim = bisim_weight * bisim_loss_val
+                    total_loss_value = total.item() + weighted_bisim.item()
+
+                    optim.zero_grad()
+
                     bisim_grad_norm = 0.0
                     if bisim_weight > 0.0 and bisim_loss_val.requires_grad:
-                        # Compute gradient norm from weighted bisim loss alone
-                        optim.zero_grad()
-                        weighted_bisim = bisim_weight * bisim_loss_val
-                        weighted_bisim.backward(retain_graph=False)
+                        weighted_bisim.backward()
+                        # current params.grad is only from bisim loss
                         bisim_grad_norm = torch.nn.utils.clip_grad_norm_(params, float('inf'), norm_type=2)
-                        optim.zero_grad()
+                        # optim.zero_grad() # dont zero grad, we use it later for total loss
                     
-                    # Now compute total loss gradients
-                    optim.zero_grad()
                     total.backward()
                     
                     # Compute gradient norms for each component (before clipping)
                     with torch.no_grad():
+                        # now params.grad is from total loss (total + bisim)
                         total_grad_norm = torch.nn.utils.clip_grad_norm_(params, float('inf'), norm_type=2)
                         encoder_grad_norm = torch.nn.utils.clip_grad_norm_(encoder_params, float('inf'), norm_type=2) if encoder_params else torch.tensor(0.0)
                         decoder_grad_norm = torch.nn.utils.clip_grad_norm_(decoder_params, float('inf'), norm_type=2) if decoder_params else torch.tensor(0.0)
@@ -827,10 +826,11 @@ def main(args):
                     
                     if args.grad_clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(params, args.grad_clip_norm, norm_type=2)
+
                     optim.step()
 
                     # Accumulate losses for logging
-                    loss_accum["total"] += total.item()
+                    loss_accum["total"] += total_loss_value.item()
                     loss_accum["rec"] += rec_loss.item()
                     loss_accum["kl"] += kld_loss.item()
                     loss_accum["rew"] += rew_loss.item()
