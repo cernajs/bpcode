@@ -286,7 +286,7 @@ def make_run_name(args):
         parts.append("no_jacobreg")
 
     if args.pullback_bisim:
-        parts.append("pullback_bisim_knn")
+        parts.append("pullback_bisim_knn_h_s_grad")
     
     # Add seed for reproducibility tracking
     parts.append(f"seed{args.seed}")
@@ -310,6 +310,25 @@ def pullback_distance_s(decoder, h, s1, s2, create_graph=True):
         decoder_wrapper,
         (s1,),
         (delta,),
+        create_graph=create_graph,
+    )
+    Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
+    return torch.norm(Jdelta, dim=1)
+
+def pullback_distance_full(decoder, h1, s1, h2, s2, create_graph=True):
+    """
+    Computes || J_{h,s} g(h1, s1) · ([h1, s1] - [h2, s2]) ||_2
+    """
+    delta_h = (h1 - h2)
+    delta_s = (s1 - s2)
+    
+    def decoder_wrapper(h, s):
+        return decoder(h, s)
+    
+    _, Jdelta = torch.autograd.functional.jvp(
+        decoder_wrapper,
+        (h1, s1),
+        (delta_h, delta_s),
         create_graph=create_graph,
     )
     Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
@@ -351,13 +370,22 @@ def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, in
     dst = knn.reshape(-1)                                          # [B*k]
 
     # --- Edge weights: pullback length at source (asymmetric: detach destination) ---
-    w = pullback_distance_s(
+    # w = pullback_distance_s(
+    #     decoder,
+    #     h=h_t[src],
+    #     s1=z_t[src],
+    #     s2=z_t[dst].detach(),
+    #     create_graph=create_graph
+    # )  # [B*k]
+
+    w = pullback_distance_full(
         decoder,
-        h=h_t[src],
+        h1=h_t[src],
         s1=z_t[src],
+        h2=h_t[dst].detach(),
         s2=z_t[dst].detach(),
         create_graph=create_graph
-    )  # [B*k]
+    )
 
     # --- Assemble adjacency matrix W ---
     W = torch.full((B, B), inf, device=device, dtype=dtype)
