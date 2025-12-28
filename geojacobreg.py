@@ -801,7 +801,7 @@ def main(args):
 
                     bisim_grad_norm = 0.0
                     if bisim_weight > 0.0 and bisim_loss_val.requires_grad:
-                        weighted_bisim.backward()
+                        weighted_bisim.backward(retain_graph=True)
                         # current params.grad is only from bisim loss
                         bisim_grad_norm = torch.nn.utils.clip_grad_norm_(params, float('inf'), norm_type=2)
                         # optim.zero_grad() # dont zero grad, we use it later for total loss
