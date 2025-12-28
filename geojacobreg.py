@@ -656,7 +656,8 @@ def main(args):
                     # Reconstruction loss
                     recon = bottle(decoder, h_seq, s_seq)
                     target = x[:, 1:T+1]
-                    rec_loss = F.mse_loss(recon, target, reduction='none').sum((2, 3, 4)).mean()
+                    #rec_loss = F.mse_loss(recon, target, reduction='none').sum((2, 3, 4)).mean()
+                    rec_loss = F.mse_loss(recon, target)
 
                     # KL loss with free nats
                     kld_loss = torch.max(
