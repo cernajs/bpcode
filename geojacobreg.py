@@ -334,6 +334,11 @@ def pullback_distance_full(decoder, h1, s1, h2, s2, create_graph=True):
     Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
     return torch.norm(Jdelta, dim=1)
 
+def softmin(x, trough, tau=0.1):
+    x = torch.clamp(x, max=1e6)
+    trough = torch.clamp(trough, max=1e6)
+    return -tau * torch.logsumexp(torch.stack([-x/tau, -trough/tau], dim=0), dim=0)
+
 def floyd_warshall_minplus(W):
     """
     W: [B, B] directed edge weights with large INF for missing edges and 0 on diag.
@@ -342,7 +347,8 @@ def floyd_warshall_minplus(W):
     D = W
     B = D.size(0)
     for k in range(B):
-        D = torch.minimum(D, D[:, k:k+1] + D[k:k+1, :])
+        trough = D[:, k:k+1] + D[k:k+1, :]
+        D = softmin(D, trough)
     return D
 
 def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, inf=1e9):
