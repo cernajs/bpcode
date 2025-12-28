@@ -405,26 +405,30 @@ def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, in
     dz_t = D[torch.arange(B, device=device), targets]
     return dz_t
 
-def geodesic_pb_knn(decoder, h, z, perm, k=3, time_subsample=None, create_graph=True):
+def geodesic_pb_knn(decoder, h, z, perm, k=3, time_subsample=None, t_idx=None, create_graph=True, return_mask=False):
     """
     h: [B, T, Dh]  (here you’ll pass h = h_seq[:, :-1])
     z: [B, T, Ds]  (here z = s_seq[:, :-1])
     perm: [B] permutation used for pairing within each time slice
     k: kNN degree
     time_subsample: None or int number of time indices to sample
+    t_idx: optional pre-chosen time indices (overrides sampling)
+    return_mask: return boolean mask over sampled time steps
     create_graph: True for dz, False for dnext
-    Returns: dz_flat: [B*T]
+    Returns: dz_flat: [B*T], (optional) mask_flat: [B*T] bool, (optional) t_idx used
     """
     B, Tm1, _ = z.shape
     device = z.device
 
-    if time_subsample is None or time_subsample >= Tm1:
-        t_idx = torch.arange(Tm1, device=device)
-    else:
-        t_idx = torch.randint(0, Tm1, (time_subsample,), device=device)
+    if t_idx is None:
+        if time_subsample is None or time_subsample >= Tm1:
+            t_idx = torch.arange(Tm1, device=device)
+        else:
+            t_idx = torch.randint(0, Tm1, (time_subsample,), device=device)
 
     # Compute per-slice and scatter back into [B,Tm1]
     dz = torch.zeros((B, Tm1), device=device, dtype=z.dtype)
+    mask = torch.zeros((Tm1,), device=device, dtype=torch.bool)
     for t in t_idx.tolist():
         dz[:, t] = geodesic_pb_knn_slice(
             decoder=decoder,
@@ -434,13 +438,10 @@ def geodesic_pb_knn(decoder, h, z, perm, k=3, time_subsample=None, create_graph=
             k=k,
             create_graph=create_graph
         )
+        mask[t] = True
 
-    # If subsampled, average over sampled times and broadcast (keeps scale similar)
-    if len(t_idx) != Tm1:
-        # replace non-computed times by the mean of computed ones (or leave as 0 and mask)
-        mean_dz = dz[:, t_idx].mean(dim=1, keepdim=True)  # [B,1]
-        dz = mean_dz.expand(-1, Tm1)
-
+    if return_mask:
+        return dz.reshape(-1), mask.repeat(B), t_idx
     return dz.reshape(-1)
 
 def main(args):
@@ -745,42 +746,54 @@ def main(args):
 
                         # asymmetric dz
                         if args.pullback_bisim:
-                            dz = geodesic_pb_knn(
+                            dz, dz_mask, t_idx = geodesic_pb_knn(
                                 decoder=decoder,
                                 h=h,
                                 z=z,
                                 perm=perm,
                                 k=getattr(args, "geo_knn_k", 3),
                                 time_subsample=getattr(args, "geo_time_subsample", 8),  # TODO: change later
-                                create_graph=True
+                                create_graph=True,
+                                return_mask=True
                             )
                         else:
                             dz = torch.norm(z1 - z2.detach(), p=2, dim=1)
 
                         with torch.no_grad():
                             if args.pullback_bisim:
-                                dnext = geodesic_pb_knn(
+                                dnext, _, _ = geodesic_pb_knn(
                                     decoder=decoder,
                                     h=hn,
                                     z=zn,
                                     perm=perm,
                                     k=getattr(args, "geo_knn_k", 3),
                                     time_subsample=getattr(args, "geo_time_subsample", 8),
-                                    create_graph=False
+                                    t_idx=t_idx,  # reuse the same time sampling for target
+                                    create_graph=False,
+                                    return_mask=True
                                 )
                             else:
                                 dnext = torch.norm(n1 - n2, p=2, dim=1)
                             dr = (r1 - r2).abs()
                             target = dr + args.gamma * dnext
 
-                        scale = target.detach().abs().mean().clamp_min(1e-6)
-                        bisim_loss_val = F.mse_loss(dz / scale, target / scale)
+                        if args.pullback_bisim:
+                            # Mask to only sampled time steps; keep scale comparable
+                            mask = dz_mask.bool()
+                            target_masked = target[mask]
+                            dz_masked = dz[mask]
+                            scale = target_masked.detach().abs().mean().clamp_min(1e-6)
+                            bisim_loss_val = F.mse_loss(dz_masked / scale, target_masked / scale)
+                        else:
+                            scale = target.detach().abs().mean().clamp_min(1e-6)
+                            bisim_loss_val = F.mse_loss(dz / scale, target / scale)
                         
                         # Compute statistics for pullback bisim logging
                         if args.pullback_bisim:
                             with torch.no_grad():
-                                dz_detached = dz.detach()
-                                target_detached = target.detach()
+                                mask = dz_mask.bool()
+                                dz_detached = dz.detach()[mask]
+                                target_detached = target.detach()[mask]
                                 
                                 dz_mean = dz_detached.mean().item()
                                 dz_std = dz_detached.std().item()
