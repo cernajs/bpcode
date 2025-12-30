@@ -397,7 +397,7 @@ def main(args):
     
     # Check for CUDA and set up AMP
     use_amp = args.use_amp and device.type == "cuda"
-    scaler = GradScaler() if use_amp else None
+    scaler = GradScaler(device_type='cuda') if use_amp else None
     print(f"Mixed precision training: {use_amp}")
     
     # Run name
