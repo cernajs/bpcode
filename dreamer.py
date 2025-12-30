@@ -7,7 +7,7 @@ from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 from utils import (PixelObsWrapper, DMControlWrapper, ReplayBuffer, get_device, set_seed, 
                    preprocess_img, bottle, make_env, ENV_ACTION_REPEAT)
@@ -397,7 +397,7 @@ def main(args):
     
     # Check for CUDA and set up AMP
     use_amp = args.use_amp and device.type == "cuda"
-    scaler = GradScaler(device_type='cuda') if use_amp else None
+    scaler = GradScaler(device_type="cuda") if use_amp else None
     print(f"Mixed precision training: {use_amp}")
     
     # Run name
