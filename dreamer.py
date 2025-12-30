@@ -346,6 +346,10 @@ def build_parser():
     p.add_argument("--expl_decay", type=float, default=0.0, help="Exploration decay rate")
     p.add_argument("--expl_min", type=float, default=0.0)
     
+    # Actor-critic stability
+    p.add_argument("--actor_warmup_steps", type=int, default=0, help="Steps before actor training starts")
+    p.add_argument("--advantage_clip", type=float, default=10.0, help="Clip advantages before normalization")
+    
     # Optional regularizers (your novelty)
     p.add_argument("--pb_curvature_weight", type=float, default=0.0)
     p.add_argument("--pb_curvature_projections", type=int, default=2)
@@ -585,7 +589,8 @@ def main(args):
                 
                 loss_accum = {
                     "model_total": 0.0, "rec": 0.0, "kl": 0.0, "rew": 0.0,
-                    "pb": 0.0, "bisim": 0.0, "actor": 0.0, "value": 0.0
+                    "pb": 0.0, "bisim": 0.0, "actor": 0.0, "value": 0.0,
+                    "adv_mean": 0.0, "adv_std": 0.0, "adv_min": 0.0, "adv_max": 0.0
                 }
                 
                 for upd in range(args.train_steps):
@@ -788,6 +793,10 @@ def main(args):
                             rewards_imag = bottle(reward_model, h_imag[:, :-1], s_imag[:, :-1])  # [B, H]
                         
                         values_imag = bottle(value_model, h_imag, s_imag)  # [B, H+1]
+                        
+                        # Store values BEFORE update for stable advantage computation
+                        with torch.no_grad():
+                            values_for_advantages = values_imag.detach().clone()
 
                         # Compute λ-returns
                         with torch.no_grad():
@@ -799,38 +808,54 @@ def main(args):
                         # Value loss
                         value_loss = F.mse_loss(values_imag[:, :-1], lambda_returns)
 
+                    # Value optimizer step
                     value_optim.zero_grad()
                     if use_amp:
                         scaler.scale(value_loss).backward(retain_graph=True)
                         scaler.unscale_(value_optim)
                         torch.nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm)
                         scaler.step(value_optim)
+                        # Don't update scaler here - we still need to do actor backward
                     else:
                         value_loss.backward(retain_graph=True)
                         torch.nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm)
                         value_optim.step()
 
                     # Actor loss: maximize imagined returns
-                    # Use advantage = λ-returns - baseline (values)
-                    with autocast(device_type='cuda', enabled=use_amp):
-                        with torch.no_grad():
-                            advantages = lambda_returns - values_imag[:, :-1].detach()
-                            # Normalize advantages
-                            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                        
-                        actor_loss = -(log_probs * advantages).mean()
+                    # Use advantage = λ-returns - baseline (use values from BEFORE update for stability)
+                    # Skip actor training during warmup period
+                    if total_steps >= args.actor_warmup_steps:
+                        with autocast(device_type='cuda', enabled=use_amp):
+                            with torch.no_grad():
+                                # Use stored values for stable advantages
+                                advantages = lambda_returns - values_for_advantages[:, :-1]
+                                # Clip advantages before normalization to prevent explosion
+                                advantages = torch.clamp(advantages, -args.advantage_clip, args.advantage_clip)
+                                # Normalize advantages with larger epsilon for stability
+                                adv_std = advantages.std()
+                                if adv_std > 1e-4:  # Only normalize if there's meaningful variance
+                                    advantages = (advantages - advantages.mean()) / (adv_std + 1e-5)
+                                else:
+                                    advantages = advantages - advantages.mean()
+                            
+                            actor_loss = -(log_probs * advantages).mean()
 
-                    actor_optim.zero_grad()
-                    if use_amp:
-                        scaler.scale(actor_loss).backward()
-                        scaler.unscale_(actor_optim)
-                        torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
-                        scaler.step(actor_optim)
-                        scaler.update()
+                        actor_optim.zero_grad()
+                        if use_amp:
+                            scaler.scale(actor_loss).backward()
+                            scaler.unscale_(actor_optim)
+                            torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
+                            scaler.step(actor_optim)
+                            scaler.update()  # Update scaler after all backward passes
+                        else:
+                            actor_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
+                            actor_optim.step()
                     else:
-                        actor_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
-                        actor_optim.step()
+                        # During warmup, still update scaler but skip actor training
+                        actor_loss = torch.zeros((), device=device)
+                        if use_amp:
+                            scaler.update()
 
                     # Accumulate losses
                     loss_accum["model_total"] += model_loss.item()
@@ -841,6 +866,14 @@ def main(args):
                     loss_accum["bisim"] += bisim_loss_val.item()
                     loss_accum["actor"] += actor_loss.item()
                     loss_accum["value"] += value_loss.item()
+                    
+                    # Log advantage statistics for debugging
+                    with torch.no_grad():
+                        raw_adv = lambda_returns - values_for_advantages[:, :-1]
+                        loss_accum["adv_mean"] += raw_adv.mean().item()
+                        loss_accum["adv_std"] += raw_adv.std().item()
+                        loss_accum["adv_min"] += raw_adv.min().item()
+                        loss_accum["adv_max"] += raw_adv.max().item()
 
                 # Log losses
                 n_updates = args.train_steps
@@ -853,6 +886,12 @@ def main(args):
                 writer.add_scalar("loss/actor", loss_accum["actor"] / n_updates, total_steps)
                 writer.add_scalar("loss/value", loss_accum["value"] / n_updates, total_steps)
                 writer.add_scalar("train/exploration", expl_amount, total_steps)
+                
+                # Log advantage statistics
+                writer.add_scalar("actor/advantage_mean", loss_accum["adv_mean"] / n_updates, total_steps)
+                writer.add_scalar("actor/advantage_std", loss_accum["adv_std"] / n_updates, total_steps)
+                writer.add_scalar("actor/advantage_min", loss_accum["adv_min"] / n_updates, total_steps)
+                writer.add_scalar("actor/advantage_max", loss_accum["adv_max"] / n_updates, total_steps)
 
         # -------- End of episode --------
         # Decay exploration
