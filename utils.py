@@ -70,8 +70,8 @@ def bottle(func, *tensors):
     Evaluates a func that operates in N x D with inputs of shape N x T x D.
     """
     n, t = tensors[0].shape[:2]
-    out = func(*[x.view(n*t, *x.shape[2:]) for x in tensors])
-    return out.view(n, t, *out.shape[1:])
+    out = func(*[x.reshape(n*t, *x.shape[2:]) for x in tensors])
+    return out.reshape(n, t, *out.shape[1:])
 
 
 class PixelObsWrapper(gym.Wrapper):
