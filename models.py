@@ -279,3 +279,132 @@ class RewardModel(nn.Module):
         r = self.act_fn(self.fc_reward_2(r))
         return self.fc_reward_3(r).squeeze(-1)
 
+
+class Actor(nn.Module):
+    """
+    DreamerV1 Actor: outputs tanh-squashed Gaussian action distribution.
+    """
+    def __init__(self, state_size=200, latent_size=30, act_dim=6, hidden_dim=400, 
+                 min_std=1e-4, init_std=5.0, mean_scale=5.0, activation_function='elu'):
+        super().__init__()
+        self.act_fn = getattr(F, activation_function)
+        self.act_dim = act_dim
+        self.min_std = min_std
+        self.init_std = init_std
+        self.mean_scale = mean_scale
+        
+        # MLP layers - DreamerV1 uses 4 layers of 400 units
+        self.fc1 = nn.Linear(state_size + latent_size, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Output mean and std
+        self.fc_mean = nn.Linear(hidden_dim, act_dim)
+        self.fc_std = nn.Linear(hidden_dim, act_dim)
+        
+        # Initialize for stable training
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in [self.fc1, self.fc2, self.fc3, self.fc4]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.fc_mean.weight, gain=0.01)
+        nn.init.zeros_(self.fc_mean.bias)
+        nn.init.orthogonal_(self.fc_std.weight, gain=0.01)
+        nn.init.zeros_(self.fc_std.bias)
+
+    def forward(self, h, s):
+        """
+        Returns action distribution parameters.
+        h: [B, state_size] or [B, T, state_size]
+        s: [B, latent_size] or [B, T, latent_size]
+        """
+        x = torch.cat([h, s], dim=-1)
+        x = self.act_fn(self.fc1(x))
+        x = self.act_fn(self.fc2(x))
+        x = self.act_fn(self.fc3(x))
+        x = self.act_fn(self.fc4(x))
+        
+        mean = self.fc_mean(x)
+        mean = self.mean_scale * torch.tanh(mean / self.mean_scale)
+        
+        std = self.fc_std(x)
+        std = F.softplus(std + self._raw_init_std()) + self.min_std
+        
+        return mean, std
+    
+    def _raw_init_std(self):
+        return torch.log(torch.exp(torch.tensor(self.init_std)) - 1)
+    
+    def get_action(self, h, s, deterministic=False):
+        """
+        Sample action from policy.
+        Returns action and log_prob.
+        """
+        mean, std = self.forward(h, s)
+        
+        if deterministic:
+            action = torch.tanh(mean)
+            return action, None
+        
+        # Sample from Gaussian
+        noise = torch.randn_like(mean)
+        raw_action = mean + std * noise
+        action = torch.tanh(raw_action)
+        
+        # Log prob with tanh correction
+        log_prob = -0.5 * (noise.pow(2) + 2 * std.log() + torch.log(torch.tensor(2 * 3.14159265)))
+        log_prob = log_prob - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1)
+        
+        return action, log_prob
+    
+    def get_dist(self, h, s):
+        """Get action distribution for entropy computation."""
+        mean, std = self.forward(h, s)
+        from torch.distributions import Normal, TransformedDistribution
+        from torch.distributions.transforms import TanhTransform
+        
+        base_dist = Normal(mean, std)
+        return base_dist, mean, std
+
+
+class ValueModel(nn.Module):
+    """
+    DreamerV1 Value/Critic network: predicts state value.
+    """
+    def __init__(self, state_size=200, latent_size=30, hidden_dim=400, activation_function='elu'):
+        super().__init__()
+        self.act_fn = getattr(F, activation_function)
+        
+        # MLP layers - DreamerV1 uses 3 layers of 400 units
+        self.fc1 = nn.Linear(state_size + latent_size, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 1)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in [self.fc1, self.fc2, self.fc3]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.fc_out.weight, gain=0.01)
+        nn.init.zeros_(self.fc_out.bias)
+
+    def forward(self, h, s=None):
+        """
+        h: [B, state_size] or full z if s is None
+        s: [B, latent_size] (optional)
+        """
+        if s is not None:
+            x = torch.cat([h, s], dim=-1)
+        else:
+            x = h
+        x = self.act_fn(self.fc1(x))
+        x = self.act_fn(self.fc2(x))
+        x = self.act_fn(self.fc3(x))
+        return self.fc_out(x).squeeze(-1)
+
