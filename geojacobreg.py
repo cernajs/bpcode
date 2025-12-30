@@ -313,7 +313,8 @@ def pullback_distance_s(decoder, h, s1, s2, create_graph=True):
         create_graph=create_graph,
     )
     Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
-    return torch.norm(Jdelta, dim=1)
+    # return torch.norm(Jdelta, dim=1)
+    return torch.sqrt((Jdelta * Jdelta).mean(dim=1) + 1e-8)
 
 def pullback_distance_full(decoder, h1, s1, h2, s2, create_graph=True):
     """
@@ -332,7 +333,8 @@ def pullback_distance_full(decoder, h1, s1, h2, s2, create_graph=True):
         create_graph=create_graph,
     )
     Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
-    return torch.norm(Jdelta, dim=1)
+    # return torch.norm(Jdelta, dim=1)
+    return torch.sqrt((Jdelta * Jdelta).mean(dim=1) + 1e-8)
 
 def softmin(x, trough, tau=0.1):
     x = torch.clamp(x, max=1e6)
@@ -398,6 +400,9 @@ def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, in
     W.fill_diagonal_(0.0)
     W[src, dst] = w
 
+    # Make graph undirected by symmetrizing (take minimum of both directions)
+    W = torch.minimum(W, W.T)
+
     # --- All-pairs shortest paths ---
     D = floyd_warshall_minplus(W)  # [B,B]
 
@@ -405,7 +410,7 @@ def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, in
     dz_t = D[torch.arange(B, device=device), targets]
     return dz_t
 
-def geodesic_pb_knn(decoder, h, z, perm, k=3, time_subsample=None, t_idx=None, create_graph=True, return_mask=False):
+def geodesic_pb_knn(decoder, h, z, perm, k=10, time_subsample=None, t_idx=None, create_graph=True, return_mask=False):
     """
     h: [B, T, Dh]  (here you’ll pass h = h_seq[:, :-1])
     z: [B, T, Ds]  (here z = s_seq[:, :-1])
