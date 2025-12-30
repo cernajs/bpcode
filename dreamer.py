@@ -755,48 +755,49 @@ def main(args):
                     # ========================================
                     # Actor-Critic Training (Imagination)
                     # ========================================
-                    with torch.no_grad():
-                        # Start imagination from posterior states
-                        h_start = h_seq[:, -1].detach()
-                        s_start = s_seq[:, -1].detach()
+                    with autocast(device_type='cuda', enabled=use_amp):
+                        with torch.no_grad():
+                            # Start imagination from posterior states
+                            h_start = h_seq[:, -1].detach()
+                            s_start = s_seq[:, -1].detach()
 
-                    # Imagination rollout
-                    h_imag_list = [h_start]
-                    s_imag_list = [s_start]
-                    a_imag_list = []
-                    log_prob_list = []
-                    
-                    h_im, s_im = h_start, s_start
-                    for _ in range(args.imagination_horizon):
-                        action_im, log_prob = actor.get_action(h_im, s_im, deterministic=False)
-                        a_imag_list.append(action_im)
-                        log_prob_list.append(log_prob)
+                        # Imagination rollout
+                        h_imag_list = [h_start]
+                        s_imag_list = [s_start]
+                        a_imag_list = []
+                        log_prob_list = []
                         
-                        h_im = rssm.deterministic_state_fwd(h_im, s_im, action_im)
-                        s_im = rssm.state_prior(h_im, sample=True)
+                        h_im, s_im = h_start, s_start
+                        for _ in range(args.imagination_horizon):
+                            action_im, log_prob = actor.get_action(h_im, s_im, deterministic=False)
+                            a_imag_list.append(action_im)
+                            log_prob_list.append(log_prob)
+                            
+                            h_im = rssm.deterministic_state_fwd(h_im, s_im, action_im)
+                            s_im = rssm.state_prior(h_im, sample=True)
+                            
+                            h_imag_list.append(h_im)
+                            s_imag_list.append(s_im)
+
+                        h_imag = torch.stack(h_imag_list, dim=1)  # [B, H+1, D]
+                        s_imag = torch.stack(s_imag_list, dim=1)  # [B, H+1, D]
+                        log_probs = torch.stack(log_prob_list, dim=1)  # [B, H]
+
+                        # Predict rewards and values
+                        with torch.no_grad():
+                            rewards_imag = bottle(reward_model, h_imag[:, :-1], s_imag[:, :-1])  # [B, H]
                         
-                        h_imag_list.append(h_im)
-                        s_imag_list.append(s_im)
+                        values_imag = bottle(value_model, h_imag, s_imag)  # [B, H+1]
 
-                    h_imag = torch.stack(h_imag_list, dim=1)  # [B, H+1, D]
-                    s_imag = torch.stack(s_imag_list, dim=1)  # [B, H+1, D]
-                    log_probs = torch.stack(log_prob_list, dim=1)  # [B, H]
+                        # Compute λ-returns
+                        with torch.no_grad():
+                            lambda_returns = compute_lambda_returns(
+                                rewards_imag, values_imag.detach(),
+                                gamma=args.gamma, lambda_=args.lambda_
+                            )
 
-                    # Predict rewards and values
-                    with torch.no_grad():
-                        rewards_imag = bottle(reward_model, h_imag[:, :-1], s_imag[:, :-1])  # [B, H]
-                    
-                    values_imag = bottle(value_model, h_imag, s_imag)  # [B, H+1]
-
-                    # Compute λ-returns
-                    with torch.no_grad():
-                        lambda_returns = compute_lambda_returns(
-                            rewards_imag, values_imag.detach(),
-                            gamma=args.gamma, lambda_=args.lambda_
-                        )
-
-                    # Value loss
-                    value_loss = F.mse_loss(values_imag[:, :-1], lambda_returns)
+                        # Value loss
+                        value_loss = F.mse_loss(values_imag[:, :-1], lambda_returns)
 
                     value_optim.zero_grad()
                     if use_amp:
@@ -811,12 +812,13 @@ def main(args):
 
                     # Actor loss: maximize imagined returns
                     # Use advantage = λ-returns - baseline (values)
-                    with torch.no_grad():
-                        advantages = lambda_returns - values_imag[:, :-1].detach()
-                        # Normalize advantages
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                    
-                    actor_loss = -(log_probs * advantages).mean()
+                    with autocast(device_type='cuda', enabled=use_amp):
+                        with torch.no_grad():
+                            advantages = lambda_returns - values_imag[:, :-1].detach()
+                            # Normalize advantages
+                            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                        
+                        actor_loss = -(log_probs * advantages).mean()
 
                     actor_optim.zero_grad()
                     if use_amp:
