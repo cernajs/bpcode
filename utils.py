@@ -243,25 +243,45 @@ class ReplayBuffer:
 
     def sample_sequences(self, batch_size: int, seq_len: int):
         """
-        Sample sequences from the flat buffer.
-        Sequences may cross episode boundaries, but downstream losses
-        mask out transitions after dones.
+        Sample sequences consistent with episode boundaries and buffer pointers.
+        Fixes the 'teleportation' issue by rejecting invalid indices.
         """
         assert self.size > seq_len + 1, "Not enough data to sample sequences."
+        
         obs_seq = []
         act_seq = []
         rew_seq = []
         done_seq = []
 
-        max_start = self.size - seq_len - 1
-        for _ in range(batch_size):
-            start = np.random.randint(0, max_start)
+        # We need to find 'batch_size' valid starting indices
+        count = 0
+        while count < batch_size:
+            # 1. Sample a random start index
+            # We subtract seq_len to ensure the slice fits in the array
+            start = np.random.randint(0, self.size - seq_len)
             end = start + seq_len
 
+            # 2. Check for Buffer Overwrite (Circular Buffer "Head")
+            # If the buffer is full, self.idx is the split between oldest and newest data.
+            # We cannot sample a sequence that crosses this boundary.
+            if self.size == self.capacity:
+                # If the interval [start, end] contains the write head 'self.idx'
+                if start < self.idx < end:
+                    continue
+
+            # 3. Check for Episode Boundaries
+            # If any step (except the last one) is 'done', the sequence contains a reset.
+            # We want transitions: s_0->s_1, ..., s_{T-1}->s_T. 
+            # If s_k is terminal, the transition s_k -> s_{k+1} is invalid (teleportation).
+            if np.any(self.dones[start : end - 1]):
+                continue
+
+            # If valid, append to batch
             obs_seq.append(self.obs[start:end])
             act_seq.append(self.actions[start:end])
             rew_seq.append(self.rews[start:end])
             done_seq.append(self.dones[start:end])
+            count += 1
 
         obs_seq = np.stack(obs_seq, axis=0)          # [B, T, H, W, C]
         act_seq = np.stack(act_seq, axis=0)          # [B, T, act_dim]
