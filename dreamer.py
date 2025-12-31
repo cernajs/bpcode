@@ -779,7 +779,8 @@ def main(args):
                             a_imag_list.append(action_im)
                             log_prob_list.append(log_prob)
                             
-                            h_im = rssm.deterministic_state_fwd(h_im.detach(), s_im.detach(), action_im)
+                            # h_im = rssm.deterministic_state_fwd(h_im.detach(), s_im.detach(), action_im)
+                            h_im = rssm.deterministic_state_fwd(h_im, s_im, action_im)
                             s_im = rssm.state_prior(h_im, sample=True) # Reparameterized sampling
                             
                             h_imag_list.append(h_im)
