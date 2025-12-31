@@ -774,12 +774,13 @@ def main(args):
                         
                         h_im, s_im = h_start, s_start
                         for _ in range(args.imagination_horizon):
+                            # we need gradient to flow from action to actor expl_amountweights -> actor.get_action use reparametrization trick
                             action_im, log_prob = actor.get_action(h_im, s_im, deterministic=False)
                             a_imag_list.append(action_im)
                             log_prob_list.append(log_prob)
                             
-                            h_im = rssm.deterministic_state_fwd(h_im, s_im, action_im)
-                            s_im = rssm.state_prior(h_im, sample=True)
+                            h_im = rssm.deterministic_state_fwd(h_im.detach(), s_im.detach(), action_im)
+                            s_im = rssm.state_prior(h_im, sample=True) # Reparameterized sampling
                             
                             h_imag_list.append(h_im)
                             s_imag_list.append(s_im)
@@ -789,21 +790,17 @@ def main(args):
                         log_probs = torch.stack(log_prob_list, dim=1)  # [B, H]
 
                         # Predict rewards and values
-                        with torch.no_grad():
-                            rewards_imag = bottle(reward_model, h_imag[:, :-1], s_imag[:, :-1])  # [B, H]
-                        
+                        rewards_imag = bottle(reward_model, h_imag[:, :-1], s_imag[:, :-1])  # [B, H] 
                         values_imag = bottle(value_model, h_imag, s_imag)  # [B, H+1]
                         
                         # Store values BEFORE update for stable advantage computation
-                        with torch.no_grad():
-                            values_for_advantages = values_imag.detach().clone()
+                        values_for_advantages = values_imag.detach().clone()
 
                         # Compute λ-returns
-                        with torch.no_grad():
-                            lambda_returns = compute_lambda_returns(
-                                rewards_imag, values_imag.detach(),
-                                gamma=args.gamma, lambda_=args.lambda_
-                            )
+                        lambda_returns = compute_lambda_returns(
+                            rewards_imag, values_imag,
+                            gamma=args.gamma, lambda_=args.lambda_
+                        )
 
                         # Value loss
                         value_loss = F.mse_loss(values_imag[:, :-1], lambda_returns)
@@ -825,20 +822,8 @@ def main(args):
                     # Use advantage = λ-returns - baseline (use values from BEFORE update for stability)
                     # Skip actor training during warmup period
                     if total_steps >= args.actor_warmup_steps:
-                        with autocast(device_type='cuda', enabled=use_amp):
-                            with torch.no_grad():
-                                # Use stored values for stable advantages
-                                advantages = lambda_returns - values_for_advantages[:, :-1]
-                                # Clip advantages before normalization to prevent explosion
-                                advantages = torch.clamp(advantages, -args.advantage_clip, args.advantage_clip)
-                                # Normalize advantages with larger epsilon for stability
-                                adv_std = advantages.std()
-                                if adv_std > 1e-4:  # Only normalize if there's meaningful variance
-                                    advantages = (advantages - advantages.mean()) / (adv_std + 1e-5)
-                                else:
-                                    advantages = advantages - advantages.mean()
-                            
-                            actor_loss = -(log_probs * advantages).mean()
+                        with autocast(device_type='cuda', enabled=use_amp): 
+                            actor_loss = -lambda_returns.mean()
 
                         actor_optim.zero_grad()
                         if use_amp:
