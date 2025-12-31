@@ -823,7 +823,12 @@ def main(args):
                     # Skip actor training during warmup period
                     if total_steps >= args.actor_warmup_steps:
                         with autocast(device_type='cuda', enabled=use_amp): 
-                            actor_loss = -lambda_returns.mean()
+                            dist = actor.get_dist(h_imag[:, :-1], s_imag[:, :-1])
+
+                            entropy = dist.entropy().sum(dim=-1).mean()
+
+                            actor_entropy_scale = 1e-4 
+                            actor_loss = -lambda_returns.mean() - (actor_entropy_scale * entropy)
 
                         actor_optim.zero_grad()
                         if use_amp:

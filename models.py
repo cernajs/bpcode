@@ -364,11 +364,9 @@ class Actor(nn.Module):
     def get_dist(self, h, s):
         """Get action distribution for entropy computation."""
         mean, std = self.forward(h, s)
-        from torch.distributions import Normal, TransformedDistribution
-        from torch.distributions.transforms import TanhTransform
+        from torch.distributions import Normal
         
-        base_dist = Normal(mean, std)
-        return base_dist, mean, std
+        return Normal(mean, std)
 
 
 class ValueModel(nn.Module):
