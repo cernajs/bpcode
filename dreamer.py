@@ -12,7 +12,7 @@ from torch.amp import GradScaler
 from utils import (PixelObsWrapper, DMControlWrapper, ReplayBuffer, get_device, set_seed, 
                    preprocess_img, bottle, make_env, ENV_ACTION_REPEAT)
 
-from models import ConvEncoder, ConvDecoder, RSSM, RewardModel, Actor, ValueModel, ContinueModel
+from models import ConvEncoder, ConvDecoder, RSSM, RewardModel, ContinueModel, Actor, ValueModel
 
 
 # ===============================
@@ -207,30 +207,45 @@ def imagine_ahead(rssm, actor, h_init, s_init, horizon=15):
     return h_imag, s_imag, a_imag
 
 
-def compute_lambda_returns(rewards, values, gamma=0.99, lambda_=0.95):
+def compute_lambda_returns(rewards, values, discounts, lambda_=0.95):
     """
-    Compute λ-returns for value learning.
-    rewards: [B, H] - predicted rewards
-    values: [B, H+1] - predicted values (includes bootstrap)
-    Returns: [B, H] λ-returns
+    Compute Dreamer-style λ-returns.
+
+    rewards:   [B, H]   predicted rewards r_t
+    values:    [B, H+1] predicted values V_t (includes bootstrap at H)
+    discounts: float or [B, H] discounts d_t applied to bootstrap term (typically gamma * p_continue_{t+1})
+    returns:   [B, H] λ-returns
     """
+    if not torch.is_tensor(discounts):
+        discounts = torch.full_like(rewards, float(discounts))
+    else:
+        # Allow [H] -> [B,H]
+        if discounts.dim() == 1:
+            discounts = discounts.unsqueeze(0).expand_as(rewards)
+        discounts = discounts.to(dtype=rewards.dtype, device=rewards.device)
+
     B, H = rewards.shape
-    device = rewards.device
-    
-    # Bootstrap value
-    next_values = values[:, 1:]  # [B, H]
-    
-    # Compute λ-returns backwards
+    next_values = values[:, 1:]          # [B, H]
+    last = values[:, -1]                # [B]
+
     lambda_returns = torch.zeros_like(rewards)
-    last_lambda = values[:, -1]  # Bootstrap
-    
     for t in reversed(range(H)):
-        lambda_returns[:, t] = rewards[:, t] + gamma * (
-            (1 - lambda_) * next_values[:, t] + lambda_ * last_lambda
-        )
-        last_lambda = lambda_returns[:, t]
-    
+        bootstrap = (1.0 - lambda_) * next_values[:, t] + lambda_ * last
+        last = rewards[:, t] + discounts[:, t] * bootstrap
+        lambda_returns[:, t] = last
     return lambda_returns
+
+
+def compute_discount_weights(discounts):
+    """Cumulative product weights for discounted objectives.
+    discounts: [B, H]
+    returns:   [B, H] with w_0 = 1 and w_{t} = prod_{i< t} discounts_i
+    """
+    B, H = discounts.shape
+    ones = torch.ones((B, 1), device=discounts.device, dtype=discounts.dtype)
+    w = torch.cumprod(torch.cat([ones, discounts], dim=1), dim=1)[:, :-1]
+    return w
+
 
 
 # ===============================
@@ -340,6 +355,8 @@ def build_parser():
     
     # DreamerV1 imagination
     p.add_argument("--imagination_horizon", type=int, default=15, help="DreamerV1: 15")
+    p.add_argument("--imagination_starts", type=int, default=8, help="How many posterior time indices per sequence to start imagination from. Set 0 to use all.")
+    p.add_argument("--cont_weight", type=float, default=1.0, help="Weight of continuation (discount) prediction loss in world model.")
     
     # Exploration
     p.add_argument("--expl_amount", type=float, default=0.3, help="Action noise during collection")
@@ -424,7 +441,8 @@ def main(args):
     act_high = env.action_space.high
 
     action_repeat = args.action_repeat if args.action_repeat > 0 else ENV_ACTION_REPEAT.get(args.env_id, 2)
-    print(f"Environment: {args.env_id}, Action repeat: {action_repeat}")
+    effective_gamma = args.gamma ** action_repeat
+    print(f"Environment: {args.env_id}, Action repeat: {action_repeat}, effective_gamma: {effective_gamma:.6f}")
 
     # ========================================
     # Models - DreamerV1 Architecture
@@ -594,7 +612,7 @@ def main(args):
                 value_model.train()
                 
                 loss_accum = {
-                    "model_total": 0.0, "rec": 0.0, "kl": 0.0, "rew": 0.0,
+                    "model_total": 0.0, "rec": 0.0, "kl": 0.0, "rew": 0.0, "cont": 0.0,
                     "pb": 0.0, "bisim": 0.0, "actor": 0.0, "value": 0.0,
                     "adv_mean": 0.0, "adv_std": 0.0, "adv_min": 0.0, "adv_max": 0.0
                 }
@@ -606,6 +624,7 @@ def main(args):
                     obs_seq = torch.tensor(batch.obs, dtype=torch.float32, device=device)
                     act_seq = torch.tensor(batch.actions, dtype=torch.float32, device=device)
                     rew_seq = torch.tensor(batch.rews, dtype=torch.float32, device=device)
+                    done_seq = torch.tensor(batch.dones, dtype=torch.float32, device=device)
 
                     B, T1 = rew_seq.shape
                     T = T1 - 1
@@ -660,6 +679,12 @@ def main(args):
                         rew_pred = bottle(reward_model, h_seq, s_seq)
                         rew_target = rew_seq[:, :T]
                         rew_loss = F.mse_loss(rew_pred, rew_target)
+
+                        # Continuation / discount loss (DreamerV1)
+                        # Predict p_continue(s_{t+1}) from features at t+1, target = 1 - done_t
+                        cont_logits = bottle(continue_model, h_seq, s_seq)  # [B, T]
+                        cont_target = (1.0 - done_seq[:, :T]).clamp(0.0, 1.0)
+                        cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
 
                         # Optional pullback curvature regularization
                         pb_loss = torch.zeros((), device=device)
@@ -746,6 +771,7 @@ def main(args):
                             rec_loss +
                             args.kl_weight * kld_loss +
                             rew_loss +
+                            args.cont_weight * cont_loss +
                             args.pb_curvature_weight * pb_loss +
                             bisim_weight * bisim_loss_val
                         )
@@ -768,9 +794,21 @@ def main(args):
                     # ========================================
                     with autocast(device_type='cuda', enabled=use_amp):
                         with torch.no_grad():
-                            # Start imagination from posterior states
-                            h_start = h_seq[:, -1].detach()
-                            s_start = s_seq[:, -1].detach()
+                            # Start imagination from multiple posterior states (DreamerV1-style)
+                            # h_seq/s_seq correspond to (t+1) posterior states, shape [B, T, D]
+                            B_seq, T_seq, Dh = h_seq.shape
+                            Ds = s_seq.size(-1)
+
+                            if args.imagination_starts and args.imagination_starts > 0 and args.imagination_starts < T_seq:
+                                # Sample K start indices per sequence to limit compute
+                                K = args.imagination_starts
+                                t_idx = torch.randint(0, T_seq, (B_seq, K), device=device)
+                                h_start = h_seq.gather(1, t_idx.unsqueeze(-1).expand(-1, -1, Dh)).reshape(-1, Dh).detach()
+                                s_start = s_seq.gather(1, t_idx.unsqueeze(-1).expand(-1, -1, Ds)).reshape(-1, Ds).detach()
+                            else:
+                                # Use all posterior states as starts (can be heavy): [B*T, D]
+                                h_start = h_seq.reshape(-1, Dh).detach()
+                                s_start = s_seq.reshape(-1, Ds).detach()
 
                         # Imagination rollout
                         h_imag_list = [h_start]
@@ -804,13 +842,30 @@ def main(args):
                         values_for_advantages = values_imag.detach().clone()
 
                         # Compute λ-returns
+                        # Continuation -> discounts per step: d_t = gamma^action_repeat * p_continue(s_{t+1})
+                        cont_logits_imag = bottle(continue_model, h_imag[:, 1:], s_imag[:, 1:])  # [B_imag, H]
+                        pcont_imag = torch.sigmoid(cont_logits_imag).clamp(0.0, 1.0)
+                        discounts_imag = effective_gamma * pcont_imag
+
+                        # Targets for critic must be stop-grad (avoid λ-target leakage)
+                        with torch.no_grad():
+                            lambda_returns_tgt = compute_lambda_returns(
+                                rewards_imag.detach(), values_imag.detach(), discounts_imag.detach(), lambda_=args.lambda_
+                            )
+                            weights_imag = compute_discount_weights(discounts_imag.detach())
+
+                        # For actor objective we keep gradients through imagined dynamics -> rewards/value/continue outputs
                         lambda_returns = compute_lambda_returns(
-                            rewards_imag, values_imag,
-                            gamma=args.gamma, lambda_=args.lambda_
+                            rewards_imag, values_imag, discounts_imag, lambda_=args.lambda_
                         )
 
+                        # Discount weights for actor objective
+                        weights_actor = compute_discount_weights(discounts_imag)
+
+
+
                         # Value loss
-                        value_loss = F.mse_loss(values_imag[:, :-1], lambda_returns)
+                        value_loss = ((values_imag[:, :-1] - lambda_returns_tgt) ** 2 * weights_imag).mean()
 
                     # Value optimizer step
                     value_optim.zero_grad()
@@ -835,7 +890,7 @@ def main(args):
                             entropy = dist.entropy().sum(dim=-1).mean()
 
                             actor_entropy_scale = 1e-4 
-                            actor_loss = -lambda_returns.mean() - (actor_entropy_scale * entropy)
+                            actor_loss = -(weights_actor * lambda_returns).mean() - (actor_entropy_scale * entropy)
 
                         actor_optim.zero_grad()
                         if use_amp:
@@ -859,6 +914,7 @@ def main(args):
                     loss_accum["rec"] += rec_loss.item()
                     loss_accum["kl"] += kld_loss.item()
                     loss_accum["rew"] += rew_loss.item()
+                    loss_accum["cont"] += cont_loss.item()
                     loss_accum["pb"] += pb_loss.item()
                     loss_accum["bisim"] += bisim_loss_val.item()
                     loss_accum["actor"] += actor_loss.item()
@@ -866,7 +922,7 @@ def main(args):
                     
                     # Log advantage statistics for debugging
                     with torch.no_grad():
-                        raw_adv = lambda_returns - values_for_advantages[:, :-1]
+                        raw_adv = lambda_returns_tgt - values_for_advantages[:, :-1]
                         loss_accum["adv_mean"] += raw_adv.mean().item()
                         loss_accum["adv_std"] += raw_adv.std().item()
                         loss_accum["adv_min"] += raw_adv.min().item()
@@ -878,6 +934,7 @@ def main(args):
                 writer.add_scalar("loss/reconstruction", loss_accum["rec"] / n_updates, total_steps)
                 writer.add_scalar("loss/kl_divergence", loss_accum["kl"] / n_updates, total_steps)
                 writer.add_scalar("loss/reward", loss_accum["rew"] / n_updates, total_steps)
+                writer.add_scalar("loss/continue", loss_accum["cont"] / n_updates, total_steps)
                 writer.add_scalar("loss/pullback_curvature", loss_accum["pb"] / n_updates, total_steps)
                 writer.add_scalar("loss/bisimulation", loss_accum["bisim"] / n_updates, total_steps)
                 writer.add_scalar("loss/actor", loss_accum["actor"] / n_updates, total_steps)
