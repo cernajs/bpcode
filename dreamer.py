@@ -12,7 +12,7 @@ from torch.amp import GradScaler
 from utils import (PixelObsWrapper, DMControlWrapper, ReplayBuffer, get_device, set_seed, 
                    preprocess_img, bottle, make_env, ENV_ACTION_REPEAT)
 
-from models import ConvEncoder, ConvDecoder, RSSM, RewardModel, Actor, ValueModel
+from models import ConvEncoder, ConvDecoder, RSSM, RewardModel, Actor, ValueModel, ContinueModel
 
 
 # ===============================
@@ -448,6 +448,11 @@ def main(args):
         latent_size=args.stoch_dim,
         hidden_dim=args.hidden_dim
     ).to(device)
+    continue_model = ContinueModel(
+        state_size=args.deter_dim,
+        latent_size=args.stoch_dim,
+        hidden_dim=args.hidden_dim
+    ).to(device)
     
     # Actor-Critic (DreamerV1)
     actor = Actor(
@@ -467,7 +472,8 @@ def main(args):
         list(encoder.parameters()) + 
         list(decoder.parameters()) + 
         list(rssm.parameters()) + 
-        list(reward_model.parameters())
+        list(reward_model.parameters()) +
+        list(continue_model.parameters())
     )
     model_optim = torch.optim.Adam(world_model_params, lr=args.model_lr, eps=args.adam_eps)
     actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=args.adam_eps)
