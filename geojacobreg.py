@@ -15,42 +15,6 @@ from models import ConvEncoder, ConvDecoder, RSSM, RewardModel
 #  Losses / Regularizers
 # ===============================
 
-def compute_pullback_curvature_loss(decoder, h, s, num_projections=4, detach_features=True):
-    """
-    Hutchinson estimate of || J^T J - I ||_F^2 for decoder Jacobian wrt latent.
-    Expensive: keep projections small.
-    """
-    if detach_features:
-        h = h.detach().requires_grad_(True)
-        s = s.detach().requires_grad_(True)
-    else:
-        h = h.requires_grad_(True)
-        s = s.requires_grad_(True)
-
-    loss = 0.0
-    for _ in range(num_projections):
-        u_h = (torch.randint(0, 2, h.shape, device=h.device) * 2 - 1).to(h.dtype)
-        u_s = (torch.randint(0, 2, s.shape, device=s.device) * 2 - 1).to(s.dtype)
-
-        recon, (Ju_h, Ju_s) = torch.autograd.functional.jvp(
-            lambda hh, ss: decoder(hh, ss), (h, s), (u_h, u_s), create_graph=True
-        )
-
-        Gu_h = torch.autograd.grad(
-            outputs=recon, inputs=h, grad_outputs=Ju_h if isinstance(Ju_h, torch.Tensor) else recon, 
-            create_graph=True, retain_graph=True
-        )[0]
-        Gu_s = torch.autograd.grad(
-            outputs=recon, inputs=s, grad_outputs=Ju_s if isinstance(Ju_s, torch.Tensor) else recon,
-            create_graph=True
-        )[0]
-
-        Au_h = Gu_h - u_h
-        Au_s = Gu_s - u_s
-        loss = loss + (Au_h.pow(2).sum(dim=1)).mean() + (Au_s.pow(2).sum(dim=1)).mean()
-
-    return loss / float(num_projections)
-
 
 def bisimulation_loss(z1, z2, r1, r2, next_z1, next_z2, gamma=0.99):
     dz = torch.norm(z1 - z2.detach(), p=2, dim=1)              # [B]
@@ -242,6 +206,8 @@ def build_parser():
     p.add_argument("--pb_detach_features", action="store_true")
 
     p.add_argument("--pullback_bisim", action="store_true")
+    p.add_argument("--geo_knn_k", type=int, default=3, help="kNN degree for geodesic computation")
+    p.add_argument("--geo_time_subsample", type=int, default=8, help="Number of time steps to subsample for geodesic computation")
 
     p.add_argument("--bisimulation_weight", type=float, default=0.0, help="Bisimulation loss weight")
     p.add_argument("--bisimulation_warmup", type=int, default=50_000, help="Bisimulation warmup steps")
@@ -710,21 +676,26 @@ def main(args):
                     rew_target = rew_seq[:, :T]
                     rew_loss = F.mse_loss(rew_pred, rew_target)
 
-                    # Optional regularizers
                     pb_loss = torch.zeros((), device=device)
                     if args.pb_curvature_weight > 0.0:
-                        h_flat = h_seq.reshape(-1, args.deter_dim)
-                        s_flat = s_seq.reshape(-1, args.stoch_dim)
-                        pb_loss = compute_pullback_curvature_loss(
-                            decoder=decoder,
-                            h=h_flat,
-                            s=s_flat,
-                            num_projections=args.pb_curvature_projections,
-                            detach_features=args.pb_detach_features
-                        )
+                        # TODO: test later change geometry of manifold
+                        pass
+
+                    # Optional regularizers
+                    def bisim_lambda(total_steps, warmup=50_000, ramp=100_000, target=0.03):
+                        if total_steps < warmup:
+                            return 0.0
+                        t = min(1.0, (total_steps - warmup) / float(ramp))
+                        return target * t
+
+                    bisim_weight = bisim_lambda(total_steps,
+                                               warmup=args.bisimulation_warmup,
+                                               ramp=args.bisimulation_ramp,
+                                               target=args.bisimulation_weight)
+
 
                     bisim_loss_val = torch.zeros((), device=device)
-                    if args.bisimulation_weight > 0.0 and T > 2:
+                    if args.bisimulation_weight > 0.0 and T > 2 and bisim_weight > 0.0:
                         # use only stochastic state
                         h = h_seq[:, :-1]        # [B, T-1, Dh]
                         hn = h_seq[:, 1:]        # [B, T-1, Dh]
@@ -827,25 +798,12 @@ def main(args):
                                 bisim_stats_accum["corr"] += corr
                                 n_bisim_computations += 1
 
-                    def bisim_lambda(total_steps, warmup=50_000, ramp=100_000, target=0.03):
-                        if total_steps < warmup:
-                            return 0.0
-                        t = min(1.0, (total_steps - warmup) / float(ramp))
-                        return target * t
-
                     # Total loss
                     total = (
                         args.kl_weight * kld_loss 
                         + rec_loss 
                         + rew_loss
-                        + args.pb_curvature_weight * pb_loss
                     )
-
-                    # Compute bisim gradient contribution separately if needed
-                    bisim_weight = bisim_lambda(total_steps,
-                                               warmup=args.bisimulation_warmup,
-                                               ramp=args.bisimulation_ramp,
-                                               target=args.bisimulation_weight)
 
                     weighted_bisim = bisim_weight * bisim_loss_val
                     total_loss_value = total.item() + weighted_bisim.item()
