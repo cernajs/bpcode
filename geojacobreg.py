@@ -206,12 +206,15 @@ def build_parser():
     p.add_argument("--pb_detach_features", action="store_true")
 
     p.add_argument("--pullback_bisim", action="store_true")
-    p.add_argument("--geo_knn_k", type=int, default=3, help="kNN degree for geodesic computation")
-    p.add_argument("--geo_time_subsample", type=int, default=8, help="Number of time steps to subsample for geodesic computation")
+    p.add_argument("--geo_knn_k", type=int, default=8, help="kNN degree for geodesic computation")
+    p.add_argument("--geo_time_subsample", type=int, default=16, help="Number of time steps to subsample for geodesic computation")
 
     p.add_argument("--bisimulation_weight", type=float, default=0.0, help="Bisimulation loss weight")
-    p.add_argument("--bisimulation_warmup", type=int, default=50_000, help="Bisimulation warmup steps")
-    p.add_argument("--bisimulation_ramp", type=int, default=100_000, help="Bisimulation ramp steps")
+    p.add_argument("--bisimulation_warmup", type=int, default=0, help="Bisimulation warmup steps (0=no warmup)")
+    p.add_argument("--bisimulation_ramp", type=int, default=0, help="Bisimulation ramp steps (0=no ramp)")
+    
+    # Loss balancing (PlaNet-style)
+    p.add_argument("--reward_scale", type=float, default=1.0, help="Scale factor for reward loss")
 
     # CEM planner (reference defaults)
     p.add_argument("--plan_horizon", type=int, default=12, help="Reference: 12")
@@ -665,28 +668,35 @@ def main(args):
                     rec_loss = F.mse_loss(recon, target, reduction='none').sum((2, 3, 4)).mean()
                     # rec_loss = F.mse_loss(recon, target)
 
-                    # KL loss with free nats
                     kld_loss = torch.max(
                         kl_divergence(posterior_dist, prior_dist).sum(-1),
                         free_nats
                     ).mean()
 
-                    # Reward loss
+                    # KL loss with free nats (mean over latent dim, then over batch/time)
+                    # kl_per_latent = kl_divergence(posterior_dist, prior_dist)  # [T, B, stoch_dim]
+                    # kl_per_sample = kl_per_latent.mean(-1)  # mean over stoch_dim -> [T, B]
+                    # free_nats_per_dim = args.kl_free_nats / args.stoch_dim  # ~0.1 per dim
+                    # kld_loss = torch.max(kl_per_sample, torch.tensor(free_nats_per_dim, device=device)).mean()
+
+                    # Reward loss (scaled to balance with reconstruction)
                     rew_pred = bottle(reward_model, h_seq, s_seq)
                     rew_target = rew_seq[:, :T]
-                    rew_loss = F.mse_loss(rew_pred, rew_target)
+                    rew_loss = F.mse_loss(rew_pred, rew_target) * args.reward_scale
 
                     pb_loss = torch.zeros((), device=device)
                     if args.pb_curvature_weight > 0.0:
                         # TODO: test later change geometry of manifold
                         pass
 
-                    # Optional regularizers
-                    def bisim_lambda(total_steps, warmup=50_000, ramp=100_000, target=0.03):
-                        if total_steps < warmup:
+                    # Bisimulation weight schedule (optional warmup/ramp)
+                    def bisim_lambda(total_steps, warmup=0, ramp=0, target=1.0):
+                        if warmup > 0 and total_steps < warmup:
                             return 0.0
-                        t = min(1.0, (total_steps - warmup) / float(ramp))
-                        return target * t
+                        if ramp > 0:
+                            t = min(1.0, (total_steps - warmup) / float(ramp))
+                            return target * t
+                        return target  # No ramp: use full weight immediately
 
                     bisim_weight = bisim_lambda(total_steps,
                                                warmup=args.bisimulation_warmup,
@@ -694,8 +704,9 @@ def main(args):
                                                target=args.bisimulation_weight)
 
 
+                    # Always compute bisimulation loss for monitoring (even if weight=0)
                     bisim_loss_val = torch.zeros((), device=device)
-                    if args.bisimulation_weight > 0.0 and T > 2 and bisim_weight > 0.0:
+                    if T > 2:
                         # use only stochastic state
                         h = h_seq[:, :-1]        # [B, T-1, Dh]
                         hn = h_seq[:, 1:]        # [B, T-1, Dh]
@@ -720,20 +731,25 @@ def main(args):
                         r1  = r.reshape(-1)
                         r2  = r[perm].reshape(-1)
 
-                        # asymmetric dz
+                        # asymmetric dz (only create_graph when actually optimizing)
+                        needs_grad = bisim_weight > 0.0
                         if args.pullback_bisim:
                             dz, dz_mask, t_idx = geodesic_pb_knn(
                                 decoder=decoder,
                                 h=h,
                                 z=z,
                                 perm=perm,
-                                k=getattr(args, "geo_knn_k", 3),
-                                time_subsample=getattr(args, "geo_time_subsample", 8),  # TODO: change later
-                                create_graph=True,
+                                k=args.geo_knn_k,
+                                time_subsample=args.geo_time_subsample,
+                                create_graph=needs_grad,
                                 return_mask=True
                             )
                         else:
-                            dz = torch.norm(z1 - z2.detach(), p=2, dim=1)
+                            if needs_grad:
+                                dz = torch.norm(z1 - z2.detach(), p=2, dim=1)
+                            else:
+                                with torch.no_grad():
+                                    dz = torch.norm(z1 - z2, p=2, dim=1)
 
                         with torch.no_grad():
                             if args.pullback_bisim:
@@ -742,8 +758,8 @@ def main(args):
                                     h=hn,
                                     z=zn,
                                     perm=perm,
-                                    k=getattr(args, "geo_knn_k", 3),
-                                    time_subsample=getattr(args, "geo_time_subsample", 8),
+                                    k=args.geo_knn_k,
+                                    time_subsample=args.geo_time_subsample,
                                     t_idx=t_idx,  # reuse the same time sampling for target
                                     create_graph=False,
                                     return_mask=True
@@ -798,26 +814,21 @@ def main(args):
                                 bisim_stats_accum["corr"] += corr
                                 n_bisim_computations += 1
 
-                    # Total loss
+                    # Total loss (including bisimulation when weight > 0)
                     total = (
-                        args.kl_weight * kld_loss 
-                        + rec_loss 
+                        rec_loss 
+                        + args.kl_weight * kld_loss 
                         + rew_loss
+                        + bisim_weight * bisim_loss_val
                     )
 
-                    weighted_bisim = bisim_weight * bisim_loss_val
-                    total_loss_value = total.item() + weighted_bisim.item()
+                    total_loss_value = total.item()
 
                     optim.zero_grad()
-
-                    bisim_grad_norm = 0.0
-                    if bisim_weight > 0.0 and bisim_loss_val.requires_grad:
-                        weighted_bisim.backward(retain_graph=True)
-                        # current params.grad is only from bisim loss
-                        bisim_grad_norm = torch.nn.utils.clip_grad_norm_(params, float('inf'), norm_type=2)
-                        # optim.zero_grad() # dont zero grad, we use it later for total loss
-                    
                     total.backward()
+                    
+                    # Compute bisim gradient norm for logging (approximate)
+                    bisim_grad_norm = bisim_weight * bisim_loss_val.item() if bisim_weight > 0 else 0.0
                     
                     # Compute gradient norms for each component (before clipping)
                     with torch.no_grad():
@@ -847,6 +858,7 @@ def main(args):
                     loss_accum["rew"] += rew_loss.item()
                     loss_accum["pb"] += pb_loss.item()
                     loss_accum["bisim"] += bisim_loss_val.item()
+                    loss_accum["bisim_weighted"] = loss_accum.get("bisim_weighted", 0.0) + bisim_weight * bisim_loss_val.item()
 
                 # Log average losses to TensorBoard
                 n_updates = args.train_steps
@@ -856,9 +868,13 @@ def main(args):
                 writer.add_scalar("loss/reward", loss_accum["rew"] / n_updates, total_steps)
                 writer.add_scalar("loss/pullback_curvature", loss_accum["pb"] / n_updates, total_steps)
                 writer.add_scalar("loss/bisimulation", loss_accum["bisim"] / n_updates, total_steps)
+                writer.add_scalar("loss/bisimulation_weighted", loss_accum.get("bisim_weighted", 0.0) / n_updates, total_steps)
                 
-                # Log pullback bisim statistics if enabled
-                if args.pullback_bisim and args.bisimulation_weight > 0.0 and n_bisim_computations > 0:
+                # Log effective bisim weight (useful to see warmup/ramp progress)
+                writer.add_scalar("loss/bisim_weight", bisim_weight, total_steps)
+                
+                # Log pullback bisim statistics if computed
+                if args.pullback_bisim and n_bisim_computations > 0:
                     n_bisim_updates = n_bisim_computations
                     writer.add_scalar("bisim_stats/dz_mean", bisim_stats_accum["dz_mean"] / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/dz_std", bisim_stats_accum["dz_std"] / n_bisim_updates, total_steps)
