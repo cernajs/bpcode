@@ -1,6 +1,15 @@
-gymnasium==1.1.1
-gymnasium==1.0.0
-matplotlib==3.10.8
-numpy==2.3.5
-opencv_python==4.11.0.86
-torch==2.6.0
+torch>=2.4.0
+numpy>=1.21.0
+
+# Environment & Physics
+gymnasium>=0.29.0
+dm_control>=1.0.14
+mujoco>=3.1.0
+
+# Image Processing & Logging
+opencv-python>=4.8.0
+tensorboard>=2.14.0
+
+# Utilities
+argparse
+typing-extensions
