@@ -230,6 +230,10 @@ def build_parser():
     # TensorBoard logging
     p.add_argument("--run_name", type=str, default="geojacobreg", help="Name for TensorBoard run")
     p.add_argument("--log_dir", type=str, default="runs", help="Directory for TensorBoard logs")
+    
+    # Checkpointing
+    p.add_argument("--save_interval", type=int, default=0, help="Save checkpoint every N episodes (0=only final)")
+    p.add_argument("--load_checkpoint", type=str, default="", help="Path to checkpoint to resume from")
 
     return p
 
@@ -492,6 +496,19 @@ def main(args):
     free_nats = torch.ones(1, device=device) * args.kl_free_nats
 
     total_steps = 0
+    start_episode = 0
+    
+    # Load checkpoint if specified
+    if args.load_checkpoint:
+        print(f"Loading checkpoint from: {args.load_checkpoint}")
+        checkpoint = torch.load(args.load_checkpoint, map_location=device)
+        encoder.load_state_dict(checkpoint['encoder'])
+        decoder.load_state_dict(checkpoint['decoder'])
+        rssm.load_state_dict(checkpoint['rssm'])
+        reward_model.load_state_dict(checkpoint['reward_model'])
+        total_steps = checkpoint.get('total_steps', 0)
+        start_episode = checkpoint.get('episode', 0)
+        print(f"Resumed from episode {start_episode}, total_steps {total_steps}")
     
     # ========================================
     # Phase 1: Seed buffer with random episodes
@@ -530,9 +547,12 @@ def main(args):
     # ========================================
     # Phase 2: Main training loop
     # ========================================
-    print(f"\nStarting training for {args.max_episodes} episodes...")
+    if start_episode > 0:
+        print(f"\nResuming training from episode {start_episode} to {args.max_episodes}...")
+    else:
+        print(f"\nStarting training for {args.max_episodes} episodes...")
     
-    for episode in range(args.max_episodes):
+    for episode in range(start_episode, args.max_episodes):
         obs, _ = env.reset()
         done = False
         ep_return = 0.0
@@ -937,10 +957,41 @@ def main(args):
             
             writer.add_scalar("eval/mean_return", mean_ret, episode)
             writer.add_scalar("eval/std_return", std_ret, episode)
+        
+        # Periodic checkpoint saving
+        if args.save_interval > 0 and (episode + 1) % args.save_interval == 0:
+            checkpoint_dir = f"{args.log_dir}/{run_name}"
+            checkpoint_path = f"{checkpoint_dir}/model_ep{episode + 1}.pt"
+            print(f"  Saving checkpoint to: {checkpoint_path}")
+            torch.save({
+                'encoder': encoder.state_dict(),
+                'decoder': decoder.state_dict(),
+                'rssm': rssm.state_dict(),
+                'reward_model': reward_model.state_dict(),
+                'args': vars(args),
+                'total_steps': total_steps,
+                'episode': episode + 1,
+            }, checkpoint_path)
 
     env.close()
     writer.close()
-    print(f"\nTraining complete! TensorBoard logs saved to: {args.log_dir}/{run_name}")
+    
+    # Save final model checkpoint
+    checkpoint_dir = f"{args.log_dir}/{run_name}"
+    checkpoint_path = f"{checkpoint_dir}/model_final.pt"
+    print(f"\nSaving final model checkpoint to: {checkpoint_path}")
+    
+    torch.save({
+        'encoder': encoder.state_dict(),
+        'decoder': decoder.state_dict(),
+        'rssm': rssm.state_dict(),
+        'reward_model': reward_model.state_dict(),
+        'args': vars(args),
+        'total_steps': total_steps,
+        'episode': args.max_episodes,
+    }, checkpoint_path)
+    
+    print(f"Training complete! TensorBoard logs and checkpoint saved to: {args.log_dir}/{run_name}")
 
 
 if __name__ == "__main__":
