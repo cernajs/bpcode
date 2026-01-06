@@ -50,9 +50,12 @@ def vicreg_loss(z1, z2, sim_weight=25.0, var_weight=25.0, cov_weight=1.0, eps=1e
 def random_shift(x, pad = 4):
     n, c, h, w = x.shape
     x = F.pad(x, (pad, pad, pad, pad), mode='replicate')
-    eps_h = torch.randint(-pad, pad + 1, (n, 1, 1, 1), device=x.device)
-    eps_w = torch.randint(-pad, pad + 1, (n, 1, 1, 1), device=x.device)
-    return x[:, :, pad + eps_h:pad + eps_h + h, pad + eps_w:pad + eps_w + w]
+    eps_h = torch.randint(0, 2*pad + 1, (n,), device=x.device)
+    eps_w = torch.randint(0, 2*pad + 1, (n,), device=x.device)
+    out = torch.empty_like(x)
+    for i in range(n):
+        out[i] = x[i, :, eps_h[i]:eps_h[i] + h, eps_w[i]:eps_w[i] + w]
+    return out
 
 def mild_jitter(x, brightness=0.4):
     return x + (torch.rand((x.shape[0], 1, 1, 1), device=x.device) * 2 - 1) * brightness
