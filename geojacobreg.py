@@ -1,4 +1,5 @@
 import argparse
+import copy
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ from utils import (PixelObsWrapper, DMControlWrapper, ReplayBuffer, get_device, 
                    preprocess_img, bottle, make_env, ENV_ACTION_REPEAT)
 
 from models import ConvEncoder, ConvDecoder, RSSM, RewardModel
+from vicreg_net import PhiNet, ema_update, phi_augment, vicreg_loss
 
 # ===============================
 #  Losses / Regularizers
@@ -475,6 +477,13 @@ def main(args):
         hidden_dim=args.hidden_dim
     ).to(device)
 
+    phi_net = PhiNet(in_channels=C, hidden_channels=args.hidden_dim, out_dim=args.embed_dim).to(device)
+    phi_net_target = copy.deepcopy(phi_net)
+    phi_net_target.eval()
+    for param in phi_net_target.parameters():
+        param.requires_grad = False
+    ema_update(phi_net_target, phi_net, 0.999)
+
     # Single optimizer for all parameters
     params = (
         list(encoder.parameters()) + 
@@ -483,12 +492,16 @@ def main(args):
         list(reward_model.parameters())
     )
     optim = torch.optim.Adam(params, lr=args.lr, eps=args.adam_eps)
+    phi_optim = torch.optim.Adam(phi_net_params, lr=args.lr, eps=args.adam_eps)
+    phi_tau = 0.995
+    feat_alaign_weight = 0.1
     
     # Store parameter groups for gradient norm computation
     encoder_params = list(encoder.parameters())
     decoder_params = list(decoder.parameters())
     rssm_params = list(rssm.parameters())
     reward_params = list(reward_model.parameters())
+    phi_net_params = list(phi_net.parameters())
 
     replay = ReplayBuffer(args.replay_buff_capacity, obs_shape=(H, W, C), act_dim=act_dim)
 
@@ -687,6 +700,31 @@ def main(args):
                     target = x[:, 1:T+1]
                     rec_loss = F.mse_loss(recon, target, reduction='none').sum((2, 3, 4)).mean()
                     # rec_loss = F.mse_loss(recon, target)
+
+                    real = target.reshape(-1, C, H, W)
+                    phi_net.train()
+                    x1 = phi_augment(real)
+                    x2 = phi_augment(real)
+                    z1 = phi_net(x1)
+                    z2 = phi_net(x2)
+                    phi_loss = vicreg_loss(z1, z2)
+
+                    phi_optim.zero_grad()
+                    phi_loss.backward()
+                    phi_optim.step()
+                    ema_update(phi_net_target, phi_net, phi_tau)
+                    phi_net_target.eval()
+
+                    with torch.no_grad():
+                        writer.add_scalar("phi/loss", phi_loss.item(), total_steps)
+                        writer.add_scalar("phi/z1_mean", z1.mean().item(), total_steps)
+                        writer.add_scalar("phi/z1_std", z1.std().item(), total_steps)
+                        writer.add_scalar("phi/z2_mean", z2.mean().item(), total_steps)
+                        writer.add_scalar("phi/z2_std", z2.std().item(), total_steps)
+                        writer.add_scalar("phi/z1_z2_corr", (z1 * z2).mean().item(), total_steps)
+                        writer.add_scalar("phi/z1_z2_cov", (z1 * z2).var().item(), total_steps)
+                        writer.add_scalar("phi/z1_z2_cov_off_diag", (z1 * z2).flatten()[:-1].view(z1.size(0) - 1, z1.size(1) + 1)[:, 1:].flatten().var().item(), total_steps)
+
 
                     kld_loss = torch.max(
                         kl_divergence(posterior_dist, prior_dist).sum(-1),
