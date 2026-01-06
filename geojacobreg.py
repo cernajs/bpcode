@@ -907,7 +907,8 @@ def main(args):
                     optim.step()
 
                     # Train phi network separately (after main optimizer to avoid inplace conflicts)
-                    real = target.reshape(-1, C, H, W)
+                    # Reuse target_flat from earlier (already reshaped)
+                    real = target_flat.detach()
                     phi_net.train()
                     x1 = phi_augment(real)
                     x2 = phi_augment(real)
