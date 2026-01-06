@@ -1,5 +1,6 @@
 import argparse
 import copy
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -268,7 +269,7 @@ def make_run_name(args):
     
     return "_".join(parts)
 
-def pullback_distance_s(decoder, h, s1, s2, create_graph=True):
+def pullback_distance_s(decoder, phi_target, h, s1, s2, create_graph=True):
     """
     Computes || J_s g(h, s1) · (s1 - s2) ||_2  (pullback metric at (h, s1))
     h:  [N, Dh] treated as constant
@@ -278,7 +279,8 @@ def pullback_distance_s(decoder, h, s1, s2, create_graph=True):
     delta = (s1 - s2)  # [N, Ds]
 
     def decoder_wrapper(s):
-        return decoder(h, s)
+        x = decoder(h, s)
+        return phi_target(x)
 
     # JVP wrt s only, holding h fixed
     _, Jdelta = torch.autograd.functional.jvp(
@@ -287,9 +289,8 @@ def pullback_distance_s(decoder, h, s1, s2, create_graph=True):
         (delta,),
         create_graph=create_graph,
     )
-    Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
-    # return torch.norm(Jdelta, dim=1)
-    return torch.sqrt((Jdelta * Jdelta).mean(dim=1) + 1e-8)
+    
+    return torch.norm(Jdelta, dim=1) / math.sqrt(Jdelta.size(1))
 
 def pullback_distance_full(decoder, h1, s1, h2, s2, create_graph=True):
     """
@@ -328,7 +329,7 @@ def floyd_warshall_minplus(W):
         D = softmin(D, trough)
     return D
 
-def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, inf=1e9):
+def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_graph=True, inf=1e9):
     """
     h_t: [B, Dh]
     z_t: [B, Ds]
@@ -353,22 +354,23 @@ def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, in
     dst = knn.reshape(-1)                                          # [B*k]
 
     # --- Edge weights: pullback length at source (asymmetric: detach destination) ---
-    # w = pullback_distance_s(
-    #     decoder,
-    #     h=h_t[src],
-    #     s1=z_t[src],
-    #     s2=z_t[dst].detach(),
-    #     create_graph=create_graph
-    # )  # [B*k]
-
-    w = pullback_distance_full(
+    w = pullback_distance_s(
         decoder,
-        h1=h_t[src],
+        phi_target=phi_target,
+        h=h_t[src],
         s1=z_t[src],
-        h2=h_t[dst].detach(),
         s2=z_t[dst].detach(),
         create_graph=create_graph
-    )
+    )  # [B*k]
+
+    # w = pullback_distance_full(
+    #     decoder,
+    #     h1=h_t[src],
+    #     s1=z_t[src],
+    #     h2=h_t[dst].detach(),
+    #     s2=z_t[dst].detach(),
+    #     create_graph=create_graph
+    # )
 
     # --- Assemble adjacency matrix W ---
     W = torch.full((B, B), inf, device=device, dtype=dtype)
@@ -385,7 +387,7 @@ def geodesic_pb_knn_slice(decoder, h_t, z_t, targets, k=3, create_graph=True, in
     dz_t = D[torch.arange(B, device=device), targets]
     return dz_t
 
-def geodesic_pb_knn(decoder, h, z, perm, k=10, time_subsample=None, t_idx=None, create_graph=True, return_mask=False):
+def geodesic_pb_knn(decoder, phi_target, h, z, perm, k=10, time_subsample=None, t_idx=None, create_graph=True, return_mask=False):
     """
     h: [B, T, Dh]  (here you’ll pass h = h_seq[:, :-1])
     z: [B, T, Ds]  (here z = s_seq[:, :-1])
@@ -412,6 +414,7 @@ def geodesic_pb_knn(decoder, h, z, perm, k=10, time_subsample=None, t_idx=None, 
     for t in t_idx.tolist():
         dz[:, t] = geodesic_pb_knn_slice(
             decoder=decoder,
+            phi_target=phi_target,
             h_t=h[:, t],
             z_t=z[:, t],
             targets=perm,
@@ -492,16 +495,17 @@ def main(args):
         list(reward_model.parameters())
     )
     optim = torch.optim.Adam(params, lr=args.lr, eps=args.adam_eps)
+    phi_net_params = list(phi_net.parameters())
     phi_optim = torch.optim.Adam(phi_net_params, lr=args.lr, eps=args.adam_eps)
     phi_tau = 0.995
-    feat_alaign_weight = 0.1
+    feat_align_weight = 0.1
     
     # Store parameter groups for gradient norm computation
     encoder_params = list(encoder.parameters())
     decoder_params = list(decoder.parameters())
     rssm_params = list(rssm.parameters())
     reward_params = list(reward_model.parameters())
-    phi_net_params = list(phi_net.parameters())
+    # phi_net_params = list(phi_net.parameters())
 
     replay = ReplayBuffer(args.replay_buff_capacity, obs_shape=(H, W, C), act_dim=act_dim)
 
@@ -701,6 +705,15 @@ def main(args):
                     rec_loss = F.mse_loss(recon, target, reduction='none').sum((2, 3, 4)).mean()
                     # rec_loss = F.mse_loss(recon, target)
 
+                    recon_flat = recon.reshape(-1, C, H, W)
+                    target_flat = target.reshape(-1, C, H, W)
+
+                    feat_recon = phi_net(recon_flat)
+                    with torch.no_grad():
+                        feat_target = phi_net_target(target_flat)
+  
+                    feat_loss = F.mse_loss(feat_recon, feat_target)
+
                     real = target.reshape(-1, C, H, W)
                     phi_net.train()
                     x1 = phi_augment(real)
@@ -723,8 +736,6 @@ def main(args):
                         writer.add_scalar("phi/z2_std", z2.std().item(), total_steps)
                         writer.add_scalar("phi/z1_z2_corr", (z1 * z2).mean().item(), total_steps)
                         writer.add_scalar("phi/z1_z2_cov", (z1 * z2).var().item(), total_steps)
-                        writer.add_scalar("phi/z1_z2_cov_off_diag", (z1 * z2).flatten()[:-1].view(z1.size(0) - 1, z1.size(1) + 1)[:, 1:].flatten().var().item(), total_steps)
-
 
                     kld_loss = torch.max(
                         kl_divergence(posterior_dist, prior_dist).sum(-1),
@@ -794,6 +805,7 @@ def main(args):
                         if args.pullback_bisim:
                             dz, dz_mask, t_idx = geodesic_pb_knn(
                                 decoder=decoder,
+                                phi_target=phi_net_target,
                                 h=h,
                                 z=z,
                                 perm=perm,
@@ -878,6 +890,7 @@ def main(args):
                         + args.kl_weight * kld_loss 
                         + rew_loss
                         + bisim_weight * bisim_loss_val
+                        + feat_align_weight * feat_loss
                     )
 
                     total_loss_value = total.item()
