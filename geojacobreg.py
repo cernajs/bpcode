@@ -795,10 +795,10 @@ def main(args):
                             target_masked = target[mask]
                             dz_masked = dz[mask]
                             scale = target_masked.detach().abs().mean().clamp_min(1e-6)
-                            bisim_loss_val = F.mse_loss(dz_masked / scale, target_masked / scale)
+                            bisim_loss_val = F.mse_loss(dz_masked, target_masked) / scale
                         else:
                             scale = target.detach().abs().mean().clamp_min(1e-6)
-                            bisim_loss_val = F.mse_loss(dz / scale, target / scale)
+                            bisim_loss_val = F.mse_loss(dz, target) / scale
                         
                         # Compute statistics for pullback bisim logging
                         if args.pullback_bisim:
