@@ -827,6 +827,7 @@ def main(args):
                             if args.pullback_bisim:
                                 dnext, _, _ = geodesic_pb_knn(
                                     decoder=decoder,
+                                    phi_target=phi_net_target,
                                     h=hn,
                                     z=zn,
                                     perm=perm,
