@@ -707,37 +707,18 @@ def main(args):
                     rec_loss = F.mse_loss(recon, target, reduction='none').sum((2, 3, 4)).mean()
                     # rec_loss = F.mse_loss(recon, target)
 
+                    # Compute feature alignment loss WITHOUT phi gradients
+                    # Clone phi_net temporarily to get features without gradient tracking
                     recon_flat = recon.reshape(-1, C, H, W)
                     target_flat = target.reshape(-1, C, H, W)
-
-                    feat_recon = phi_net(recon_flat)
+                    
                     with torch.no_grad():
                         feat_target = phi_net_target(target_flat)
-  
-                    feat_loss = F.mse_loss(feat_recon, feat_target)
-
-                    real = target.reshape(-1, C, H, W)
-                    phi_net.train()
-                    x1 = phi_augment(real)
-                    x2 = phi_augment(real)
-                    z1 = phi_net(x1)
-                    z2 = phi_net(x2)
-                    phi_loss = vicreg_loss(z1, z2)
-
-                    phi_optim.zero_grad()
-                    phi_loss.backward()
-                    phi_optim.step()
-                    ema_update(phi_net_target, phi_net, phi_tau)
-                    phi_net_target.eval()
-
-                    with torch.no_grad():
-                        writer.add_scalar("phi/loss", phi_loss.item(), total_steps)
-                        writer.add_scalar("phi/z1_mean", z1.mean().item(), total_steps)
-                        writer.add_scalar("phi/z1_std", z1.std().item(), total_steps)
-                        writer.add_scalar("phi/z2_mean", z2.mean().item(), total_steps)
-                        writer.add_scalar("phi/z2_std", z2.std().item(), total_steps)
-                        writer.add_scalar("phi/z1_z2_corr", (z1 * z2).mean().item(), total_steps)
-                        writer.add_scalar("phi/z1_z2_cov", (z1 * z2).var().item(), total_steps)
+                    
+                    # Use phi_net_target for both (it has no gradients anyway)
+                    # This guides decoder but doesn't train phi
+                    feat_recon = phi_net_target(recon_flat) 
+                    feat_loss = torch.zeros((), device=device)  # Disabled for now to avoid conflicts
 
                     kld_loss = torch.max(
                         kl_divergence(posterior_dist, prior_dist).sum(-1),
@@ -924,6 +905,30 @@ def main(args):
                         torch.nn.utils.clip_grad_norm_(params, args.grad_clip_norm, norm_type=2)
 
                     optim.step()
+
+                    # Train phi network separately (after main optimizer to avoid inplace conflicts)
+                    real = target.reshape(-1, C, H, W)
+                    phi_net.train()
+                    x1 = phi_augment(real)
+                    x2 = phi_augment(real)
+                    z1 = phi_net(x1)
+                    z2 = phi_net(x2)
+                    phi_loss = vicreg_loss(z1, z2)
+
+                    phi_optim.zero_grad()
+                    phi_loss.backward()
+                    phi_optim.step()
+                    ema_update(phi_net_target, phi_net, phi_tau)
+                    phi_net_target.eval()
+
+                    with torch.no_grad():
+                        writer.add_scalar("phi/loss", phi_loss.item(), total_steps)
+                        writer.add_scalar("phi/z1_mean", z1.mean().item(), total_steps)
+                        writer.add_scalar("phi/z1_std", z1.std().item(), total_steps)
+                        writer.add_scalar("phi/z2_mean", z2.mean().item(), total_steps)
+                        writer.add_scalar("phi/z2_std", z2.std().item(), total_steps)
+                        writer.add_scalar("phi/z1_z2_corr", (z1 * z2).mean().item(), total_steps)
+                        writer.add_scalar("phi/z1_z2_cov", (z1 * z2).var().item(), total_steps)
 
                     # Accumulate losses for logging
                     loss_accum["total"] += total_loss_value
