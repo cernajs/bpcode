@@ -304,7 +304,7 @@ def pullback_distance_full(decoder, phi_target, h1, s1, h2, s2, create_graph=Tru
     def decoder_wrapper(h, s):
         x = decoder(h, s)
         f = phi_target(x)
-        f = F.layer_norm(f, (f.size(-1),))
+        f = F.layer_norm(f, (f.size(-1),)) # std went up, possible fix
         return f
 
     """
@@ -362,6 +362,10 @@ def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_gr
     src = torch.arange(B, device=device).repeat_interleave(k)       # [B*k]
     dst = knn.reshape(-1)                                          # [B*k]
 
+    # add reverse edges explicitly so both directions have real weights
+    src2 = torch.cat([src, dst], dim=0)
+    dst2 = torch.cat([dst, src], dim=0)
+
     # --- Edge weights: pullback length at source (asymmetric: detach destination) ---
     # w = pullback_distance_s(
     #     decoder,
@@ -372,20 +376,20 @@ def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_gr
     #     create_graph=create_graph
     # )  # [B*k]
 
-    w = pullback_distance_full(
+    w2 = pullback_distance_full(
         decoder,
         phi_target=phi_target,
-        h1=h_t[src],
-        s1=z_t[src],
-        h2=h_t[dst].detach(),
-        s2=z_t[dst].detach(),
+        h1=h_t[src2],
+        s1=z_t[src2],
+        h2=h_t[dst2].detach(),
+        s2=z_t[dst2].detach(),
         create_graph=create_graph
     )
 
     # --- Assemble adjacency matrix W ---
-    W = torch.full((B, B), inf, device=device, dtype=dtype)
+    W = torch.full((B, B), inf, device=device, dtype=torch.float32)
     W.fill_diagonal_(0.0)
-    W[src, dst] = w
+    W[src2, dst2] = w2.float()
 
     # Make graph undirected by symmetrizing (take minimum of both directions)
     W = torch.minimum(W, W.T)
