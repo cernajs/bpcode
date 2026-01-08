@@ -264,7 +264,7 @@ def make_run_name(args):
     if args.pullback_bisim:
         parts.append("pullback_bisim_knn_h_s_grad")
 
-    parts.append(f"phi_align")
+    parts.append(f"phi_align_fixed")
     
     # Add seed for reproducibility tracking
     parts.append(f"seed{args.seed}")
