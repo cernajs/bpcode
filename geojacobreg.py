@@ -8,7 +8,7 @@ from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 
-from utils import (PixelObsWrapper, DMControlWrapper, ReplayBuffer, get_device, set_seed, 
+from utils import (PixelObsWrapper, DMControlWrapper, ReplayBuffer, get_device, no_param_grads, set_seed, 
                    preprocess_img, bottle, make_env, ENV_ACTION_REPEAT)
 
 from models import ConvEncoder, ConvDecoder, RSSM, RewardModel
@@ -294,7 +294,7 @@ def pullback_distance_s(decoder, phi_target, h, s1, s2, create_graph=True):
     
     return torch.norm(Jdelta, dim=1) / math.sqrt(Jdelta.size(1))
 
-def pullback_distance_full(decoder, h1, s1, h2, s2, create_graph=True):
+def pullback_distance_full(decoder, phi_target, h1, s1, h2, s2, create_graph=True):
     """
     Computes || J_{h,s} g(h1, s1) · ([h1, s1] - [h2, s2]) ||_2
     """
@@ -302,16 +302,22 @@ def pullback_distance_full(decoder, h1, s1, h2, s2, create_graph=True):
     delta_s = (s1 - s2)
     
     def decoder_wrapper(h, s):
-        return decoder(h, s)
-    
-    _, Jdelta = torch.autograd.functional.jvp(
-        decoder_wrapper,
-        (h1, s1),
-        (delta_h, delta_s),
-        create_graph=create_graph,
-    )
+        x = decoder(h, s)
+        f = phi_target(x)
+        f = F.layer_norm(f, (f.size(-1),))
+        return f
+
+    """
+    when gradient flow from here:
+    -making the decoder insensitive to s,
+    -making phi rescale/warp features,
+    -instead of learning better latent dynamics.
+    """
+
+    with no_param_grads(decoder), no_param_grads(phi_target):
+        _, Jdelta = torch.autograd.functional.jvp(decoder_wrapper, (h1, s1), (delta_h, delta_s), create_graph=create_graph)
+
     Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
-    # return torch.norm(Jdelta, dim=1)
     return torch.sqrt((Jdelta * Jdelta).mean(dim=1) + 1e-8)
 
 # softmin(x, x) = -tau*log(2) < 0
@@ -357,23 +363,24 @@ def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_gr
     dst = knn.reshape(-1)                                          # [B*k]
 
     # --- Edge weights: pullback length at source (asymmetric: detach destination) ---
-    w = pullback_distance_s(
-        decoder,
-        phi_target=phi_target,
-        h=h_t[src],
-        s1=z_t[src],
-        s2=z_t[dst].detach(),
-        create_graph=create_graph
-    )  # [B*k]
-
-    # w = pullback_distance_full(
+    # w = pullback_distance_s(
     #     decoder,
-    #     h1=h_t[src],
+    #     phi_target=phi_target,
+    #     h=h_t[src],
     #     s1=z_t[src],
-    #     h2=h_t[dst].detach(),
     #     s2=z_t[dst].detach(),
     #     create_graph=create_graph
-    # )
+    # )  # [B*k]
+
+    w = pullback_distance_full(
+        decoder,
+        phi_target=phi_target,
+        h1=h_t[src],
+        s1=z_t[src],
+        h2=h_t[dst].detach(),
+        s2=z_t[dst].detach(),
+        create_graph=create_graph
+    )
 
     # --- Assemble adjacency matrix W ---
     W = torch.full((B, B), inf, device=device, dtype=dtype)

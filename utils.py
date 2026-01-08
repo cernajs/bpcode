@@ -55,6 +55,18 @@ def preprocess_img(image, depth=5):
     image.div_(2 ** (8 - depth)).floor_().div_(2 ** depth).sub_(0.5)
     image.add_(torch.randn_like(image).div_(2 ** depth)).clamp_(-0.5, 0.5)
 
+from contextlib import contextmanager
+
+@contextmanager
+def no_param_grads(module):
+    req = [p.requires_grad for p in module.parameters()]
+    try:
+        for p in module.parameters():
+            p.requires_grad_(False)
+        yield
+    finally:
+        for p, r in zip(module.parameters(), req):
+            p.requires_grad_(r)
 
 def postprocess_img(image, depth=5):
     """
