@@ -314,6 +314,7 @@ def pullback_distance_full(decoder, h1, s1, h2, s2, create_graph=True):
     # return torch.norm(Jdelta, dim=1)
     return torch.sqrt((Jdelta * Jdelta).mean(dim=1) + 1e-8)
 
+# softmin(x, x) = -tau*log(2) < 0
 def softmin(x, trough, tau=0.1):
     x = torch.clamp(x, max=1e6)
     trough = torch.clamp(trough, max=1e6)
@@ -328,7 +329,7 @@ def floyd_warshall_minplus(W):
     B = D.size(0)
     for k in range(B):
         trough = D[:, k:k+1] + D[k:k+1, :]
-        D = softmin(D, trough)
+        D = torch.minimum(D, trough)
     return D
 
 def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_graph=True, inf=1e9):
