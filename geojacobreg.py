@@ -346,6 +346,7 @@ def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_gr
     k: number of neighbors per node in the kNN graph
     create_graph: True for dz, False for dnext
     Returns: dz_t: [B] geodesic approx from i -> targets[i]
+             edge_weights: [B*k*2] mean edge weight for monitoring
     """
     B = z_t.size(0)
     device = z_t.device
@@ -399,7 +400,7 @@ def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_gr
 
     # distance i -> targets[i]
     dz_t = D[torch.arange(B, device=device), targets]
-    return dz_t
+    return dz_t, w2.detach()  # Add edge weights for monitoring
 
 def action_targets(a_t, topm=3):
     dist = torch.cdist(a_t, a_t)
@@ -413,6 +414,7 @@ def geodesic_pb_knn(decoder, phi_target, h, z, targets, k=10, time_subsample=Non
     B, T, _ = z.shape
     dz = torch.zeros((B, T), device=z.device, dtype=z.dtype)
     mask = torch.zeros((T,), device=z.device, dtype=torch.bool)
+    edge_weights_list = []  # NEW: collect edge weights
 
     if t_idx is None:
         t_idx = torch.arange(T, device=z.device) if (time_subsample is None or time_subsample >= T) \
@@ -420,12 +422,16 @@ def geodesic_pb_knn(decoder, phi_target, h, z, targets, k=10, time_subsample=Non
 
     for t in t_idx.tolist():
         tgt_t = targets if targets.ndim == 1 else targets[:, t]
-        dz[:, t] = geodesic_pb_knn_slice(decoder, phi_target, h[:, t], z[:, t], tgt_t, k=k, create_graph=create_graph)
+        dz_t, w_t = geodesic_pb_knn_slice(decoder, phi_target, h[:, t], z[:, t], tgt_t, k=k, create_graph=create_graph)  # NEW: receive edge weights
+        dz[:, t] = dz_t
         mask[t] = True
+        edge_weights_list.append(w_t)  # NEW: collect
+
+    edge_weights = torch.cat(edge_weights_list) if edge_weights_list else torch.tensor([], device=z.device)  # NEW
 
     if return_mask:
-        return dz.reshape(-1), mask.repeat(B), t_idx
-    return dz.reshape(-1)
+        return dz.reshape(-1), mask.repeat(B), t_idx, edge_weights  # NEW: return edge weights
+    return dz.reshape(-1), edge_weights  # NEW
 
 
 def main(args):
@@ -783,7 +789,7 @@ def main(args):
                         # asymmetric dz (only create_graph when actually optimizing)
                         needs_grad = bisim_weight > 0.0
                         if args.pullback_bisim:
-                            dz, dz_mask, _ = geodesic_pb_knn(
+                            dz, dz_mask, t_idx, edge_weights = geodesic_pb_knn(  # NEW: receive edge_weights and t_idx
                                 decoder=decoder,
                                 phi_target=phi_net_target,
                                 h=h,
@@ -801,6 +807,7 @@ def main(args):
                             dz = dz_mat.reshape(-1)
                             dz_mask = torch.zeros((B * Tm1,), device=device, dtype=torch.bool)
                             dz_mask[(t_grid.reshape(-1).unsqueeze(0) == t_idx.reshape(-1).unsqueeze(1)).any(dim=0)] = True
+                            edge_weights = torch.tensor([], device=device)  # NEW: empty tensor for non-pullback case
 
                         with torch.no_grad():
                             # dr using same per-time targets
@@ -809,7 +816,7 @@ def main(args):
                             dr = (r - r2).abs().reshape(-1)
 
                             if args.pullback_bisim:
-                                dnext, _, _ = geodesic_pb_knn(
+                                dnext, _, _, _ = geodesic_pb_knn(  # NEW: ignore edge_weights here
                                     decoder=decoder,
                                     phi_target=phi_net_target,
                                     h=hn,
@@ -817,7 +824,7 @@ def main(args):
                                     targets=targets,
                                     k=args.geo_knn_k,
                                     time_subsample=args.geo_time_subsample,
-                                    t_idx=t_idx,
+                                    t_idx=t_idx,  # Reuse t_idx from first call
                                     create_graph=False,
                                     return_mask=True
                                 )
@@ -860,6 +867,14 @@ def main(args):
                                 target_var = target_centered.pow(2).mean()
                                 corr = (numerator / (dz_var.sqrt() * target_var.sqrt() + 1e-8)).item()
                                 
+                                # NEW: Edge weight monitoring
+                                edge_weight_mean = edge_weights.mean().item() if len(edge_weights) > 0 else 0.0
+                                edge_weight_std = edge_weights.std().item() if len(edge_weights) > 0 else 0.0
+                                
+                                # NEW: Phi feature scale monitoring
+                                feat_norm_mean = feat_target.norm(dim=-1).mean().item()
+                                feat_std = feat_target.std(dim=-1).mean().item()
+                                
                                 bisim_stats_accum["dz_mean"] += dz_mean
                                 bisim_stats_accum["dz_std"] += dz_std
                                 bisim_stats_accum["target_mean"] += target_mean
@@ -867,6 +882,10 @@ def main(args):
                                 bisim_stats_accum["abs_err_mean"] += abs_err_mean
                                 bisim_stats_accum["rel_err"] += rel_err
                                 bisim_stats_accum["corr"] += corr
+                                bisim_stats_accum["edge_weight_mean"] = bisim_stats_accum.get("edge_weight_mean", 0.0) + edge_weight_mean  # NEW
+                                bisim_stats_accum["edge_weight_std"] = bisim_stats_accum.get("edge_weight_std", 0.0) + edge_weight_std  # NEW
+                                bisim_stats_accum["feat_norm_mean"] = bisim_stats_accum.get("feat_norm_mean", 0.0) + feat_norm_mean  # NEW
+                                bisim_stats_accum["feat_std"] = bisim_stats_accum.get("feat_std", 0.0) + feat_std  # NEW
                                 n_bisim_computations += 1
 
                     # Total loss (including bisimulation when weight > 0)
@@ -964,6 +983,12 @@ def main(args):
                     writer.add_scalar("bisim_stats/abs_err_mean", bisim_stats_accum["abs_err_mean"] / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/rel_err", bisim_stats_accum["rel_err"] / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/corr", bisim_stats_accum["corr"] / n_bisim_updates, total_steps)
+                    
+                    # NEW: Add monitoring metrics
+                    writer.add_scalar("bisim_stats/edge_weight_mean", bisim_stats_accum.get("edge_weight_mean", 0.0) / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/edge_weight_std", bisim_stats_accum.get("edge_weight_std", 0.0) / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/feat_norm_mean", bisim_stats_accum.get("feat_norm_mean", 0.0) / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/feat_std", bisim_stats_accum.get("feat_std", 0.0) / n_bisim_updates, total_steps)
                 
                 # Log gradient norms
                 n_updates = args.train_steps
