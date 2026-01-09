@@ -8,7 +8,7 @@ from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 
-from utils import (PixelObsWrapper, DMControlWrapper, ReplayBuffer, get_device, no_param_grads, set_seed, 
+from utils import (ReplayBuffer, get_device, no_param_grads, set_seed, 
                    preprocess_img, bottle, make_env, ENV_ACTION_REPEAT)
 
 from models import ConvEncoder, ConvDecoder, RSSM, RewardModel
