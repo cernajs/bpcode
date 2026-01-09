@@ -494,6 +494,16 @@ def main(args):
         param.requires_grad = False
     ema_update(phi_net_target, phi_net, 0.999)
 
+    # --- Feature Bank for Stable VICReg ---
+    # Capacity 256 is large enough for stats, small enough for VRAM
+    bank_capacity = 256 
+    feature_bank = torch.randn(bank_capacity, args.embed_dim, device=device)
+    feature_bank = F.normalize(feature_bank, dim=-1)  # Start normalized
+    bank_ptr = 0
+    
+    # --- Target Scaler for Bisimulation ---
+    target_scale_ema = 1.0
+
     # Single optimizer for all parameters
     params = (
         list(encoder.parameters()) + 
@@ -816,7 +826,7 @@ def main(args):
                             dr = (r - r2).abs().reshape(-1)
 
                             if args.pullback_bisim:
-                                dnext, _, _, _ = geodesic_pb_knn(  # NEW: ignore edge_weights here
+                                dnext, _, _, _ = geodesic_pb_knn(
                                     decoder=decoder,
                                     phi_target=phi_net_target,
                                     h=hn,
@@ -825,29 +835,38 @@ def main(args):
                                     k=args.geo_knn_k,
                                     time_subsample=args.geo_time_subsample,
                                     t_idx=t_idx,  # Reuse t_idx from first call
-                                    create_graph=False,
+                                    create_graph=False,  # STOP GRADIENT HERE
                                     return_mask=True
                                 )
                             else:
                                 n2 = zn[targets, t_grid]
                                 dnext = torch.norm(zn - n2, p=2, dim=-1).reshape(-1)
 
-                            target = dr + args.gamma * dnext
+                            # Raw target calculation
+                            raw_target = dr + args.gamma * dnext
+                            
+                            # --- Update Target Scale (EMA) ---
+                            # This scales the huge reward diffs down to match latent space
+                            batch_scale = raw_target.mean()
+                            target_scale_ema = 0.99 * target_scale_ema + 0.01 * batch_scale.item()
+                            safe_scale = max(target_scale_ema, 1e-4)  # Avoid div by zero
+                            
+                            # Normalize target (detached)
+                            normalized_target = raw_target / safe_scale
 
                         # ---- loss on sampled time steps only ----
                         mask = dz_mask.bool()
                         dz_m = dz[mask]
-                        tgt_m = target[mask]
+                        tgt_m = normalized_target[mask]  # Uses the normalized target
 
-                        scale = tgt_m.detach().abs().mean().clamp_min(1e-6)
-                        bisim_loss_val = F.mse_loss(dz_m, tgt_m) / scale
+                        bisim_loss_val = F.mse_loss(dz_m, tgt_m)
                         
                         # Compute statistics for pullback bisim logging
                         if args.pullback_bisim:
                             with torch.no_grad():
                                 mask = dz_mask.bool()
                                 dz_detached = dz.detach()[mask]
-                                target_detached = target.detach()[mask]
+                                target_detached = normalized_target.detach()[mask]
                                 
                                 dz_mean = dz_detached.mean().item()
                                 dz_std = dz_detached.std().item()
@@ -867,11 +886,11 @@ def main(args):
                                 target_var = target_centered.pow(2).mean()
                                 corr = (numerator / (dz_var.sqrt() * target_var.sqrt() + 1e-8)).item()
                                 
-                                # NEW: Edge weight monitoring
+                                # Edge weight monitoring
                                 edge_weight_mean = edge_weights.mean().item() if len(edge_weights) > 0 else 0.0
                                 edge_weight_std = edge_weights.std().item() if len(edge_weights) > 0 else 0.0
                                 
-                                # NEW: Phi feature scale monitoring
+                                # Phi feature scale monitoring
                                 feat_norm_mean = feat_target.norm(dim=-1).mean().item()
                                 feat_std = feat_target.std(dim=-1).mean().item()
                                 
@@ -882,10 +901,11 @@ def main(args):
                                 bisim_stats_accum["abs_err_mean"] += abs_err_mean
                                 bisim_stats_accum["rel_err"] += rel_err
                                 bisim_stats_accum["corr"] += corr
-                                bisim_stats_accum["edge_weight_mean"] = bisim_stats_accum.get("edge_weight_mean", 0.0) + edge_weight_mean  # NEW
-                                bisim_stats_accum["edge_weight_std"] = bisim_stats_accum.get("edge_weight_std", 0.0) + edge_weight_std  # NEW
-                                bisim_stats_accum["feat_norm_mean"] = bisim_stats_accum.get("feat_norm_mean", 0.0) + feat_norm_mean  # NEW
-                                bisim_stats_accum["feat_std"] = bisim_stats_accum.get("feat_std", 0.0) + feat_std  # NEW
+                                bisim_stats_accum["edge_weight_mean"] = bisim_stats_accum.get("edge_weight_mean", 0.0) + edge_weight_mean
+                                bisim_stats_accum["edge_weight_std"] = bisim_stats_accum.get("edge_weight_std", 0.0) + edge_weight_std
+                                bisim_stats_accum["feat_norm_mean"] = bisim_stats_accum.get("feat_norm_mean", 0.0) + feat_norm_mean
+                                bisim_stats_accum["feat_std"] = bisim_stats_accum.get("feat_std", 0.0) + feat_std
+                                bisim_stats_accum["target_scale_ema"] = bisim_stats_accum.get("target_scale_ema", 0.0) + target_scale_ema
                                 n_bisim_computations += 1
 
                     # Total loss (including bisimulation when weight > 0)
@@ -926,30 +946,73 @@ def main(args):
 
                     optim.step()
 
-                    # Train phi network separately (after main optimizer to avoid inplace conflicts)
-                    # Reuse target_flat from earlier (already reshaped)
+                    # =========================================================
+                    #  VICReg Training with Feature Bank for Stability
+                    # =========================================================
+                    # 1. Forward pass on current batch
                     real = target_flat.detach()
                     phi_net.train()
                     x1 = phi_augment(real)
                     x2 = phi_augment(real)
                     z1 = phi_net(x1)
                     z2 = phi_net(x2)
-                    phi_loss = vicreg_loss(z1, z2)
+                    
+                    # 2. Update Feature Bank (FIFO Queue)
+                    with torch.no_grad():
+                        z_out = z1.detach()  # Use one view to update stats
+                        batch_len = z_out.shape[0]
+                        
+                        # Simple FIFO logic
+                        indices = torch.arange(bank_ptr, bank_ptr + batch_len, device=device) % bank_capacity
+                        feature_bank[indices] = z_out
+                        bank_ptr = (bank_ptr + batch_len) % bank_capacity
+
+                    # 3. Compute Stable VICReg Loss
+                    # Invariance: Force x1 and x2 (same image) to be close
+                    sim_loss = F.mse_loss(z1, z2)
+
+                    # Variance/Covariance: Use the BANK (256 samples) not the batch
+                    # Concatenate current batch with bank for robust stats
+                    # (Detach bank so we don't backprop through history)
+                    z_all = torch.cat([z1, feature_bank.detach()], dim=0) 
+                    
+                    # Variance Loss (Hinge loss on std dev)
+                    eps = 1e-4
+                    std_z = torch.sqrt(z_all.var(dim=0) + eps)
+                    var_loss = F.relu(1.0 - std_z).mean() 
+                    
+                    # Covariance Loss (Decorrelate dimensions)
+                    z_all_centered = z_all - z_all.mean(dim=0)
+                    cov_z = (z_all_centered.T @ z_all_centered) / (z_all.shape[0] - 1)
+                    
+                    # Zero out diagonal (we want diagonal to be 1, which var_loss handles)
+                    n_dim = cov_z.shape[0]
+                    off_diag_mask = ~torch.eye(n_dim, dtype=torch.bool, device=device)
+                    cov_loss = cov_z[off_diag_mask].pow(2).mean()
+
+                    # Final Phi Loss (25.0 is standard VICReg default weight)
+                    phi_loss = 25.0 * sim_loss + 25.0 * var_loss + 1.0 * cov_loss
 
                     phi_optim.zero_grad()
                     phi_loss.backward()
                     phi_optim.step()
+                    
+                    # Update target phi net
                     ema_update(phi_net_target, phi_net, phi_tau)
                     phi_net_target.eval()
 
                     with torch.no_grad():
                         writer.add_scalar("phi/loss", phi_loss.item(), total_steps)
+                        writer.add_scalar("phi/sim_loss", sim_loss.item(), total_steps)
+                        writer.add_scalar("phi/var_loss", var_loss.item(), total_steps)
+                        writer.add_scalar("phi/cov_loss", cov_loss.item(), total_steps)
                         writer.add_scalar("phi/z1_mean", z1.mean().item(), total_steps)
                         writer.add_scalar("phi/z1_std", z1.std().item(), total_steps)
                         writer.add_scalar("phi/z2_mean", z2.mean().item(), total_steps)
                         writer.add_scalar("phi/z2_std", z2.std().item(), total_steps)
                         writer.add_scalar("phi/z1_z2_corr", (z1 * z2).mean().item(), total_steps)
                         writer.add_scalar("phi/z1_z2_cov", (z1 * z2).var().item(), total_steps)
+                        writer.add_scalar("phi/bank_std_mean", std_z.mean().item(), total_steps)
 
                     # Accumulate losses for logging
                     loss_accum["total"] += total_loss_value
@@ -984,11 +1047,12 @@ def main(args):
                     writer.add_scalar("bisim_stats/rel_err", bisim_stats_accum["rel_err"] / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/corr", bisim_stats_accum["corr"] / n_bisim_updates, total_steps)
                     
-                    # NEW: Add monitoring metrics
+                    # Monitoring metrics
                     writer.add_scalar("bisim_stats/edge_weight_mean", bisim_stats_accum.get("edge_weight_mean", 0.0) / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/edge_weight_std", bisim_stats_accum.get("edge_weight_std", 0.0) / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/feat_norm_mean", bisim_stats_accum.get("feat_norm_mean", 0.0) / n_bisim_updates, total_steps)
                     writer.add_scalar("bisim_stats/feat_std", bisim_stats_accum.get("feat_std", 0.0) / n_bisim_updates, total_steps)
+                    writer.add_scalar("bisim_stats/target_scale_ema", bisim_stats_accum.get("target_scale_ema", 0.0) / n_bisim_updates, total_steps)
                 
                 # Log gradient norms
                 n_updates = args.train_steps
