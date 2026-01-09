@@ -265,6 +265,8 @@ def make_run_name(args):
         parts.append("pullback_bisim_knn_h_s_grad")
 
     parts.append(f"phi_align_fixed")
+
+    parts.append("memory_bank")
     
     # Add seed for reproducibility tracking
     parts.append(f"seed{args.seed}")
