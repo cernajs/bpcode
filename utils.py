@@ -16,7 +16,7 @@ import numpy as np
 import cv2
 from dataclasses import dataclass
 
-__all__ = ['PixelObsWrapper', 'DMControlWrapper', 'ReplayBuffer', 'get_device', 'set_seed', 
+__all__ = ['ReplayBuffer', 'get_device', 'set_seed', 
            'preprocess_img', 'postprocess_img', 'bottle', 'make_env', 'ENV_ACTION_REPEAT']
 
 # Reference PlaNet action repeat settings per environment
