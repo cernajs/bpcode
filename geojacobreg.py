@@ -9,7 +9,9 @@ from torch.distributions.kl import kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 
 from utils import (ReplayBuffer, get_device, no_param_grads, set_seed, 
-                   preprocess_img, bottle, make_env, ENV_ACTION_REPEAT)
+                   preprocess_img, bottle, make_env, ENV_ACTION_REPEAT, log_visualizations,
+                   log_imagination_rollout, log_reward_prediction, log_latent_reward_structure,
+                   log_action_conditioned_prediction, log_latent_dynamics)
 
 from models import ConvEncoder, ConvDecoder, RSSM, RewardModel
 from vicreg_net import PhiNet, ema_update, phi_augment, vicreg_loss
@@ -580,6 +582,67 @@ def main(args):
         
         print(f"  Seed episode {seed_ep + 1}/{args.seed_episodes}: return = {ep_return:.2f}, buffer size = {replay.size}")
     
+    # -------- Initial Visualization at step 0 --------
+    if replay.size > (args.seq_len + 2):
+        print("Generating initial visualization (step 0)...")
+        viz_batch = replay.sample_sequences(min(args.batch_size, 8), args.seq_len + 1)
+        viz_obs = torch.tensor(viz_batch.obs, dtype=torch.float32, device=device)
+        viz_act = torch.tensor(viz_batch.actions, dtype=torch.float32, device=device)
+        viz_rew = torch.tensor(viz_batch.rews, dtype=torch.float32, device=device)
+        
+        viz_x = viz_obs.permute(0, 1, 4, 2, 3).contiguous()
+        preprocess_img(viz_x, depth=args.bit_depth)
+        
+        with torch.no_grad():
+            viz_e = bottle(encoder, viz_x)
+            viz_h_init, viz_s_init = rssm.get_init_state(viz_e[:, 0])
+            
+            viz_h_list, viz_s_list = [], []
+            h_curr, s_curr = viz_h_init, viz_s_init
+            viz_T = viz_x.shape[1] - 1
+            
+            for t in range(viz_T):
+                h_curr = rssm.deterministic_state_fwd(h_curr, s_curr, viz_act[:, t])
+                viz_h_list.append(h_curr)
+                post_mean, post_std = rssm.state_posterior(h_curr, viz_e[:, t + 1])
+                s_curr = post_mean
+                viz_s_list.append(s_curr)
+            
+            viz_h_seq = torch.stack(viz_h_list, dim=1)
+            viz_s_seq = torch.stack(viz_s_list, dim=1)
+        
+        # Core visualizations
+        log_visualizations(
+            writer=writer, step=0, encoder=encoder, decoder=decoder, rssm=rssm,
+            obs_batch=viz_x[:, 1:viz_T+1], act_batch=viz_act[:, :viz_T],
+            h_seq=viz_h_seq, s_seq=viz_s_seq, bit_depth=args.bit_depth,
+            knn_k=args.geo_knn_k, device=device,
+        )
+        
+        # Additional diagnostics
+        log_imagination_rollout(
+            writer=writer, step=0, encoder=encoder, decoder=decoder, rssm=rssm,
+            obs_batch=viz_x, act_batch=viz_act, bit_depth=args.bit_depth,
+            imagination_horizon=min(15, viz_T), device=device,
+        )
+        log_reward_prediction(
+            writer=writer, step=0, encoder=encoder, rssm=rssm, reward_model=reward_model,
+            obs_batch=viz_x, act_batch=viz_act, rew_batch=viz_rew, device=device,
+        )
+        log_latent_reward_structure(
+            writer=writer, step=0, h_seq=viz_h_seq, s_seq=viz_s_seq,
+            rew_batch=viz_rew[:, :viz_T], device=device,
+        )
+        log_action_conditioned_prediction(
+            writer=writer, step=0, encoder=encoder, decoder=decoder, rssm=rssm,
+            obs_batch=viz_x, act_batch=viz_act, act_dim=act_dim,
+            horizon=min(5, viz_T), device=device,
+        )
+        log_latent_dynamics(
+            writer=writer, step=0, h_seq=viz_h_seq, s_seq=viz_s_seq,
+            act_batch=viz_act[:, :viz_T], device=device,
+        )
+    
     # ========================================
     # Phase 2: Main training loop
     # ========================================
@@ -1074,6 +1137,68 @@ def main(args):
                 if grad_norm_accum["decoder"] > 0:
                     decoder_bisim_ratio = grad_norm_accum["bisim_weighted"] / grad_norm_accum["decoder"]
                     writer.add_scalar("grad_norm/bisim_to_decoder_ratio", decoder_bisim_ratio, total_steps)
+                
+                # -------- Visualizations every 100 env steps --------
+                if total_steps % 100 == 0:
+                    # Sample a fresh batch for visualization
+                    viz_batch = replay.sample_sequences(min(args.batch_size, 8), args.seq_len + 1)
+                    viz_obs = torch.tensor(viz_batch.obs, dtype=torch.float32, device=device)
+                    viz_act = torch.tensor(viz_batch.actions, dtype=torch.float32, device=device)
+                    viz_rew = torch.tensor(viz_batch.rews, dtype=torch.float32, device=device)
+                    
+                    viz_x = viz_obs.permute(0, 1, 4, 2, 3).contiguous()
+                    preprocess_img(viz_x, depth=args.bit_depth)
+                    
+                    # Compute latent states for visualization
+                    with torch.no_grad():
+                        viz_e = bottle(encoder, viz_x)
+                        viz_h_init, viz_s_init = rssm.get_init_state(viz_e[:, 0])
+                        
+                        viz_h_list, viz_s_list = [], []
+                        h_curr, s_curr = viz_h_init, viz_s_init
+                        viz_T = viz_x.shape[1] - 1
+                        
+                        for t in range(viz_T):
+                            h_curr = rssm.deterministic_state_fwd(h_curr, s_curr, viz_act[:, t])
+                            viz_h_list.append(h_curr)
+                            post_mean, post_std = rssm.state_posterior(h_curr, viz_e[:, t + 1])
+                            s_curr = post_mean
+                            viz_s_list.append(s_curr)
+                        
+                        viz_h_seq = torch.stack(viz_h_list, dim=1)
+                        viz_s_seq = torch.stack(viz_s_list, dim=1)
+                    
+                    # Core visualizations
+                    log_visualizations(
+                        writer=writer, step=total_steps, encoder=encoder, decoder=decoder, rssm=rssm,
+                        obs_batch=viz_x[:, 1:viz_T+1], act_batch=viz_act[:, :viz_T],
+                        h_seq=viz_h_seq, s_seq=viz_s_seq, bit_depth=args.bit_depth,
+                        knn_k=args.geo_knn_k, device=device,
+                    )
+                    
+                    # Additional diagnostics
+                    log_imagination_rollout(
+                        writer=writer, step=total_steps, encoder=encoder, decoder=decoder, rssm=rssm,
+                        obs_batch=viz_x, act_batch=viz_act, bit_depth=args.bit_depth,
+                        imagination_horizon=min(15, viz_T), device=device,
+                    )
+                    log_reward_prediction(
+                        writer=writer, step=total_steps, encoder=encoder, rssm=rssm, reward_model=reward_model,
+                        obs_batch=viz_x, act_batch=viz_act, rew_batch=viz_rew, device=device,
+                    )
+                    log_latent_reward_structure(
+                        writer=writer, step=total_steps, h_seq=viz_h_seq, s_seq=viz_s_seq,
+                        rew_batch=viz_rew[:, :viz_T], device=device,
+                    )
+                    log_action_conditioned_prediction(
+                        writer=writer, step=total_steps, encoder=encoder, decoder=decoder, rssm=rssm,
+                        obs_batch=viz_x, act_batch=viz_act, act_dim=act_dim,
+                        horizon=min(5, viz_T), device=device,
+                    )
+                    log_latent_dynamics(
+                        writer=writer, step=total_steps, h_seq=viz_h_seq, s_seq=viz_s_seq,
+                        act_batch=viz_act[:, :viz_T], device=device,
+                    )
         
         # -------- End of episode --------
         writer.add_scalar("train/episode_return", ep_return, episode)
