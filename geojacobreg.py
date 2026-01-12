@@ -239,6 +239,7 @@ def build_parser():
     # Checkpointing
     p.add_argument("--save_interval", type=int, default=0, help="Save checkpoint every N episodes (0=only final)")
     p.add_argument("--load_checkpoint", type=str, default="", help="Path to checkpoint to resume from")
+    p.add_argument("--visualize_interval", type=int, default=0, help="Visualize every N steps (0=no visualization)")
 
     return p
 
@@ -583,7 +584,7 @@ def main(args):
         print(f"  Seed episode {seed_ep + 1}/{args.seed_episodes}: return = {ep_return:.2f}, buffer size = {replay.size}")
     
     # -------- Initial Visualization at step 0 --------
-    if replay.size > (args.seq_len + 2):
+    if replay.size > (args.seq_len + 2) and args.visualize_interval > 0:
         print("Generating initial visualization (step 0)...")
         viz_batch = replay.sample_sequences(min(args.batch_size, 8), args.seq_len + 1)
         viz_obs = torch.tensor(viz_batch.obs, dtype=torch.float32, device=device)
@@ -1139,7 +1140,7 @@ def main(args):
                     writer.add_scalar("grad_norm/bisim_to_decoder_ratio", decoder_bisim_ratio, total_steps)
                 
                 # -------- Visualizations every 100 env steps --------
-                if total_steps % 100 == 0:
+                if total_steps % args.visualize_interval == 0 and args.visualize_interval > 0:
                     # Sample a fresh batch for visualization
                     viz_batch = replay.sample_sequences(min(args.batch_size, 8), args.seq_len + 1)
                     viz_obs = torch.tensor(viz_batch.obs, dtype=torch.float32, device=device)
