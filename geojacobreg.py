@@ -927,7 +927,7 @@ def main(args):
                         bisim_loss_val = F.mse_loss(dz_m, tgt_m)
                         
                         # Compute statistics for pullback bisim logging
-                        if args.pullback_bisim:
+                        if args.bisimulation_weight > 0.0:
                             with torch.no_grad():
                                 mask = dz_mask.bool()
                                 dz_detached = dz.detach()[mask]
