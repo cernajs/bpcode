@@ -1245,7 +1245,7 @@ def main(args):
                     writer.add_scalar("grad_norm/bisim_to_decoder_ratio", decoder_bisim_ratio, total_steps)
                 
                 # -------- Visualizations every 100 env steps --------
-                if total_steps % args.visualize_interval == 0 and args.visualize_interval > 0:
+                if args.visualize_interval > 0 and total_steps % args.visualize_interval == 0:
                     # Sample a fresh batch for visualization
                     viz_batch = replay.sample_sequences(min(args.batch_size, 8), args.seq_len + 1)
                     viz_obs = torch.tensor(viz_batch.obs, dtype=torch.float32, device=device)
