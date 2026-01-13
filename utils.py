@@ -9,6 +9,7 @@ if 'MUJOCO_GL' not in os.environ:
     # If you get gladLoadGL errors, run: export MUJOCO_GL=osmesa
 
 import torch
+import torch.nn.functional as F
 import random
 import collections
 import gymnasium as gym
@@ -17,7 +18,7 @@ import cv2
 from dataclasses import dataclass
 
 __all__ = ['ReplayBuffer', 'get_device', 'set_seed', 
-           'preprocess_img', 'postprocess_img', 'bottle', 'make_env', 'ENV_ACTION_REPEAT',
+           'preprocess_img', 'postprocess_img', 'bottle', 'random_masking', 'make_env', 'ENV_ACTION_REPEAT',
            'log_visualizations', 'log_imagination_rollout', 'log_reward_prediction',
            'log_latent_reward_structure', 'log_action_conditioned_prediction', 'log_latent_dynamics']
 
@@ -86,6 +87,58 @@ def bottle(func, *tensors):
     n, t = tensors[0].shape[:2]
     out = func(*[x.reshape(n*t, *x.shape[2:]) for x in tensors])
     return out.reshape(n, t, *out.shape[1:])
+
+
+def random_masking(imgs, mask_ratio=0.5, patch_size=8):
+    """
+    Randomly zeros out patches of the image (Spatio-Temporal Masking).
+    
+    This forces the model to rely on the stochastic state to "fill in the blanks,"
+    preventing posterior collapse where s becomes unused.
+    
+    Args:
+        imgs: [B, T, C, H, W] or [B, C, H, W] tensor of images
+        mask_ratio: Fraction of patches to zero out (0.5 = 50% masked)
+        patch_size: Size of square patches to mask (default 8x8)
+    
+    Returns:
+        Masked images with same shape as input
+    """
+    is_sequence = (imgs.dim() == 5)
+    if is_sequence:
+        B, T, C, H, W = imgs.shape
+        x = imgs.view(B * T, C, H, W)
+    else:
+        x = imgs
+        B_flat, C, H, W = x.shape
+        
+    # Calculate number of patches
+    h_patches = H // patch_size
+    w_patches = W // patch_size
+    num_patches = h_patches * w_patches
+    num_masked = int(mask_ratio * num_patches)
+
+    # Create mask [B*T, num_patches]
+    mask = torch.ones(x.shape[0], num_patches, device=x.device)
+    
+    # Randomly select indices to zero out
+    noise = torch.rand(x.shape[0], num_patches, device=x.device)
+    ids_shuffle = torch.argsort(noise, dim=1)
+    ids_mask = ids_shuffle[:, :num_masked]
+    
+    mask.scatter_(1, ids_mask, 0)
+    
+    # Reshape mask back to image
+    mask = mask.view(x.shape[0], 1, h_patches, w_patches)
+    # Upsample mask to pixel level (nearest neighbor)
+    mask = F.interpolate(mask, size=(H, W), mode='nearest')
+    
+    x_masked = x * mask
+    
+    if is_sequence:
+        x_masked = x_masked.view(B, T, C, H, W)
+        
+    return x_masked
 
 
 class PixelObsWrapper(gym.Wrapper):

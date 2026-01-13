@@ -9,11 +9,11 @@ from torch.distributions.kl import kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 
 from utils import (ReplayBuffer, get_device, no_param_grads, set_seed, 
-                   preprocess_img, bottle, make_env, ENV_ACTION_REPEAT, log_visualizations,
+                   preprocess_img, bottle, random_masking, make_env, ENV_ACTION_REPEAT, log_visualizations,
                    log_imagination_rollout, log_reward_prediction, log_latent_reward_structure,
                    log_action_conditioned_prediction, log_latent_dynamics)
 
-from models import ConvEncoder, ConvDecoder, RSSM, RewardModel
+from models import ConvEncoder, ConvDecoder, RSSM, RewardModel, FeatureDecoder
 from vicreg_net import PhiNet, ema_update, phi_augment, vicreg_loss
 
 # ===============================
@@ -220,6 +220,12 @@ def build_parser():
     
     # Loss balancing (PlaNet-style)
     p.add_argument("--reward_scale", type=float, default=1.0, help="Scale factor for reward loss")
+    
+    # Feature-based reconstruction (Robust Riemannian World Model)
+    p.add_argument("--use_feature_decoder", action="store_true", help="Use FeatureDecoder instead of pixel reconstruction")
+    p.add_argument("--feature_dim", type=int, default=128, help="Output dimension of FeatureDecoder (should match PhiNet)")
+    p.add_argument("--mask_ratio", type=float, default=0.5, help="Ratio of patches to mask for encoder input (0.5 = 50%)")
+    p.add_argument("--mask_patch_size", type=int, default=8, help="Size of patches for random masking")
 
     # CEM planner (reference defaults)
     p.add_argument("--plan_horizon", type=int, default=12, help="Reference: 12")
@@ -251,6 +257,11 @@ def build_parser():
 def make_run_name(args):
     """Generate a descriptive run name based on experimental configuration."""
     parts = [args.env_id]
+    
+    # Feature decoder (Robust Riemannian World Model)
+    if args.use_feature_decoder:
+        parts.append(f"featdec{args.feature_dim}")
+        parts.append(f"mask{args.mask_ratio}")
     
     # Bisimulation on/off
     if args.bisimulation_weight > 0:
@@ -299,28 +310,40 @@ def pullback_distance_s(decoder, phi_target, h, s1, s2, create_graph=True):
     
     return torch.norm(Jdelta, dim=1) / math.sqrt(Jdelta.size(1))
 
-def pullback_distance_full(decoder, phi_target, h1, s1, h2, s2, create_graph=True):
+def pullback_distance_full(decoder, phi_target, h1, s1, h2, s2, create_graph=True, is_feature_decoder=False):
     """
     Computes || J_{h,s} g(h1, s1) · ([h1, s1] - [h2, s2]) ||_2
+    
+    When is_feature_decoder=True (Robust Riemannian World Model):
+      - decoder outputs features directly, no need to apply phi_target
+      - Measures: "How much does the semantic feature change if I move in latent space?"
+    
+    When is_feature_decoder=False (pixel reconstruction):
+      - decoder outputs images, phi_target extracts features
+      - Measures: "How much does the pixel brightness change?"
     """
     delta_h = (h1 - h2)
     delta_s = (s1 - s2)
     
-    def decoder_wrapper(h, s):
-        x = decoder(h, s)
-        f = phi_target(x)
-        f = F.layer_norm(f, (f.size(-1),)) # std went up, possible fix
-        return f
+    if is_feature_decoder:
+        # FeatureDecoder: output is already features, no need for phi_target
+        def decoder_wrapper(h, s):
+            f = decoder(h, s)
+            f = F.layer_norm(f, (f.size(-1),))
+            return f
+        
+        with no_param_grads(decoder):
+            _, Jdelta = torch.autograd.functional.jvp(decoder_wrapper, (h1, s1), (delta_h, delta_s), create_graph=create_graph)
+    else:
+        # ConvDecoder: output is images, apply phi_target to get features
+        def decoder_wrapper(h, s):
+            x = decoder(h, s)
+            f = phi_target(x)
+            f = F.layer_norm(f, (f.size(-1),))
+            return f
 
-    """
-    when gradient flow from here:
-    -making the decoder insensitive to s,
-    -making phi rescale/warp features,
-    -instead of learning better latent dynamics.
-    """
-
-    with no_param_grads(decoder), no_param_grads(phi_target):
-        _, Jdelta = torch.autograd.functional.jvp(decoder_wrapper, (h1, s1), (delta_h, delta_s), create_graph=create_graph)
+        with no_param_grads(decoder), no_param_grads(phi_target):
+            _, Jdelta = torch.autograd.functional.jvp(decoder_wrapper, (h1, s1), (delta_h, delta_s), create_graph=create_graph)
 
     Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
     return torch.sqrt((Jdelta * Jdelta).mean(dim=1) + 1e-8)
@@ -343,13 +366,14 @@ def floyd_warshall_minplus(W):
         D = torch.minimum(D, trough)
     return D
 
-def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_graph=True, inf=1e9):
+def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_graph=True, inf=1e9, is_feature_decoder=False):
     """
     h_t: [B, Dh]
     z_t: [B, Ds]
     targets: [B] indices in [0..B-1] (your perm)
     k: number of neighbors per node in the kNN graph
     create_graph: True for dz, False for dnext
+    is_feature_decoder: True when using FeatureDecoder (no phi_target needed)
     Returns: dz_t: [B] geodesic approx from i -> targets[i]
              edge_weights: [B*k*2] mean edge weight for monitoring
     """
@@ -373,15 +397,6 @@ def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_gr
     dst2 = torch.cat([dst, src], dim=0)
 
     # --- Edge weights: pullback length at source (asymmetric: detach destination) ---
-    # w = pullback_distance_s(
-    #     decoder,
-    #     phi_target=phi_target,
-    #     h=h_t[src],
-    #     s1=z_t[src],
-    #     s2=z_t[dst].detach(),
-    #     create_graph=create_graph
-    # )  # [B*k]
-
     w2 = pullback_distance_full(
         decoder,
         phi_target=phi_target,
@@ -389,7 +404,8 @@ def geodesic_pb_knn_slice(decoder, phi_target, h_t, z_t, targets, k=3, create_gr
         s1=z_t[src2],
         h2=h_t[dst2].detach(),
         s2=z_t[dst2].detach(),
-        create_graph=create_graph
+        create_graph=create_graph,
+        is_feature_decoder=is_feature_decoder
     )
 
     # --- Assemble adjacency matrix W ---
@@ -414,12 +430,12 @@ def action_targets(a_t, topm=3):
     pick = torch.randint(0, topm, (a_t.size(0),), device=a_t.device)
     return nn[torch.arange(a_t.size(0), device=a_t.device), pick]  # [B]
 
-def geodesic_pb_knn(decoder, phi_target, h, z, targets, k=10, time_subsample=None, t_idx=None, create_graph=True, return_mask=False):
+def geodesic_pb_knn(decoder, phi_target, h, z, targets, k=10, time_subsample=None, t_idx=None, create_graph=True, return_mask=False, is_feature_decoder=False):
     # targets: [B] or [B, T]
     B, T, _ = z.shape
     dz = torch.zeros((B, T), device=z.device, dtype=z.dtype)
     mask = torch.zeros((T,), device=z.device, dtype=torch.bool)
-    edge_weights_list = []  # NEW: collect edge weights
+    edge_weights_list = []
 
     if t_idx is None:
         t_idx = torch.arange(T, device=z.device) if (time_subsample is None or time_subsample >= T) \
@@ -427,16 +443,16 @@ def geodesic_pb_knn(decoder, phi_target, h, z, targets, k=10, time_subsample=Non
 
     for t in t_idx.tolist():
         tgt_t = targets if targets.ndim == 1 else targets[:, t]
-        dz_t, w_t = geodesic_pb_knn_slice(decoder, phi_target, h[:, t], z[:, t], tgt_t, k=k, create_graph=create_graph)  # NEW: receive edge weights
+        dz_t, w_t = geodesic_pb_knn_slice(decoder, phi_target, h[:, t], z[:, t], tgt_t, k=k, create_graph=create_graph, is_feature_decoder=is_feature_decoder)
         dz[:, t] = dz_t
         mask[t] = True
-        edge_weights_list.append(w_t)  # NEW: collect
+        edge_weights_list.append(w_t)
 
-    edge_weights = torch.cat(edge_weights_list) if edge_weights_list else torch.tensor([], device=z.device)  # NEW
+    edge_weights = torch.cat(edge_weights_list) if edge_weights_list else torch.tensor([], device=z.device)
 
     if return_mask:
-        return dz.reshape(-1), mask.repeat(B), t_idx, edge_weights  # NEW: return edge weights
-    return dz.reshape(-1), edge_weights  # NEW
+        return dz.reshape(-1), mask.repeat(B), t_idx, edge_weights
+    return dz.reshape(-1), edge_weights
 
 
 def main(args):
@@ -473,12 +489,31 @@ def main(args):
 
     # Models matching reference architecture
     encoder = ConvEncoder(embedding_size=args.embed_dim, in_channels=C).to(device)
-    decoder = ConvDecoder(
+    
+    # Pixel decoder for visualization (kept separate, detached from main training)
+    vis_decoder = ConvDecoder(
         state_size=args.deter_dim,
         latent_size=args.stoch_dim,
         embedding_size=args.embed_dim,
         out_channels=C
     ).to(device)
+    
+    # Feature decoder for main training objective (Robust Riemannian World Model)
+    # This predicts VICReg features instead of pixels
+    if args.use_feature_decoder:
+        decoder = FeatureDecoder(
+            state_size=args.deter_dim,
+            latent_size=args.stoch_dim,
+            feature_dim=args.feature_dim,
+            hidden_dim=args.hidden_dim,
+            activation_function='elu'
+        ).to(device)
+        print(f"Using FeatureDecoder (feature_dim={args.feature_dim})")
+    else:
+        # Fallback to pixel decoder for backwards compatibility
+        decoder = vis_decoder
+        print("Using ConvDecoder (pixel reconstruction)")
+    
     rssm = RSSM(
         stoch_dim=args.stoch_dim,
         deter_dim=args.deter_dim,
@@ -492,7 +527,9 @@ def main(args):
         hidden_dim=args.hidden_dim
     ).to(device)
 
-    phi_net = PhiNet(in_channels=C, hidden_channels=args.hidden_dim, out_dim=args.embed_dim).to(device)
+    # PhiNet for VICReg - output dim matches FeatureDecoder
+    phi_out_dim = args.feature_dim if args.use_feature_decoder else args.embed_dim
+    phi_net = PhiNet(in_channels=C, hidden_channels=args.hidden_dim, out_dim=phi_out_dim).to(device)
     phi_net_target = copy.deepcopy(phi_net)
     phi_net_target.eval()
     for param in phi_net_target.parameters():
@@ -510,6 +547,7 @@ def main(args):
     target_scale_ema = 1.0
 
     # Single optimizer for all parameters
+    # When using feature decoder, also train vis_decoder separately for visualization
     params = (
         list(encoder.parameters()) + 
         list(decoder.parameters()) + 
@@ -517,6 +555,13 @@ def main(args):
         list(reward_model.parameters())
     )
     optim = torch.optim.Adam(params, lr=args.lr, eps=args.adam_eps)
+    
+    # Separate optimizer for vis_decoder (only trained for visualization, not main objective)
+    if args.use_feature_decoder:
+        vis_decoder_optim = torch.optim.Adam(vis_decoder.parameters(), lr=args.lr, eps=args.adam_eps)
+    else:
+        vis_decoder_optim = None
+    
     phi_net_params = list(phi_net.parameters())
     phi_optim = torch.optim.Adam(phi_net_params, lr=args.lr, eps=args.adam_eps)
     phi_tau = 0.995
@@ -612,9 +657,10 @@ def main(args):
             viz_h_seq = torch.stack(viz_h_list, dim=1)
             viz_s_seq = torch.stack(viz_s_list, dim=1)
         
-        # Core visualizations
+        # Core visualizations (use vis_decoder for pixel-based visualization)
+        pixel_decoder = vis_decoder if args.use_feature_decoder else decoder
         log_visualizations(
-            writer=writer, step=0, encoder=encoder, decoder=decoder, rssm=rssm,
+            writer=writer, step=0, encoder=encoder, decoder=pixel_decoder, rssm=rssm,
             obs_batch=viz_x[:, 1:viz_T+1], act_batch=viz_act[:, :viz_T],
             h_seq=viz_h_seq, s_seq=viz_s_seq, bit_depth=args.bit_depth,
             knn_k=args.geo_knn_k, device=device,
@@ -622,7 +668,7 @@ def main(args):
         
         # Additional diagnostics
         log_imagination_rollout(
-            writer=writer, step=0, encoder=encoder, decoder=decoder, rssm=rssm,
+            writer=writer, step=0, encoder=encoder, decoder=pixel_decoder, rssm=rssm,
             obs_batch=viz_x, act_batch=viz_act, bit_depth=args.bit_depth,
             imagination_horizon=min(15, viz_T), device=device,
         )
@@ -635,7 +681,7 @@ def main(args):
             rew_batch=viz_rew[:, :viz_T], device=device,
         )
         log_action_conditioned_prediction(
-            writer=writer, step=0, encoder=encoder, decoder=decoder, rssm=rssm,
+            writer=writer, step=0, encoder=encoder, decoder=pixel_decoder, rssm=rssm,
             obs_batch=viz_x, act_batch=viz_act, act_dim=act_dim,
             horizon=min(5, viz_T), device=device,
         )
@@ -746,9 +792,27 @@ def main(args):
                     # Convert to [B, T+1, C, H, W] and preprocess
                     x = obs_seq.permute(0, 1, 4, 2, 3).contiguous()
                     preprocess_img(x, depth=args.bit_depth)
-
-                    # Encode all observations
-                    e_t = bottle(encoder, x)
+                    
+                    # ============================================
+                    # Feature-based reconstruction (Robust Riemannian World Model)
+                    # ============================================
+                    if args.use_feature_decoder:
+                        # 1. Compute target features from CLEAN (unmasked) images
+                        # This is the "Teacher" (VICReg) telling us what to predict
+                        x_flat = x.view(-1, C, H, W)  # [B*(T+1), C, H, W]
+                        with torch.no_grad():
+                            target_features = phi_net_target(x_flat)  # [B*(T+1), feature_dim]
+                            target_features = target_features.view(B, T1, -1)  # [B, T+1, feature_dim]
+                        
+                        # 2. Apply masking to encoder inputs
+                        # This forces the model to rely on stochastic state, preventing posterior collapse
+                        x_masked = random_masking(x, mask_ratio=args.mask_ratio, patch_size=args.mask_patch_size)
+                        
+                        # Encode MASKED observations
+                        e_t = bottle(encoder, x_masked)
+                    else:
+                        # Standard pixel reconstruction (backwards compatibility)
+                        e_t = bottle(encoder, x)
 
                     # Initialize state from first observation
                     h_t_train, s_t_train = rssm.get_init_state(e_t[:, 0])
@@ -782,24 +846,45 @@ def main(args):
                     prior_dist = Normal(prior_means, prior_stds)
                     posterior_dist = Normal(post_means, post_stds)
 
-                    # Reconstruction loss
-                    recon = bottle(decoder, h_seq, s_seq)
-                    target = x[:, 1:T+1]
-                    rec_loss = F.mse_loss(recon, target, reduction='none').sum((2, 3, 4)).mean()
-                    # rec_loss = F.mse_loss(recon, target)
+                    # ============================================
+                    # Reconstruction Loss
+                    # ============================================
+                    if args.use_feature_decoder:
+                        # Feature-based reconstruction: predict VICReg features, not pixels
+                        # The decoder predicts features, loss is MSE between predicted and target features
+                        pred_features = bottle(decoder, h_seq, s_seq)  # [B, T, feature_dim]
+                        feat_target_seq = target_features[:, 1:T+1]  # [B, T, feature_dim] - skip first obs
+                        
+                        rec_loss = F.mse_loss(pred_features, feat_target_seq)
+                        
+                        # No separate feature alignment loss needed (it's the main loss now)
+                        feat_loss = torch.zeros((), device=device)
+                        
+                        # Train vis_decoder separately with DETACHED gradients for visualization
+                        # This doesn't affect the main training objective
+                        if vis_decoder_optim is not None:
+                            target_pixels = x[:, 1:T+1]  # [B, T, C, H, W]
+                            vis_recon = bottle(vis_decoder, h_seq.detach(), s_seq.detach())
+                            vis_loss = F.mse_loss(vis_recon, target_pixels, reduction='none').sum((2, 3, 4)).mean()
+                            
+                            vis_decoder_optim.zero_grad()
+                            vis_loss.backward()
+                            vis_decoder_optim.step()
+                    else:
+                        # Standard pixel reconstruction (backwards compatibility)
+                        recon = bottle(decoder, h_seq, s_seq)
+                        target = x[:, 1:T+1]
+                        rec_loss = F.mse_loss(recon, target, reduction='none').sum((2, 3, 4)).mean()
 
-                    # Compute feature alignment loss WITHOUT phi gradients
-                    # Clone phi_net temporarily to get features without gradient tracking
-                    recon_flat = recon.reshape(-1, C, H, W)
-                    target_flat = target.reshape(-1, C, H, W)
-                    
-                    with torch.no_grad():
-                        feat_target = phi_net_target(target_flat)
-                    
-                    # Use phi_net_target for both (it has no gradients anyway)
-                    # This guides decoder but doesn't train phi
-                    feat_recon = phi_net_target(recon_flat) 
-                    feat_loss = torch.zeros((), device=device)  # Disabled for now to avoid conflicts
+                        # Compute feature alignment loss WITHOUT phi gradients
+                        recon_flat = recon.reshape(-1, C, H, W)
+                        target_flat = target.reshape(-1, C, H, W)
+                        
+                        with torch.no_grad():
+                            feat_target = phi_net_target(target_flat)
+                        
+                        feat_recon = phi_net_target(recon_flat) 
+                        feat_loss = torch.zeros((), device=device)  # Disabled for now to avoid conflicts
 
                     kld_loss = torch.max(
                         kl_divergence(posterior_dist, prior_dist).sum(-1),
@@ -865,7 +950,7 @@ def main(args):
                         # asymmetric dz (only create_graph when actually optimizing)
                         needs_grad = bisim_weight > 0.0
                         if args.pullback_bisim:
-                            dz, dz_mask, t_idx, edge_weights = geodesic_pb_knn(  # NEW: receive edge_weights and t_idx
+                            dz, dz_mask, t_idx, edge_weights = geodesic_pb_knn(
                                 decoder=decoder,
                                 phi_target=phi_net_target,
                                 h=h,
@@ -874,7 +959,8 @@ def main(args):
                                 k=args.geo_knn_k,
                                 time_subsample=args.geo_time_subsample,
                                 create_graph=needs_grad,
-                                return_mask=True
+                                return_mask=True,
+                                is_feature_decoder=args.use_feature_decoder
                             )
                         else:
                             t_grid = torch.arange(Tm1, device=device)[None, :].expand(B, Tm1)
@@ -902,7 +988,8 @@ def main(args):
                                     time_subsample=args.geo_time_subsample,
                                     t_idx=t_idx,  # Reuse t_idx from first call
                                     create_graph=False,  # STOP GRADIENT HERE
-                                    return_mask=True
+                                    return_mask=True,
+                                    is_feature_decoder=args.use_feature_decoder
                                 )
                             else:
                                 n2 = zn[targets, t_grid]
@@ -1016,7 +1103,12 @@ def main(args):
                     #  VICReg Training with Feature Bank for Stability
                     # =========================================================
                     # 1. Forward pass on current batch
-                    real = target_flat.detach()
+                    # Use clean (unmasked) images for VICReg training
+                    if args.use_feature_decoder:
+                        # When using feature decoder, x is the clean images, x_masked was used for encoder
+                        real = x[:, 1:T+1].reshape(-1, C, H, W).detach()
+                    else:
+                        real = target_flat.detach()
                     phi_net.train()
                     x1 = phi_augment(real)
                     x2 = phi_augment(real)
@@ -1099,6 +1191,11 @@ def main(args):
                 writer.add_scalar("loss/bisimulation", loss_accum["bisim"] / n_updates, total_steps)
                 writer.add_scalar("loss/bisimulation_weighted", loss_accum.get("bisim_weighted", 0.0) / n_updates, total_steps)
                 
+                # Log feature decoder specific metrics
+                if args.use_feature_decoder:
+                    writer.add_scalar("loss/feature_rec", loss_accum["rec"] / n_updates, total_steps)
+                    writer.add_scalar("config/mask_ratio", args.mask_ratio, total_steps)
+                
                 # Log effective bisim weight (useful to see warmup/ramp progress)
                 writer.add_scalar("loss/bisim_weight", bisim_weight, total_steps)
                 
@@ -1169,9 +1266,10 @@ def main(args):
                         viz_h_seq = torch.stack(viz_h_list, dim=1)
                         viz_s_seq = torch.stack(viz_s_list, dim=1)
                     
-                    # Core visualizations
+                    # Core visualizations (use vis_decoder for pixel-based visualization)
+                    pixel_decoder = vis_decoder if args.use_feature_decoder else decoder
                     log_visualizations(
-                        writer=writer, step=total_steps, encoder=encoder, decoder=decoder, rssm=rssm,
+                        writer=writer, step=total_steps, encoder=encoder, decoder=pixel_decoder, rssm=rssm,
                         obs_batch=viz_x[:, 1:viz_T+1], act_batch=viz_act[:, :viz_T],
                         h_seq=viz_h_seq, s_seq=viz_s_seq, bit_depth=args.bit_depth,
                         knn_k=args.geo_knn_k, device=device,
@@ -1179,7 +1277,7 @@ def main(args):
                     
                     # Additional diagnostics
                     log_imagination_rollout(
-                        writer=writer, step=total_steps, encoder=encoder, decoder=decoder, rssm=rssm,
+                        writer=writer, step=total_steps, encoder=encoder, decoder=pixel_decoder, rssm=rssm,
                         obs_batch=viz_x, act_batch=viz_act, bit_depth=args.bit_depth,
                         imagination_horizon=min(15, viz_T), device=device,
                     )
@@ -1192,7 +1290,7 @@ def main(args):
                         rew_batch=viz_rew[:, :viz_T], device=device,
                     )
                     log_action_conditioned_prediction(
-                        writer=writer, step=total_steps, encoder=encoder, decoder=decoder, rssm=rssm,
+                        writer=writer, step=total_steps, encoder=encoder, decoder=pixel_decoder, rssm=rssm,
                         obs_batch=viz_x, act_batch=viz_act, act_dim=act_dim,
                         horizon=min(5, viz_T), device=device,
                     )
@@ -1241,7 +1339,7 @@ def main(args):
             checkpoint_dir = f"{args.log_dir}/{run_name}"
             checkpoint_path = f"{checkpoint_dir}/model_ep{episode + 1}.pt"
             print(f"  Saving checkpoint to: {checkpoint_path}")
-            torch.save({
+            checkpoint_dict = {
                 'encoder': encoder.state_dict(),
                 'decoder': decoder.state_dict(),
                 'rssm': rssm.state_dict(),
@@ -1249,7 +1347,11 @@ def main(args):
                 'args': vars(args),
                 'total_steps': total_steps,
                 'episode': episode + 1,
-            }, checkpoint_path)
+            }
+            if args.use_feature_decoder:
+                checkpoint_dict['vis_decoder'] = vis_decoder.state_dict()
+                checkpoint_dict['phi_net'] = phi_net.state_dict()
+            torch.save(checkpoint_dict, checkpoint_path)
 
     env.close()
     writer.close()
@@ -1259,7 +1361,7 @@ def main(args):
     checkpoint_path = f"{checkpoint_dir}/model_final.pt"
     print(f"\nSaving final model checkpoint to: {checkpoint_path}")
     
-    torch.save({
+    checkpoint_dict = {
         'encoder': encoder.state_dict(),
         'decoder': decoder.state_dict(),
         'rssm': rssm.state_dict(),
@@ -1267,7 +1369,11 @@ def main(args):
         'args': vars(args),
         'total_steps': total_steps,
         'episode': args.max_episodes,
-    }, checkpoint_path)
+    }
+    if args.use_feature_decoder:
+        checkpoint_dict['vis_decoder'] = vis_decoder.state_dict()
+        checkpoint_dict['phi_net'] = phi_net.state_dict()
+    torch.save(checkpoint_dict, checkpoint_path)
     
     print(f"Training complete! TensorBoard logs and checkpoint saved to: {args.log_dir}/{run_name}")
 
