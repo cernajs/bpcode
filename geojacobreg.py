@@ -859,7 +859,8 @@ def main(args):
                         pred_features = bottle(decoder, h_seq, s_seq)  # [B, T, feature_dim]
                         feat_target_seq = target_features[:, 1:T+1]  # [B, T, feature_dim] - skip first obs
                         
-                        rec_loss = F.mse_loss(pred_features, feat_target_seq)
+                        #rec_loss = F.mse_loss(pred_features, feat_target_seq)
+                        rec_loss = F.mse_loss(pred_features, feat_target_seq, reduction='none').sum(dim=-1).mean()
                         
                         # No separate feature alignment loss needed (it's the main loss now)
                         feat_loss = torch.zeros((), device=device)
