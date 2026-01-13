@@ -444,6 +444,7 @@ class FeatureDecoder(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         self.fc_out = nn.Linear(hidden_dim, feature_dim)
+        self.layer_norm = nn.LayerNorm(feature_dim)
         
     def forward(self, h, s=None):
         """
@@ -458,5 +459,6 @@ class FeatureDecoder(nn.Module):
         x = self.act_fn(self.fc1(x))
         x = self.act_fn(self.fc2(x))
         x = self.act_fn(self.fc3(x))
-        return self.fc_out(x)
+        x = self.fc_out(x)
+        return self.layer_norm(x)
 

@@ -329,7 +329,6 @@ def pullback_distance_full(decoder, phi_target, h1, s1, h2, s2, create_graph=Tru
         # FeatureDecoder: output is already features, no need for phi_target
         def decoder_wrapper(h, s):
             f = decoder(h, s)
-            f = F.layer_norm(f, (f.size(-1),))
             return f
         
         with no_param_grads(decoder):
@@ -806,6 +805,7 @@ def main(args):
                         x_flat = x.view(-1, C, H, W)  # [B*(T+1), C, H, W]
                         with torch.no_grad():
                             target_features = phi_net_target(x_flat)  # [B*(T+1), feature_dim]
+                            target_features = F.layer_norm(target_features, (target_features.size(-1),))
                             target_features = target_features.view(B, T1, -1)  # [B, T+1, feature_dim]
                         
                         # 2. Apply masking to encoder inputs
@@ -860,7 +860,7 @@ def main(args):
                         feat_target_seq = target_features[:, 1:T+1]  # [B, T, feature_dim] - skip first obs
                         
                         #rec_loss = F.mse_loss(pred_features, feat_target_seq)
-                        rec_loss = F.mse_loss(pred_features, feat_target_seq, reduction='none').sum(dim=-1).mean()
+                        rec_loss = F.mse_loss(pred_features, feat_target_seq, reduction='none').sum(dim=-1).mean() * 100
                         
                         # No separate feature alignment loss needed (it's the main loss now)
                         feat_loss = torch.zeros((), device=device)
@@ -1158,7 +1158,7 @@ def main(args):
                     cov_loss = cov_z[off_diag_mask].pow(2).mean()
 
                     # Final Phi Loss (25.0 is standard VICReg default weight)
-                    phi_loss = 25.0 * sim_loss + 25.0 * var_loss + 1.0 * cov_loss
+                    phi_loss = 1.0 * sim_loss + 1.0 * var_loss + 1.0 * cov_loss
 
                     phi_optim.zero_grad()
                     phi_loss.backward()
