@@ -539,7 +539,11 @@ def main(args):
     # --- Feature Bank for Stable VICReg ---
     # Capacity 256 is large enough for stats, small enough for VRAM
     bank_capacity = 256 
-    feature_bank = torch.randn(bank_capacity, args.embed_dim, device=device)
+    
+    if args.use_feature_decoder:
+        feature_bank = torch.randn(bank_capacity, args.feature_dim, device=device)
+    else:
+        feature_bank = torch.randn(bank_capacity, args.embed_dim, device=device)
     feature_bank = F.normalize(feature_bank, dim=-1)  # Start normalized
     bank_ptr = 0
     
