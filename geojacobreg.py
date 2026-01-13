@@ -860,6 +860,10 @@ def main(args):
                         # No separate feature alignment loss needed (it's the main loss now)
                         feat_loss = torch.zeros((), device=device)
                         
+                        # For bisimulation statistics: use target_features (already computed)
+                        # Flatten to match the shape expected by statistics code
+                        feat_target = target_features[:, 1:T+1].reshape(-1, args.feature_dim)  # [B*T, feature_dim]
+                        
                         # Train vis_decoder separately with DETACHED gradients for visualization
                         # This doesn't affect the main training objective
                         if vis_decoder_optim is not None:
