@@ -225,8 +225,17 @@ def build_parser():
     p.add_argument("--use_feature_decoder", action="store_true", help="Use FeatureDecoder instead of pixel reconstruction")
     p.add_argument("--feature_dim", type=int, default=128, help="Output dimension of FeatureDecoder (should match PhiNet)")
     p.add_argument("--mask_ratio", type=float, default=0.5, help="Ratio of patches to mask for encoder input (0.5 = 50%)")
+    p.add_argument("--mask_ratio_final", type=float, default=0.35, help="Final mask ratio after ramp (for mask schedule)")
+    p.add_argument("--mask_ramp_steps", type=int, default=80000, help="Steps to ramp mask ratio from 0 to mask_ratio_final")
     p.add_argument("--mask_patch_size", type=int, default=8, help="Size of patches for random masking")
     p.add_argument("--feature_bank", action="store_true", help="Use feature bank for VICReg variance/covariance computation (default: use batch only)")
+    p.add_argument("--aux_pixel_weight", type=float, default=0.0, help="Auxiliary pixel reconstruction weight (stabilizes feature decoder)")
+    
+    # PhiNet stabilization
+    p.add_argument("--phi_lr", type=float, default=1e-4, help="Learning rate for PhiNet (slower than world model)")
+    p.add_argument("--phi_update_every", type=int, default=4, help="Update PhiNet every N world model updates")
+    p.add_argument("--phi_tau", type=float, default=0.9995, help="EMA tau for PhiNet target (higher = slower)")
+    p.add_argument("--phi_freeze_steps", type=int, default=0, help="Freeze PhiNet after N steps (0 = never freeze)")
 
     # CEM planner (reference defaults)
     p.add_argument("--plan_horizon", type=int, default=12, help="Reference: 12")
@@ -262,7 +271,12 @@ def make_run_name(args):
     # Feature decoder (Robust Riemannian World Model)
     if args.use_feature_decoder:
         parts.append(f"featdec{args.feature_dim}")
-        parts.append(f"mask{args.mask_ratio}")
+        if args.mask_ramp_steps > 0:
+            parts.append(f"mask_ramp{args.mask_ratio_final}")
+        else:
+            parts.append(f"mask{args.mask_ratio}")
+        if args.aux_pixel_weight > 0:
+            parts.append(f"auxpix{args.aux_pixel_weight}")
     
     # Bisimulation on/off
     if args.bisimulation_weight > 0:
@@ -277,11 +291,11 @@ def make_run_name(args):
         parts.append("no_jacobreg")
 
     if args.pullback_bisim:
-        parts.append("pullback_bisim_knn_h_s_grad")
+        parts.append("pullback_bisim")
 
-    parts.append(f"phi_align_fixed")
-
-    parts.append("memory_bank")
+    # PhiNet config
+    if args.phi_lr != 1e-3:  # Non-default phi_lr
+        parts.append(f"philr{args.phi_lr}")
     
     # Add seed for reproducibility tracking
     parts.append(f"seed{args.seed}")
@@ -553,24 +567,29 @@ def main(args):
 
     # Single optimizer for all parameters
     # When using feature decoder, also train vis_decoder separately for visualization
+    # Include vis_decoder in main optimizer if aux_pixel_weight > 0 (for stability)
     params = (
         list(encoder.parameters()) + 
         list(decoder.parameters()) + 
         list(rssm.parameters()) + 
         list(reward_model.parameters())
     )
+    if args.use_feature_decoder and args.aux_pixel_weight > 0:
+        params = params + list(vis_decoder.parameters())
     optim = torch.optim.Adam(params, lr=args.lr, eps=args.adam_eps)
     
-    # Separate optimizer for vis_decoder (only trained for visualization, not main objective)
-    if args.use_feature_decoder:
+    # Separate optimizer for vis_decoder (only when NOT using aux_pixel_weight)
+    # When aux_pixel_weight > 0, vis_decoder is included in main optimizer
+    if args.use_feature_decoder and args.aux_pixel_weight == 0:
         vis_decoder_optim = torch.optim.Adam(vis_decoder.parameters(), lr=args.lr, eps=args.adam_eps)
     else:
         vis_decoder_optim = None
     
     phi_net_params = list(phi_net.parameters())
-    phi_optim = torch.optim.Adam(phi_net_params, lr=args.lr, eps=args.adam_eps)
-    phi_tau = 0.995
+    phi_optim = torch.optim.Adam(phi_net_params, lr=args.phi_lr, eps=args.adam_eps)
+    phi_tau = args.phi_tau
     feat_align_weight = 0.1
+    phi_update_counter = 0  # Track updates for phi_update_every
     
     # Store parameter groups for gradient norm computation
     encoder_params = list(encoder.parameters())
@@ -810,9 +829,14 @@ def main(args):
                             #target_features = F.layer_norm(target_features, (target_features.size(-1),))
                             target_features = target_features.view(B, T1, -1)  # [B, T+1, feature_dim]
                         
-                        # 2. Apply masking to encoder inputs
+                        # 2. Apply masking to encoder inputs with ramp schedule
                         # This forces the model to rely on stochastic state, preventing posterior collapse
-                        x_masked = random_masking(x, mask_ratio=args.mask_ratio, patch_size=args.mask_patch_size)
+                        # Ramp mask ratio from 0 to mask_ratio_final over mask_ramp_steps
+                        if args.mask_ramp_steps > 0:
+                            mask_ratio = min(args.mask_ratio_final, args.mask_ratio_final * total_steps / args.mask_ramp_steps)
+                        else:
+                            mask_ratio = args.mask_ratio
+                        x_masked = random_masking(x, mask_ratio=mask_ratio, patch_size=args.mask_patch_size)
                         
                         # Encode MASKED observations
                         e_t = bottle(encoder, x_masked)
@@ -870,15 +894,23 @@ def main(args):
                         feat_loss = torch.zeros((), device=device)
                         feat_target = target_features[:, 1:T+1].reshape(-1, args.feature_dim)
                         
-                        # Train vis_decoder separately
-                        if vis_decoder_optim is not None:
-                            target_pixels = x[:, 1:T+1]
-                            vis_recon = bottle(vis_decoder, h_seq.detach(), s_seq.detach())
-                            vis_loss = F.mse_loss(vis_recon, target_pixels, reduction='none').sum((2, 3, 4)).mean()
-                            vis_decoder_optim.zero_grad()
-                            vis_loss.backward()
-                            torch.nn.utils.clip_grad_norm_(vis_decoder.parameters(), 10.0)
-                            vis_decoder_optim.step()
+                        # Auxiliary pixel reconstruction anchor (stabilizes feature decoder)
+                        # This prevents representational drift by anchoring to pixel space
+                        if args.aux_pixel_weight > 0:
+                            pix_recon = bottle(vis_decoder, h_seq, s_seq)  # No detach - gradients flow
+                            pix_target = x[:, 1:T+1]
+                            aux_pix_loss = F.mse_loss(pix_recon, pix_target, reduction='none').sum((2, 3, 4)).mean()
+                        else:
+                            aux_pix_loss = torch.zeros((), device=device)
+                            # Train vis_decoder separately (detached) only if no aux_pixel_weight
+                            if vis_decoder_optim is not None:
+                                target_pixels = x[:, 1:T+1]
+                                vis_recon = bottle(vis_decoder, h_seq.detach(), s_seq.detach())
+                                vis_loss = F.mse_loss(vis_recon, target_pixels, reduction='none').sum((2, 3, 4)).mean()
+                                vis_decoder_optim.zero_grad()
+                                vis_loss.backward()
+                                torch.nn.utils.clip_grad_norm_(vis_decoder.parameters(), 10.0)
+                                vis_decoder_optim.step()
                     else:
                         # Standard pixel reconstruction (backwards compatibility)
                         recon = bottle(decoder, h_seq, s_seq)
@@ -894,6 +926,7 @@ def main(args):
                         
                         feat_recon = phi_net_target(recon_flat) 
                         feat_loss = torch.zeros((), device=device)  # Disabled for now to avoid conflicts
+                        aux_pix_loss = torch.zeros((), device=device)  # Not needed for pixel decoder
 
                     kld_loss = torch.max(
                         kl_divergence(posterior_dist, prior_dist).sum(-1),
@@ -1077,6 +1110,7 @@ def main(args):
                         + rew_loss
                         + bisim_weight * bisim_loss_val
                         + feat_align_weight * feat_loss
+                        + args.aux_pixel_weight * aux_pix_loss
                     )
 
                     total_loss_value = total.item()
@@ -1111,82 +1145,95 @@ def main(args):
                     # =========================================================
                     #  VICReg Training (with optional Feature Bank)
                     # =========================================================
-                    # 1. Forward pass on current batch
-                    # Use clean (unmasked) images for VICReg training
-                    if args.use_feature_decoder:
-                        # When using feature decoder, x is the clean images, x_masked was used for encoder
-                        real = x[:, 1:T+1].reshape(-1, C, H, W).detach()
-                    else:
-                        real = target_flat.detach()
-                    phi_net.train()
-                    x1 = phi_augment(real)
-                    x2 = phi_augment(real)
-                    z1 = phi_net(x1)
-                    z2 = phi_net(x2)
+                    # Only update phi every phi_update_every steps and before phi_freeze_steps
+                    phi_update_counter += 1
+                    do_phi_update = (phi_update_counter % args.phi_update_every == 0)
+                    if args.phi_freeze_steps > 0:
+                        do_phi_update = do_phi_update and (total_steps < args.phi_freeze_steps)
                     
-                    # 2. Update Feature Bank (FIFO Queue) - only if feature_bank is enabled
-                    if args.feature_bank:
+                    if do_phi_update:
+                        # 1. Forward pass on current batch
+                        # Use clean (unmasked) images for VICReg training
+                        if args.use_feature_decoder:
+                            # When using feature decoder, x is the clean images, x_masked was used for encoder
+                            real = x[:, 1:T+1].reshape(-1, C, H, W).detach()
+                        else:
+                            real = target_flat.detach()
+                        phi_net.train()
+                        x1 = phi_augment(real)
+                        x2 = phi_augment(real)
+                        z1 = phi_net(x1)
+                        z2 = phi_net(x2)
+                        
+                        # 2. Update Feature Bank (FIFO Queue) - only if feature_bank is enabled
+                        if args.feature_bank:
+                            with torch.no_grad():
+                                z_out = z1.detach()  # Use one view to update stats
+                                batch_len = z_out.shape[0]
+                                
+                                # Simple FIFO logic
+                                indices = torch.arange(bank_ptr, bank_ptr + batch_len, device=device) % bank_capacity
+                                feature_bank[indices] = z_out
+                                bank_ptr = (bank_ptr + batch_len) % bank_capacity
+
+                        # 3. Compute VICReg Loss
+                        # Invariance: Force x1 and x2 (same image) to be close
+                        sim_loss = F.mse_loss(z1, z2)
+
+                        # Variance/Covariance: Use the BANK (if enabled) or just the batch
+                        if args.feature_bank:
+                            # Concatenate current batch with bank for robust stats
+                            # (Detach bank so we don't backprop through history)
+                            z_all = torch.cat([z1, feature_bank.detach()], dim=0)
+                        else:
+                            # Use just the current batch
+                            z_all = z1 
+                        
+                        # Variance Loss (Hinge loss on std dev)
+                        eps = 1e-4
+                        std_z = torch.sqrt(z_all.var(dim=0) + eps)
+                        var_loss = F.relu(1.0 - std_z).mean() 
+                        
+                        # Covariance Loss (Decorrelate dimensions)
+                        z_all_centered = z_all - z_all.mean(dim=0)
+                        cov_z = (z_all_centered.T @ z_all_centered) / (z_all.shape[0] - 1)
+                        
+                        # Zero out diagonal (we want diagonal to be 1, which var_loss handles)
+                        n_dim = cov_z.shape[0]
+                        off_diag_mask = ~torch.eye(n_dim, dtype=torch.bool, device=device)
+                        cov_loss = cov_z[off_diag_mask].pow(2).mean()
+
+                        phi_loss = 25.0 * sim_loss + 25.0 * var_loss + 1.0 * cov_loss
+
+                        phi_optim.zero_grad()
+                        phi_loss.backward()
+
+                        torch.nn.utils.clip_grad_norm_(phi_net.parameters(), 10.0)
+
+                        phi_optim.step()
+                        
+                        # Update target phi net with slower EMA
+                        ema_update(phi_net_target, phi_net, phi_tau)
+                        phi_net_target.eval()
+
                         with torch.no_grad():
-                            z_out = z1.detach()  # Use one view to update stats
-                            batch_len = z_out.shape[0]
+                            writer.add_scalar("phi/loss", phi_loss.item(), total_steps)
+                            writer.add_scalar("phi/sim_loss", sim_loss.item(), total_steps)
+                            writer.add_scalar("phi/var_loss", var_loss.item(), total_steps)
+                            writer.add_scalar("phi/cov_loss", cov_loss.item(), total_steps)
+                            writer.add_scalar("phi/z1_mean", z1.mean().item(), total_steps)
+                            writer.add_scalar("phi/z1_std", z1.std().item(), total_steps)
+                            writer.add_scalar("phi/z2_mean", z2.mean().item(), total_steps)
+                            writer.add_scalar("phi/z2_std", z2.std().item(), total_steps)
+                            writer.add_scalar("phi/z1_z2_corr", (z1 * z2).mean().item(), total_steps)
+                            writer.add_scalar("phi/z1_z2_cov", (z1 * z2).var().item(), total_steps)
+                            writer.add_scalar("phi/bank_std_mean", std_z.mean().item(), total_steps)
                             
-                            # Simple FIFO logic
-                            indices = torch.arange(bank_ptr, bank_ptr + batch_len, device=device) % bank_capacity
-                            feature_bank[indices] = z_out
-                            bank_ptr = (bank_ptr + batch_len) % bank_capacity
-
-                    # 3. Compute VICReg Loss
-                    # Invariance: Force x1 and x2 (same image) to be close
-                    sim_loss = F.mse_loss(z1, z2)
-
-                    # Variance/Covariance: Use the BANK (if enabled) or just the batch
-                    if args.feature_bank:
-                        # Concatenate current batch with bank for robust stats
-                        # (Detach bank so we don't backprop through history)
-                        z_all = torch.cat([z1, feature_bank.detach()], dim=0)
-                    else:
-                        # Use just the current batch
-                        z_all = z1 
-                    
-                    # Variance Loss (Hinge loss on std dev)
-                    eps = 1e-4
-                    std_z = torch.sqrt(z_all.var(dim=0) + eps)
-                    var_loss = F.relu(1.0 - std_z).mean() 
-                    
-                    # Covariance Loss (Decorrelate dimensions)
-                    z_all_centered = z_all - z_all.mean(dim=0)
-                    cov_z = (z_all_centered.T @ z_all_centered) / (z_all.shape[0] - 1)
-                    
-                    # Zero out diagonal (we want diagonal to be 1, which var_loss handles)
-                    n_dim = cov_z.shape[0]
-                    off_diag_mask = ~torch.eye(n_dim, dtype=torch.bool, device=device)
-                    cov_loss = cov_z[off_diag_mask].pow(2).mean()
-
-                    phi_loss = 25.0 * sim_loss + 25.0 * var_loss + 1.0 * cov_loss
-
-                    phi_optim.zero_grad()
-                    phi_loss.backward()
-
-                    torch.nn.utils.clip_grad_norm_(phi_net.parameters(), 10.0)
-
-                    phi_optim.step()
-                    
-                    # Update target phi net
-                    ema_update(phi_net_target, phi_net, phi_tau)
-                    phi_net_target.eval()
-
-                    with torch.no_grad():
-                        writer.add_scalar("phi/loss", phi_loss.item(), total_steps)
-                        writer.add_scalar("phi/sim_loss", sim_loss.item(), total_steps)
-                        writer.add_scalar("phi/var_loss", var_loss.item(), total_steps)
-                        writer.add_scalar("phi/cov_loss", cov_loss.item(), total_steps)
-                        writer.add_scalar("phi/z1_mean", z1.mean().item(), total_steps)
-                        writer.add_scalar("phi/z1_std", z1.std().item(), total_steps)
-                        writer.add_scalar("phi/z2_mean", z2.mean().item(), total_steps)
-                        writer.add_scalar("phi/z2_std", z2.std().item(), total_steps)
-                        writer.add_scalar("phi/z1_z2_corr", (z1 * z2).mean().item(), total_steps)
-                        writer.add_scalar("phi/z1_z2_cov", (z1 * z2).var().item(), total_steps)
-                        writer.add_scalar("phi/bank_std_mean", std_z.mean().item(), total_steps)
+                            # Log phi drift metrics (target feature stats)
+                            target_feat_sample = phi_net_target(real[:min(64, real.shape[0])])
+                            writer.add_scalar("phi/target_feat_mean", target_feat_sample.mean().item(), total_steps)
+                            writer.add_scalar("phi/target_feat_std", target_feat_sample.std().item(), total_steps)
+                            writer.add_scalar("phi/target_feat_norm", target_feat_sample.norm(dim=-1).mean().item(), total_steps)
 
                     # Accumulate losses for logging
                     loss_accum["total"] += total_loss_value
@@ -1196,6 +1243,7 @@ def main(args):
                     loss_accum["pb"] += pb_loss.item()
                     loss_accum["bisim"] += bisim_loss_val.item()
                     loss_accum["bisim_weighted"] = loss_accum.get("bisim_weighted", 0.0) + bisim_weight * bisim_loss_val.item()
+                    loss_accum["aux_pix"] = loss_accum.get("aux_pix", 0.0) + aux_pix_loss.item()
 
                 # Log average losses to TensorBoard
                 n_updates = args.train_steps
@@ -1210,7 +1258,13 @@ def main(args):
                 # Log feature decoder specific metrics
                 if args.use_feature_decoder:
                     writer.add_scalar("loss/feature_rec", loss_accum["rec"] / n_updates, total_steps)
-                    writer.add_scalar("config/mask_ratio", args.mask_ratio, total_steps)
+                    writer.add_scalar("loss/aux_pixel", loss_accum.get("aux_pix", 0.0) / n_updates, total_steps)
+                    # Log current mask ratio (may be ramping)
+                    if args.mask_ramp_steps > 0:
+                        current_mask_ratio = min(args.mask_ratio_final, args.mask_ratio_final * total_steps / args.mask_ramp_steps)
+                    else:
+                        current_mask_ratio = args.mask_ratio
+                    writer.add_scalar("config/mask_ratio", current_mask_ratio, total_steps)
                 
                 # Log effective bisim weight (useful to see warmup/ramp progress)
                 writer.add_scalar("loss/bisim_weight", bisim_weight, total_steps)
