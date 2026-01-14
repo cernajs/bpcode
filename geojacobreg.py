@@ -230,12 +230,14 @@ def build_parser():
     p.add_argument("--mask_patch_size", type=int, default=8, help="Size of patches for random masking")
     p.add_argument("--feature_bank", action="store_true", help="Use feature bank for VICReg variance/covariance computation (default: use batch only)")
     p.add_argument("--aux_pixel_weight", type=float, default=0.0, help="Auxiliary pixel reconstruction weight (stabilizes feature decoder)")
+    p.add_argument("--feature_rec_scale", type=float, default=10.0, help="Scale factor for feature reconstruction loss (tune to match pixel MSE magnitude)")
     
     # PhiNet stabilization
     p.add_argument("--phi_lr", type=float, default=1e-4, help="Learning rate for PhiNet (slower than world model)")
     p.add_argument("--phi_update_every", type=int, default=4, help="Update PhiNet every N world model updates")
     p.add_argument("--phi_tau", type=float, default=0.9995, help="EMA tau for PhiNet target (higher = slower)")
     p.add_argument("--phi_freeze_steps", type=int, default=0, help="Freeze PhiNet after N steps (0 = never freeze)")
+    p.add_argument("--phi_warmup_steps", type=int, default=0, help="Delay feature-decoder loss until phi has trained for N steps (0 = no warmup)")
 
     # CEM planner (reference defaults)
     p.add_argument("--plan_horizon", type=int, default=12, help="Reference: 12")
@@ -341,9 +343,10 @@ def pullback_distance_full(decoder, phi_target, h1, s1, h2, s2, create_graph=Tru
     delta_s = (s1 - s2)
     
     if is_feature_decoder:
-        # FeatureDecoder: output is already features, no need for phi_target
+        # FeatureDecoder: output is already features, apply LayerNorm to stabilize scale
         def decoder_wrapper(h, s):
             f = decoder(h, s)
+            f = F.layer_norm(f, (f.size(-1),), eps=1e-3)  # Stabilize against feature scale drift
             return f
         
         with no_param_grads(decoder):
@@ -353,7 +356,7 @@ def pullback_distance_full(decoder, phi_target, h1, s1, h2, s2, create_graph=Tru
         def decoder_wrapper(h, s):
             x = decoder(h, s)
             f = phi_target(x)
-            f = F.layer_norm(f, (f.size(-1),))
+            f = F.layer_norm(f, (f.size(-1),), eps=1e-3)  # eps=1e-3 more stable early
             return f
 
         with no_param_grads(decoder), no_param_grads(phi_target):
@@ -552,6 +555,7 @@ def main(args):
 
     # --- Feature Bank for Stable VICReg (optional) ---
     # Capacity 256 is large enough for stats, small enough for VRAM
+    # Note: Don't normalize - VICReg standard doesn't L2-normalize stored features
     bank_capacity = 256 
     feature_bank = None
     bank_ptr = 0
@@ -560,7 +564,6 @@ def main(args):
             feature_bank = torch.randn(bank_capacity, args.feature_dim, device=device)
         else:
             feature_bank = torch.randn(bank_capacity, args.embed_dim, device=device)
-        feature_bank = F.normalize(feature_bank, dim=-1)  # Start normalized
     
     # --- Target Scaler for Bisimulation ---
     target_scale_ema = 1.0
@@ -823,10 +826,11 @@ def main(args):
                     if args.use_feature_decoder:
                         # 1. Compute target features from CLEAN (unmasked) images
                         # This is the "Teacher" (VICReg) telling us what to predict
+                        # LayerNorm prevents near-constant teacher vectors from producing noisy gradients
                         x_flat = x.view(-1, C, H, W)  # [B*(T+1), C, H, W]
                         with torch.no_grad():
                             target_features = phi_net_target(x_flat)  # [B*(T+1), feature_dim]
-                            #target_features = F.layer_norm(target_features, (target_features.size(-1),))
+                            target_features = F.layer_norm(target_features, (target_features.size(-1),), eps=1e-3)
                             target_features = target_features.view(B, T1, -1)  # [B, T+1, feature_dim]
                         
                         # 2. Apply masking to encoder inputs with ramp schedule
@@ -883,13 +887,24 @@ def main(args):
                         pred_features = bottle(decoder, h_seq, s_seq)  # [B, T, feature_dim]
                         feat_target_seq = target_features[:, 1:T+1]    # [B, T, feature_dim]
                         
+                        # Apply LayerNorm to pred_features before cosine sim (match target normalization)
+                        pred_features = F.layer_norm(pred_features, (pred_features.size(-1),), eps=1e-3)
+                        
                         # Cosine similarity loss (more stable than MSE for normalized features)
                         pred_norm = F.normalize(pred_features, dim=-1)
                         target_norm = F.normalize(feat_target_seq, dim=-1)
                         
                         # 1 - cosine_sim ranges [0, 2], scale to reasonable magnitude
                         cosine_sim = (pred_norm * target_norm).sum(dim=-1)  # [B, T]
-                        rec_loss = (1.0 - cosine_sim).mean() * 10.0  # Scale factor
+                        raw_rec_loss = (1.0 - cosine_sim).mean() * args.feature_rec_scale
+                        
+                        # Phi warmup gating: delay feature-decoder loss until phi is trained
+                        # This prevents learning from garbage teacher features early on
+                        if args.phi_warmup_steps > 0 and total_steps < args.phi_warmup_steps:
+                            phi_warmup_factor = total_steps / args.phi_warmup_steps
+                            rec_loss = raw_rec_loss * phi_warmup_factor
+                        else:
+                            rec_loss = raw_rec_loss
                         
                         feat_loss = torch.zeros((), device=device)
                         feat_target = target_features[:, 1:T+1].reshape(-1, args.feature_dim)
@@ -1265,6 +1280,11 @@ def main(args):
                     else:
                         current_mask_ratio = args.mask_ratio
                     writer.add_scalar("config/mask_ratio", current_mask_ratio, total_steps)
+                    writer.add_scalar("config/feature_rec_scale", args.feature_rec_scale, total_steps)
+                    # Log phi warmup factor
+                    if args.phi_warmup_steps > 0:
+                        phi_warmup_factor = min(1.0, total_steps / args.phi_warmup_steps)
+                        writer.add_scalar("config/phi_warmup_factor", phi_warmup_factor, total_steps)
                 
                 # Log effective bisim weight (useful to see warmup/ramp progress)
                 writer.add_scalar("loss/bisim_weight", bisim_weight, total_steps)
