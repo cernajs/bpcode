@@ -425,33 +425,24 @@ class ValueModel(nn.Module):
 
 
 class FeatureDecoder(nn.Module):
-    """
-    Decodes latent state (h, s) into abstract features (e.g., VICReg embeddings).
-    Replaces ConvDecoder for the primary learning objective in the Robust Riemannian World Model.
-    
-    Instead of reconstructing high-frequency pixel details, this decoder predicts
-    robust visual features that capture semantic content (cheetah position/velocity)
-    while ignoring task-irrelevant details (floor texture).
-    """
     def __init__(self, state_size=200, latent_size=30, feature_dim=128, hidden_dim=400, activation_function='elu'):
         super().__init__()
         self.act_fn = getattr(F, activation_function)
         self.feature_dim = feature_dim
         
-        # Input: Deterministic (h) + Stochastic (s)
-        # Output: VICReg Feature Vector
         self.fc1 = nn.Linear(state_size + latent_size, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         self.fc_out = nn.Linear(hidden_dim, feature_dim)
-        self.layer_norm = nn.LayerNorm(feature_dim)
+        
+        # Proper initialization for stability
+        for m in [self.fc1, self.fc2, self.fc3]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.fc_out.weight, gain=0.1)  # Small init
+        nn.init.zeros_(self.fc_out.bias)
         
     def forward(self, h, s=None):
-        """
-        h: [B, state_size] or [B, T, state_size]
-        s: [B, latent_size] or [B, T, latent_size] (optional)
-        Returns: [B, feature_dim] or [B, T, feature_dim]
-        """
         if s is not None:
             x = torch.cat([h, s], dim=-1)
         else:
@@ -459,6 +450,4 @@ class FeatureDecoder(nn.Module):
         x = self.act_fn(self.fc1(x))
         x = self.act_fn(self.fc2(x))
         x = self.act_fn(self.fc3(x))
-        x = self.fc_out(x)
-        return self.layer_norm(x)
-
+        return self.fc_out(x)

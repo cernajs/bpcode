@@ -226,6 +226,7 @@ def build_parser():
     p.add_argument("--feature_dim", type=int, default=128, help="Output dimension of FeatureDecoder (should match PhiNet)")
     p.add_argument("--mask_ratio", type=float, default=0.5, help="Ratio of patches to mask for encoder input (0.5 = 50%)")
     p.add_argument("--mask_patch_size", type=int, default=8, help="Size of patches for random masking")
+    p.add_argument("--feature_bank", action="store_true", help="Use feature bank for VICReg variance/covariance computation (default: use batch only)")
 
     # CEM planner (reference defaults)
     p.add_argument("--plan_horizon", type=int, default=12, help="Reference: 12")
@@ -535,16 +536,17 @@ def main(args):
         param.requires_grad = False
     ema_update(phi_net_target, phi_net, 0.999)
 
-    # --- Feature Bank for Stable VICReg ---
+    # --- Feature Bank for Stable VICReg (optional) ---
     # Capacity 256 is large enough for stats, small enough for VRAM
     bank_capacity = 256 
-    
-    if args.use_feature_decoder:
-        feature_bank = torch.randn(bank_capacity, args.feature_dim, device=device)
-    else:
-        feature_bank = torch.randn(bank_capacity, args.embed_dim, device=device)
-    feature_bank = F.normalize(feature_bank, dim=-1)  # Start normalized
+    feature_bank = None
     bank_ptr = 0
+    if args.feature_bank:
+        if args.use_feature_decoder:
+            feature_bank = torch.randn(bank_capacity, args.feature_dim, device=device)
+        else:
+            feature_bank = torch.randn(bank_capacity, args.embed_dim, device=device)
+        feature_bank = F.normalize(feature_bank, dim=-1)  # Start normalized
     
     # --- Target Scaler for Bisimulation ---
     target_scale_ema = 1.0
@@ -805,7 +807,7 @@ def main(args):
                         x_flat = x.view(-1, C, H, W)  # [B*(T+1), C, H, W]
                         with torch.no_grad():
                             target_features = phi_net_target(x_flat)  # [B*(T+1), feature_dim]
-                            target_features = F.layer_norm(target_features, (target_features.size(-1),))
+                            #target_features = F.layer_norm(target_features, (target_features.size(-1),))
                             target_features = target_features.view(B, T1, -1)  # [B, T+1, feature_dim]
                         
                         # 2. Apply masking to encoder inputs
@@ -854,30 +856,28 @@ def main(args):
                     # Reconstruction Loss
                     # ============================================
                     if args.use_feature_decoder:
-                        # Feature-based reconstruction: predict VICReg features, not pixels
-                        # The decoder predicts features, loss is MSE between predicted and target features
                         pred_features = bottle(decoder, h_seq, s_seq)  # [B, T, feature_dim]
-                        feat_target_seq = target_features[:, 1:T+1]  # [B, T, feature_dim] - skip first obs
+                        feat_target_seq = target_features[:, 1:T+1]    # [B, T, feature_dim]
                         
-                        #rec_loss = F.mse_loss(pred_features, feat_target_seq)
-                        rec_loss = F.mse_loss(pred_features, feat_target_seq, reduction='none').sum(dim=-1).mean() * 100
+                        # Cosine similarity loss (more stable than MSE for normalized features)
+                        pred_norm = F.normalize(pred_features, dim=-1)
+                        target_norm = F.normalize(feat_target_seq, dim=-1)
                         
-                        # No separate feature alignment loss needed (it's the main loss now)
+                        # 1 - cosine_sim ranges [0, 2], scale to reasonable magnitude
+                        cosine_sim = (pred_norm * target_norm).sum(dim=-1)  # [B, T]
+                        rec_loss = (1.0 - cosine_sim).mean() * 10.0  # Scale factor
+                        
                         feat_loss = torch.zeros((), device=device)
+                        feat_target = target_features[:, 1:T+1].reshape(-1, args.feature_dim)
                         
-                        # For bisimulation statistics: use target_features (already computed)
-                        # Flatten to match the shape expected by statistics code
-                        feat_target = target_features[:, 1:T+1].reshape(-1, args.feature_dim)  # [B*T, feature_dim]
-                        
-                        # Train vis_decoder separately with DETACHED gradients for visualization
-                        # This doesn't affect the main training objective
+                        # Train vis_decoder separately
                         if vis_decoder_optim is not None:
-                            target_pixels = x[:, 1:T+1]  # [B, T, C, H, W]
+                            target_pixels = x[:, 1:T+1]
                             vis_recon = bottle(vis_decoder, h_seq.detach(), s_seq.detach())
                             vis_loss = F.mse_loss(vis_recon, target_pixels, reduction='none').sum((2, 3, 4)).mean()
-                            
                             vis_decoder_optim.zero_grad()
                             vis_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(vis_decoder.parameters(), 10.0)
                             vis_decoder_optim.step()
                     else:
                         # Standard pixel reconstruction (backwards compatibility)
@@ -1109,7 +1109,7 @@ def main(args):
                     optim.step()
 
                     # =========================================================
-                    #  VICReg Training with Feature Bank for Stability
+                    #  VICReg Training (with optional Feature Bank)
                     # =========================================================
                     # 1. Forward pass on current batch
                     # Use clean (unmasked) images for VICReg training
@@ -1124,24 +1124,29 @@ def main(args):
                     z1 = phi_net(x1)
                     z2 = phi_net(x2)
                     
-                    # 2. Update Feature Bank (FIFO Queue)
-                    with torch.no_grad():
-                        z_out = z1.detach()  # Use one view to update stats
-                        batch_len = z_out.shape[0]
-                        
-                        # Simple FIFO logic
-                        indices = torch.arange(bank_ptr, bank_ptr + batch_len, device=device) % bank_capacity
-                        feature_bank[indices] = z_out
-                        bank_ptr = (bank_ptr + batch_len) % bank_capacity
+                    # 2. Update Feature Bank (FIFO Queue) - only if feature_bank is enabled
+                    if args.feature_bank:
+                        with torch.no_grad():
+                            z_out = z1.detach()  # Use one view to update stats
+                            batch_len = z_out.shape[0]
+                            
+                            # Simple FIFO logic
+                            indices = torch.arange(bank_ptr, bank_ptr + batch_len, device=device) % bank_capacity
+                            feature_bank[indices] = z_out
+                            bank_ptr = (bank_ptr + batch_len) % bank_capacity
 
-                    # 3. Compute Stable VICReg Loss
+                    # 3. Compute VICReg Loss
                     # Invariance: Force x1 and x2 (same image) to be close
                     sim_loss = F.mse_loss(z1, z2)
 
-                    # Variance/Covariance: Use the BANK (256 samples) not the batch
-                    # Concatenate current batch with bank for robust stats
-                    # (Detach bank so we don't backprop through history)
-                    z_all = torch.cat([z1, feature_bank.detach()], dim=0) 
+                    # Variance/Covariance: Use the BANK (if enabled) or just the batch
+                    if args.feature_bank:
+                        # Concatenate current batch with bank for robust stats
+                        # (Detach bank so we don't backprop through history)
+                        z_all = torch.cat([z1, feature_bank.detach()], dim=0)
+                    else:
+                        # Use just the current batch
+                        z_all = z1 
                     
                     # Variance Loss (Hinge loss on std dev)
                     eps = 1e-4
@@ -1157,11 +1162,13 @@ def main(args):
                     off_diag_mask = ~torch.eye(n_dim, dtype=torch.bool, device=device)
                     cov_loss = cov_z[off_diag_mask].pow(2).mean()
 
-                    # Final Phi Loss (25.0 is standard VICReg default weight)
-                    phi_loss = 1.0 * sim_loss + 1.0 * var_loss + 1.0 * cov_loss
+                    phi_loss = 25.0 * sim_loss + 25.0 * var_loss + 1.0 * cov_loss
 
                     phi_optim.zero_grad()
                     phi_loss.backward()
+
+                    torch.nn.utils.clip_grad_norm_(phi_net.parameters(), 10.0)
+
                     phi_optim.step()
                     
                     # Update target phi net
