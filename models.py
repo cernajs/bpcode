@@ -451,3 +451,95 @@ class FeatureDecoder(nn.Module):
         x = self.act_fn(self.fc2(x))
         x = self.act_fn(self.fc3(x))
         return self.fc_out(x)
+
+
+class FeatureDecoder2(nn.Module):
+    """
+    Geometric Feature Decoder with uncertainty (μ, σ).
+    
+    Outputs:
+        mu: [B, feature_dim] - mean feature embedding (for pullback metric)
+        log_sigma: [B, feature_dim] - log std (for uncertainty/ambiguity)
+    
+    Args:
+        feature_norm_mode: "none" | "layernorm" | "l2" - normalization for features
+        log_sigma_min: min clamp for log_sigma (default -8)
+        log_sigma_max: max clamp for log_sigma (default 4)
+    """
+    def __init__(
+        self, 
+        state_size=200, 
+        latent_size=30, 
+        feature_dim=128, 
+        hidden_dim=400, 
+        activation_function='elu',
+        feature_norm_mode='none',  # 'none', 'layernorm', 'l2'
+        log_sigma_min=-8.0,
+        log_sigma_max=4.0,
+    ):
+        super().__init__()
+        self.act_fn = getattr(F, activation_function)
+        self.feature_dim = feature_dim
+        self.feature_norm_mode = feature_norm_mode
+        self.log_sigma_min = log_sigma_min
+        self.log_sigma_max = log_sigma_max
+        
+        # Shared trunk
+        self.fc1 = nn.Linear(state_size + latent_size, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Split heads for mu and log_sigma
+        self.fc_mu = nn.Linear(hidden_dim, feature_dim)
+        self.fc_log_sigma = nn.Linear(hidden_dim, feature_dim)
+        
+        # Initialization
+        for m in [self.fc1, self.fc2, self.fc3]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.fc_mu.weight, gain=0.1)
+        nn.init.zeros_(self.fc_mu.bias)
+        nn.init.orthogonal_(self.fc_log_sigma.weight, gain=0.1)
+        nn.init.constant_(self.fc_log_sigma.bias, 0.0)  # Start at log(1) = 0
+        
+        # Optional LayerNorm for mu output
+        if feature_norm_mode == 'layernorm':
+            self.layer_norm = nn.LayerNorm(feature_dim, eps=1e-3)
+        else:
+            self.layer_norm = None
+    
+    def forward(self, h, s=None):
+        """
+        Args:
+            h: [B, state_size] or [B, T, state_size]
+            s: [B, latent_size] or [B, T, latent_size] (optional)
+        
+        Returns:
+            mu: [B, feature_dim] or [B, T, feature_dim]
+            log_sigma: [B, feature_dim] or [B, T, feature_dim]
+        """
+        if s is not None:
+            x = torch.cat([h, s], dim=-1)
+        else:
+            x = h
+        
+        # Shared trunk
+        x = self.act_fn(self.fc1(x))
+        x = self.act_fn(self.fc2(x))
+        x = self.act_fn(self.fc3(x))
+        
+        # Split heads
+        mu = self.fc_mu(x)
+        log_sigma = self.fc_log_sigma(x)
+        
+        # Apply normalization to mu if specified
+        if self.feature_norm_mode == 'layernorm' and self.layer_norm is not None:
+            mu = self.layer_norm(mu)
+        elif self.feature_norm_mode == 'l2':
+            mu = F.normalize(mu, p=2, dim=-1)
+        # else: no normalization
+        
+        # Clamp log_sigma to prevent degenerate behavior
+        log_sigma = torch.clamp(log_sigma, self.log_sigma_min, self.log_sigma_max)
+        
+        return mu, log_sigma

@@ -18,7 +18,8 @@ import cv2
 from dataclasses import dataclass
 
 __all__ = ['ReplayBuffer', 'get_device', 'set_seed', 
-           'preprocess_img', 'postprocess_img', 'bottle', 'random_masking', 'make_env', 'ENV_ACTION_REPEAT',
+           'preprocess_img', 'postprocess_img', 'bottle', 'random_masking', 'mask_spatiotemporal', 
+           'make_env', 'ENV_ACTION_REPEAT',
            'log_visualizations', 'log_imagination_rollout', 'log_reward_prediction',
            'log_latent_reward_structure', 'log_action_conditioned_prediction', 'log_latent_dynamics']
 
@@ -83,9 +84,14 @@ def postprocess_img(image, depth=5):
 def bottle(func, *tensors):
     """
     Evaluates a func that operates in N x D with inputs of shape N x T x D.
+    Handles both single tensor outputs and tuple outputs (e.g., FeatureDecoder2).
     """
     n, t = tensors[0].shape[:2]
     out = func(*[x.reshape(n*t, *x.shape[2:]) for x in tensors])
+    
+    # Handle tuple outputs (e.g., FeatureDecoder2 returns (mu, log_sigma))
+    if isinstance(out, tuple):
+        return tuple(o.reshape(n, t, *o.shape[1:]) for o in out)
     return out.reshape(n, t, *out.shape[1:])
 
 
@@ -139,6 +145,73 @@ def random_masking(imgs, mask_ratio=0.5, patch_size=8):
         x_masked = x_masked.view(B, T, C, H, W)
         
     return x_masked
+
+
+def mask_spatiotemporal(video, mask_ratio=0.5, cube_t=2, cube_hw=8, mode='zero'):
+    """
+    Spatio-temporal cube masking (2405.06263 style).
+    
+    Samples 3D cubes (temporal x spatial) and masks them until ~mask_ratio of 
+    the video is masked. This is more aggressive than per-frame patch masking.
+    
+    Args:
+        video: [B, T, C, H, W] video tensor
+        mask_ratio: target fraction of pixels to mask (0.5 = 50%)
+        cube_t: temporal size of cubes (default 2 frames)
+        cube_hw: spatial size of cubes (default 8x8 pixels)
+        mode: 'zero' (set to 0) or 'noise' (fill with random noise)
+    
+    Returns:
+        masked_video: [B, T, C, H, W] with cubes masked
+        mask_metadata: dict with mask positions (optional, for debugging)
+    """
+    B, T, C, H, W = video.shape
+    device = video.device
+    
+    masked_video = video.clone()
+    
+    # Calculate how many pixels to mask in total
+    total_pixels = B * T * C * H * W
+    target_masked = int(mask_ratio * total_pixels)
+    
+    # Cube dimensions
+    t_cubes = max(1, T // cube_t)
+    h_cubes = max(1, H // cube_hw)
+    w_cubes = max(1, W // cube_hw)
+    
+    pixels_per_cube = cube_t * cube_hw * cube_hw * C
+    n_cubes_to_mask = max(1, target_masked // (pixels_per_cube * B))
+    
+    # For each batch element, sample cubes to mask
+    for b in range(B):
+        masked_count = 0
+        attempts = 0
+        max_attempts = n_cubes_to_mask * 3  # avoid infinite loops
+        
+        while masked_count < target_masked / B and attempts < max_attempts:
+            # Sample random cube position
+            t_start = torch.randint(0, max(1, T - cube_t + 1), (1,), device=device).item()
+            h_start = torch.randint(0, max(1, H - cube_hw + 1), (1,), device=device).item()
+            w_start = torch.randint(0, max(1, W - cube_hw + 1), (1,), device=device).item()
+            
+            t_end = min(t_start + cube_t, T)
+            h_end = min(h_start + cube_hw, H)
+            w_end = min(w_start + cube_hw, W)
+            
+            # Apply mask
+            if mode == 'zero':
+                masked_video[b, t_start:t_end, :, h_start:h_end, w_start:w_end] = 0.0
+            elif mode == 'noise':
+                noise = torch.randn(
+                    t_end - t_start, C, h_end - h_start, w_end - w_start,
+                    device=device, dtype=video.dtype
+                ) * 0.1  # small noise
+                masked_video[b, t_start:t_end, :, h_start:h_end, w_start:w_end] = noise
+            
+            masked_count += (t_end - t_start) * C * (h_end - h_start) * (w_end - w_start)
+            attempts += 1
+    
+    return masked_video
 
 
 class PixelObsWrapper(gym.Wrapper):

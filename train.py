@@ -18,6 +18,7 @@ from utils import (
     preprocess_img,
     bottle,
     random_masking,
+    mask_spatiotemporal,
     make_env,
     ENV_ACTION_REPEAT,
     log_visualizations,
@@ -27,7 +28,7 @@ from utils import (
     log_action_conditioned_prediction,
     log_latent_dynamics,
 )
-from models import ConvEncoder, ConvDecoder, RSSM, RewardModel, FeatureDecoder
+from models import ConvEncoder, ConvDecoder, RSSM, RewardModel, FeatureDecoder, FeatureDecoder2
 from vicreg_net import PhiNet, ema_update, phi_augment
 
 
@@ -50,9 +51,28 @@ def cem_plan_action_rssm(
     device=None,
     explore=False,
     explore_noise=0.3,
+    geo_decoder=None,
+    lambda_sigma=0.0,
+    sigma_threshold=float('inf'),
 ):
     """
     CEM planner using RSSM prior rollout and reward model.
+    
+    Args:
+        rssm: RSSM model
+        reward_model: reward prediction model
+        h_t, s_t: current latent state
+        act_low, act_high: action bounds
+        horizon: planning horizon
+        candidates: number of candidate action sequences
+        iters: number of CEM iterations
+        top_k: number of elite samples
+        device: torch device
+        explore: whether to add exploration noise
+        explore_noise: std of exploration noise
+        geo_decoder: optional FeatureDecoder2 for sigma penalty
+        lambda_sigma: weight for sigma penalty (risk aversion)
+        sigma_threshold: threshold for sigma constraint (reject high-σ trajectories)
     """
     device = device or h_t.device
     act_dim = act_low.shape[0]
@@ -62,12 +82,15 @@ def cem_plan_action_rssm(
 
     mu = torch.zeros(horizon, act_dim, device=device)
     stddev = torch.ones(horizon, act_dim, device=device)
+    
+    use_sigma_penalty = (geo_decoder is not None) and (lambda_sigma > 0.0 or sigma_threshold < float('inf'))
 
     for _ in range(iters):
         actions = Normal(mu, stddev).sample((candidates,))  # [N, H, A]
         actions = torch.clamp(actions, act_low_t, act_high_t)
 
         rwds = torch.zeros(candidates, device=device)
+        sigma_costs = torch.zeros(candidates, device=device) if use_sigma_penalty else None
         h = h_t.expand(candidates, -1).clone()
         s = s_t.expand(candidates, -1).clone()
 
@@ -76,9 +99,37 @@ def cem_plan_action_rssm(
             h = rssm.deterministic_state_fwd(h, s, a_t)
             s = rssm.state_prior(h, sample=True)
             rwds += reward_model(h, s)
+            
+            # Compute sigma cost if using geometric decoder
+            if use_sigma_penalty:
+                _, log_sigma = geo_decoder(h, s)
+                sigma_costs += sigma_cost(log_sigma)
 
-        _, k = torch.topk(rwds, top_k, dim=0, largest=True, sorted=False)
-        elite_actions = actions[k]
+        # Objective: maximize reward - lambda_sigma * sigma_cost
+        if use_sigma_penalty:
+            objectives = rwds - lambda_sigma * sigma_costs
+            
+            # Optional: Apply sigma constraint (reject high-sigma trajectories)
+            if sigma_threshold < float('inf'):
+                valid_mask = (sigma_costs / horizon) < sigma_threshold
+                if valid_mask.sum() < top_k:
+                    # Not enough valid trajectories, relax threshold
+                    valid_indices = torch.arange(candidates, device=device)
+                else:
+                    valid_indices = torch.where(valid_mask)[0]
+                    objectives = objectives[valid_mask]
+        else:
+            objectives = rwds
+            valid_indices = torch.arange(candidates, device=device)
+        
+        # Select top-k elite samples
+        _, k = torch.topk(objectives, min(top_k, len(objectives)), dim=0, largest=True, sorted=False)
+        
+        if use_sigma_penalty and sigma_threshold < float('inf'):
+            elite_actions = actions[valid_indices[k]]
+        else:
+            elite_actions = actions[k]
+        
         mu = elite_actions.mean(dim=0)
         stddev = elite_actions.std(dim=0, unbiased=False)
 
@@ -103,6 +154,7 @@ def evaluate_planner_rssm(
     device="cpu",
     bit_depth=5,
     action_repeat=1,
+    geo_decoder=None,
 ):
     env = make_env(env_id, img_size=(img_size, img_size), num_stack=1)
     try:
@@ -113,6 +165,8 @@ def evaluate_planner_rssm(
     encoder.eval()
     rssm.eval()
     reward_model.eval()
+    if geo_decoder is not None:
+        geo_decoder.eval()
 
     returns = []
     for _ in range(episodes):
@@ -132,6 +186,7 @@ def evaluate_planner_rssm(
                 s_t=s_state,
                 device=device,
                 explore=False,
+                geo_decoder=geo_decoder,
                 **plan_kwargs,
             )
 
@@ -209,6 +264,19 @@ def build_parser():
     p.add_argument("--feature_bank", action="store_true")
     p.add_argument("--aux_pixel_weight", type=float, default=0.0)
     p.add_argument("--feature_rec_scale", type=float, default=10.0)
+    
+    # Geometric world model (Phase 0-3)
+    p.add_argument("--use_geo_decoder", action="store_true", help="Use FeatureDecoder2 with mu/sigma")
+    p.add_argument("--geo_cube_masking", action="store_true", help="Use spatio-temporal cube masking")
+    p.add_argument("--geo_cube_t", type=int, default=2, help="Temporal cube size")
+    p.add_argument("--geo_cube_hw", type=int, default=8, help="Spatial cube size")
+    p.add_argument("--geo_mask_mode", type=str, default="zero", choices=["zero", "noise"])
+    p.add_argument("--lambda_geo_rec", type=float, default=10.0, help="Geometric reconstruction loss weight")
+    p.add_argument("--lambda_bisim_geo", type=float, default=0.0, help="Geometric bisimulation loss weight")
+    p.add_argument("--lambda_sigma_plan", type=float, default=0.0, help="Sigma penalty in planning")
+    p.add_argument("--sigma_threshold", type=float, default=float('inf'), help="Sigma constraint threshold")
+    p.add_argument("--feature_norm_mode", type=str, default="layernorm", choices=["none", "layernorm", "l2"])
+    p.add_argument("--use_masked_branch", action="store_true", help="Enable raw+masked dual branch")
 
     p.add_argument("--phi_lr", type=float, default=1e-4)
     p.add_argument("--phi_update_every", type=int, default=4)
@@ -268,6 +336,109 @@ def make_run_name(args):
 # ===============================
 # Geometry helpers (pullback / geodesic)
 # ===============================
+
+def pullback_len_mu(z_src, z_dst, mu_fn, create_graph=True):
+    """
+    Pullback distance using μ head of FeatureDecoder2.
+    
+    Computes || J_mu(z_src) @ (z_dst - z_src) ||_2 using JVP.
+    
+    Args:
+        z_src: [N, D] source latent states (can be h,s concatenated)
+        z_dst: [N, D] destination latent states
+        mu_fn: callable that takes (h, s) or (z) and returns mu [N, Dfeat]
+        create_graph: whether to retain graph for backprop
+    
+    Returns:
+        distances: [N] scalar distances
+    """
+    delta = z_dst - z_src
+    
+    # JVP: compute Jacobian-vector product
+    if hasattr(mu_fn, 'parameters'):
+        with no_param_grads(mu_fn):
+            _, Jdelta = torch.autograd.functional.jvp(
+                lambda z: mu_fn(z),
+                (z_src,),
+                (delta,),
+                create_graph=create_graph
+            )
+    else:
+        _, Jdelta = torch.autograd.functional.jvp(
+            lambda z: mu_fn(z),
+            (z_src,),
+            (delta,),
+            create_graph=create_graph
+        )
+    
+    # RMS distance
+    Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
+    return torch.sqrt((Jdelta * Jdelta).mean(dim=1) + 1e-8)
+
+
+def pullback_len_mu_symmetric(z_src, z_dst, mu_fn, create_graph=True):
+    """
+    Symmetric pullback distance: mean of forward and reverse.
+    
+    d_sym(z1, z2) = (d(z1, z2) + d(z2, z1)) / 2
+    """
+    d_forward = pullback_len_mu(z_src, z_dst, mu_fn, create_graph)
+    d_reverse = pullback_len_mu(z_dst, z_src, mu_fn, create_graph)
+    return (d_forward + d_reverse) / 2.0
+
+
+def pullback_len_mu_split(h_src, s_src, h_dst, s_dst, mu_fn, create_graph=True):
+    """
+    Pullback distance with separate h,s inputs (for existing decoder interface).
+    
+    Args:
+        h_src, s_src: [N, deter_dim], [N, stoch_dim] source states
+        h_dst, s_dst: [N, deter_dim], [N, stoch_dim] destination states
+        mu_fn: callable(h, s) -> mu [N, Dfeat] (can be function or module)
+        create_graph: whether to retain graph
+    
+    Returns:
+        distances: [N]
+    """
+    delta_h = h_dst - h_src
+    delta_s = s_dst - s_src
+    
+    # Check if mu_fn is a module or just a function
+    if hasattr(mu_fn, 'parameters'):
+        # It's a module, use no_param_grads
+        with no_param_grads(mu_fn):
+            _, Jdelta = torch.autograd.functional.jvp(
+                mu_fn,
+                (h_src, s_src),
+                (delta_h, delta_s),
+                create_graph=create_graph
+            )
+    else:
+        # It's a function, call directly
+        _, Jdelta = torch.autograd.functional.jvp(
+            mu_fn,
+            (h_src, s_src),
+            (delta_h, delta_s),
+            create_graph=create_graph
+        )
+    
+    Jdelta = Jdelta.reshape(Jdelta.size(0), -1)
+    return torch.sqrt((Jdelta * Jdelta).mean(dim=1) + 1e-8)
+
+
+def sigma_cost(log_sigma):
+    """
+    Compute scalar cost from uncertainty (risk/ambiguity penalty).
+    
+    Args:
+        log_sigma: [..., feature_dim] log standard deviations
+    
+    Returns:
+        cost: [...] scalar cost per state (higher sigma = higher cost)
+    """
+    # Mean exp(log_sigma) = mean(sigma)
+    return torch.exp(log_sigma).mean(dim=-1)
+
 
 def pullback_distance_full(decoder, phi_target, h1, s1, h2, s2, create_graph=True, is_feature_decoder=False):
     """
@@ -350,7 +521,8 @@ def geodesic_pb_knn_slice(
     W = torch.full((B, B), inf, device=device, dtype=torch.float32)
     W.fill_diagonal_(0.0)
     W[src2, dst2] = w2.float()
-    W = torch.minimum(W, W.T)
+    # Symmetrize with mean (not min)
+    W = (W + W.T) / 2.0
 
     D = floyd_warshall_minplus(W)
     dz_t = D[torch.arange(B, device=device), targets]
@@ -467,7 +639,17 @@ def build_models(args, obs_channels, act_dim, device):
         out_channels=obs_channels,
     ).to(device)
 
-    if args.use_feature_decoder:
+    if args.use_geo_decoder:
+        decoder = FeatureDecoder2(
+            state_size=args.deter_dim,
+            latent_size=args.stoch_dim,
+            feature_dim=args.feature_dim,
+            hidden_dim=args.hidden_dim,
+            activation_function="elu",
+            feature_norm_mode=args.feature_norm_mode,
+        ).to(device)
+        print(f"Using FeatureDecoder2 (feature_dim={args.feature_dim}, norm={args.feature_norm_mode})")
+    elif args.use_feature_decoder:
         decoder = FeatureDecoder(
             state_size=args.deter_dim,
             latent_size=args.stoch_dim,
@@ -749,50 +931,196 @@ def train_world_model(
 
         x = obs_seq.permute(0, 1, 4, 2, 3).contiguous()
         preprocess_img(x, depth=args.bit_depth)
-
-        if args.use_feature_decoder:
+        
+        # ============= DUAL BRANCH: RAW + MASKED =============
+        use_geo = args.use_geo_decoder
+        use_masked_branch = args.use_masked_branch and use_geo
+        
+        # Compute target features (for reconstruction or old-style feature decoder)
+        if args.use_feature_decoder or use_geo:
             x_flat = x.view(-1, x.size(2), x.size(3), x.size(4))
             with torch.no_grad():
                 target_features = models.phi_net_target(x_flat)
                 target_features = F.layer_norm(target_features, (target_features.size(-1),), eps=1e-3)
                 target_features = target_features.view(B, T1, -1)
-
-            mask_ratio = compute_mask_ratio(args, total_steps)
-            x_masked = random_masking(x, mask_ratio=mask_ratio, patch_size=args.mask_patch_size)
-            e_t = bottle(models.encoder, x_masked)
+        
+        if use_masked_branch:
+            # Dual branch: raw + masked
+            x_raw = x
+            if args.geo_cube_masking:
+                mask_ratio = compute_mask_ratio(args, total_steps)
+                x_masked = mask_spatiotemporal(
+                    x, mask_ratio=mask_ratio, 
+                    cube_t=args.geo_cube_t, 
+                    cube_hw=args.geo_cube_hw, 
+                    mode=args.geo_mask_mode
+                )
+            else:
+                mask_ratio = compute_mask_ratio(args, total_steps)
+                x_masked = random_masking(x, mask_ratio=mask_ratio, patch_size=args.mask_patch_size)
+            
+            e_raw = bottle(models.encoder, x_raw)
+            e_mask = bottle(models.encoder, x_masked)
         else:
-            e_t = bottle(models.encoder, x)
+            # Single branch (old behavior)
+            if args.use_feature_decoder:
+                mask_ratio = compute_mask_ratio(args, total_steps)
+                x_masked = random_masking(x, mask_ratio=mask_ratio, patch_size=args.mask_patch_size)
+                e_t = bottle(models.encoder, x_masked)
+            else:
+                e_t = bottle(models.encoder, x)
 
-        h_t, s_t = models.rssm.get_init_state(e_t[:, 0])
+        # ============= RSSM ROLLOUT =============
+        if use_masked_branch:
+            # Shared h_t, dual posteriors (s_raw, s_mask)
+            h_t = models.rssm.init_state(batch_size=B, device=device)[0]
+            s_raw_t = models.rssm.init_state(batch_size=B, device=device)[1]
+            s_mask_t = s_raw_t.clone()
+            
+            states = []
+            priors = []
+            posteriors_raw = []
+            posteriors_mask = []
+            samples_raw = []
+            samples_mask = []
+            
+            for t in range(T):
+                # Shared h (deterministic state from previous latent + action)
+                # Use raw posterior from previous step for h transition
+                h_t = models.rssm.deterministic_state_fwd(h_t, s_raw_t, act_seq[:, t])
+                states.append(h_t)
+                
+                # Prior (shared, conditioned on h only)
+                priors.append(models.rssm.state_prior(h_t))
+                
+                # Raw posterior
+                post_raw = models.rssm.state_posterior(h_t, e_raw[:, t + 1])
+                posteriors_raw.append(post_raw)
+                post_raw_mean, post_raw_std = post_raw
+                s_raw_t = post_raw_mean + torch.randn_like(post_raw_std) * post_raw_std
+                samples_raw.append(s_raw_t)
+                
+                # Masked posterior
+                post_mask = models.rssm.state_posterior(h_t, e_mask[:, t + 1])
+                posteriors_mask.append(post_mask)
+                post_mask_mean, post_mask_std = post_mask
+                s_mask_t = post_mask_mean + torch.randn_like(post_mask_std) * post_mask_std
+                samples_mask.append(s_mask_t)
+            
+            h_seq = torch.stack(states, dim=1)
+            s_raw_seq = torch.stack(samples_raw, dim=1)
+            s_mask_seq = torch.stack(samples_mask, dim=1)
+            
+            # For KL loss
+            prior_means = torch.stack([p[0] for p in priors], dim=0)
+            prior_stds = torch.stack([p[1] for p in priors], dim=0)
+            post_raw_means = torch.stack([p[0] for p in posteriors_raw], dim=0)
+            post_raw_stds = torch.stack([p[1] for p in posteriors_raw], dim=0)
+            
+            # Use raw branch for primary losses
+            s_seq = s_raw_seq
+            post_means = post_raw_means
+            post_stds = post_raw_stds
+        else:
+            # Original single-branch rollout
+            h_t, s_t = models.rssm.get_init_state(e_t[:, 0])
 
-        states = []
-        priors = []
-        posteriors = []
-        posterior_samples = []
+            states = []
+            priors = []
+            posteriors = []
+            posterior_samples = []
 
-        for t in range(T):
-            h_t = models.rssm.deterministic_state_fwd(h_t, s_t, act_seq[:, t])
-            states.append(h_t)
+            for t in range(T):
+                h_t = models.rssm.deterministic_state_fwd(h_t, s_t, act_seq[:, t])
+                states.append(h_t)
 
-            priors.append(models.rssm.state_prior(h_t))
-            posteriors.append(models.rssm.state_posterior(h_t, e_t[:, t + 1]))
+                priors.append(models.rssm.state_prior(h_t))
+                posteriors.append(models.rssm.state_posterior(h_t, e_t[:, t + 1]))
 
-            post_mean, post_std = posteriors[-1]
-            s_t = post_mean + torch.randn_like(post_std) * post_std
-            posterior_samples.append(s_t)
+                post_mean, post_std = posteriors[-1]
+                s_t = post_mean + torch.randn_like(post_std) * post_std
+                posterior_samples.append(s_t)
 
-        h_seq = torch.stack(states, dim=1)
-        s_seq = torch.stack(posterior_samples, dim=1)
+            h_seq = torch.stack(states, dim=1)
+            s_seq = torch.stack(posterior_samples, dim=1)
+            
+            prior_means = torch.stack([p[0] for p in priors], dim=0)
+            prior_stds = torch.stack([p[1] for p in priors], dim=0)
+            post_means = torch.stack([p[0] for p in posteriors], dim=0)
+            post_stds = torch.stack([p[1] for p in posteriors], dim=0)
 
-        prior_means = torch.stack([p[0] for p in priors], dim=0)
-        prior_stds = torch.stack([p[1] for p in priors], dim=0)
-        post_means = torch.stack([p[0] for p in posteriors], dim=0)
-        post_stds = torch.stack([p[1] for p in posteriors], dim=0)
-
+        # Create distributions for KL loss
         prior_dist = Normal(prior_means, prior_stds)
         posterior_dist = Normal(post_means, post_stds)
 
-        if args.use_feature_decoder:
+        # ============= RECONSTRUCTION LOSSES =============
+        if use_geo:
+            # Geometric feature reconstruction with mu/sigma
+            # Get mu, log_sigma from decoder
+            mu_raw, log_sigma_raw = bottle(models.decoder, h_seq, s_raw_seq if use_masked_branch else s_seq)
+            
+            if use_masked_branch:
+                mu_mask, log_sigma_mask = bottle(models.decoder, h_seq, s_mask_seq)
+                
+                # BYOL-style latent matching: mu_mask predicts stopgrad(mu_raw)
+                # Normalize both for comparison (as per config)
+                with torch.no_grad():
+                    if args.feature_norm_mode == 'layernorm':
+                        mu_raw_target = F.layer_norm(mu_raw, (mu_raw.size(-1),), eps=1e-3)
+                    elif args.feature_norm_mode == 'l2':
+                        mu_raw_target = F.normalize(mu_raw, p=2, dim=-1)
+                    else:
+                        mu_raw_target = mu_raw
+                
+                if args.feature_norm_mode == 'layernorm':
+                    mu_mask_pred = F.layer_norm(mu_mask, (mu_mask.size(-1),), eps=1e-3)
+                elif args.feature_norm_mode == 'l2':
+                    mu_mask_pred = F.normalize(mu_mask, p=2, dim=-1)
+                else:
+                    mu_mask_pred = mu_mask
+                
+                # L2 loss (BYOL-style)
+                geo_rec_loss = F.mse_loss(mu_mask_pred, mu_raw_target) * args.lambda_geo_rec
+            else:
+                # No masked branch - use self-consistency loss (mu predicts stopgrad(mu))
+                # This is simpler than trying to match phi_net dimensions
+                with torch.no_grad():
+                    if args.feature_norm_mode == 'layernorm':
+                        mu_target = F.layer_norm(mu_raw, (mu_raw.size(-1),), eps=1e-3)
+                    elif args.feature_norm_mode == 'l2':
+                        mu_target = F.normalize(mu_raw, p=2, dim=-1)
+                    else:
+                        mu_target = mu_raw.clone()
+                
+                # Small noise perturbation for self-prediction (prevents collapse)
+                mu_pred = mu_raw + torch.randn_like(mu_raw) * 0.01
+                if args.feature_norm_mode == 'layernorm':
+                    mu_pred = F.layer_norm(mu_pred, (mu_pred.size(-1),), eps=1e-3)
+                elif args.feature_norm_mode == 'l2':
+                    mu_pred = F.normalize(mu_pred, p=2, dim=-1)
+                
+                geo_rec_loss = F.mse_loss(mu_pred, mu_target) * args.lambda_geo_rec
+            
+            rec_loss = geo_rec_loss
+            feat_loss = torch.zeros((), device=device)
+            
+            # Auxiliary pixel reconstruction (optional)
+            if args.aux_pixel_weight > 0:
+                pix_recon = bottle(models.vis_decoder, h_seq, s_seq)
+                pix_target = x[:, 1:T + 1]
+                aux_pix_loss = F.mse_loss(pix_recon, pix_target, reduction="none").sum((2, 3, 4)).mean()
+            else:
+                aux_pix_loss = torch.zeros((), device=device)
+                if optimizers.vis_decoder is not None:
+                    target_pixels = x[:, 1:T + 1]
+                    vis_recon = bottle(models.vis_decoder, h_seq.detach(), s_seq.detach())
+                    vis_loss = F.mse_loss(vis_recon, target_pixels, reduction="none").sum((2, 3, 4)).mean()
+                    optimizers.vis_decoder.zero_grad()
+                    vis_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(models.vis_decoder.parameters(), 10.0)
+                    optimizers.vis_decoder.step()
+                    
+        elif args.use_feature_decoder:
             pred_features = bottle(models.decoder, h_seq, s_seq)
             feat_target_seq = target_features[:, 1:T + 1]
             pred_features = F.layer_norm(pred_features, (pred_features.size(-1),), eps=1e-3)
@@ -853,7 +1181,9 @@ def train_world_model(
         )
 
         bisim_loss_val = torch.zeros((), device=device)
-        if T > 2:
+        bisim_weight_geo = args.lambda_bisim_geo if use_geo else bisim_weight
+        
+        if T > 2 and (bisim_weight > 0.0 or bisim_weight_geo > 0.0):
             h = h_seq[:, :-1]
             hn = h_seq[:, 1:]
             z = s_seq[:, :-1]
@@ -861,7 +1191,8 @@ def train_world_model(
             r = rew_seq[:, :T - 1]
             a = act_seq[:, :T - 1]
 
-            if not args.pullback_bisim:
+            # Normalize only if not using pullback
+            if not args.pullback_bisim and not use_geo:
                 z = F.layer_norm(z, (z.size(-1),))
                 zn = F.layer_norm(zn, (zn.size(-1),))
 
@@ -871,103 +1202,203 @@ def train_world_model(
             for t in t_idx.tolist():
                 targets[:, t] = action_targets(a[:, t], topm=3)
 
-            needs_grad = bisim_weight > 0.0
-            if args.pullback_bisim:
-                dz, dz_mask, t_idx, edge_weights = geodesic_pb_knn(
-                    decoder=models.decoder,
-                    phi_target=models.phi_net_target,
-                    h=h,
-                    z=z,
-                    targets=targets,
-                    k=args.geo_knn_k,
-                    time_subsample=args.geo_time_subsample,
-                    create_graph=needs_grad,
-                    return_mask=True,
-                    is_feature_decoder=args.use_feature_decoder,
-                )
-            else:
-                t_grid = torch.arange(Tm1, device=device)[None, :].expand(Bm, Tm1)
-                z2 = z[targets, t_grid].detach()
-                dz = torch.norm(z - z2, p=2, dim=-1).reshape(-1)
-                dz_mask = torch.zeros((Bm * Tm1,), device=device, dtype=torch.bool)
-                dz_mask[(t_grid.reshape(-1).unsqueeze(0) == t_idx.reshape(-1).unsqueeze(1)).any(dim=0)] = True
-                edge_weights = torch.tensor([], device=device)
-
-            with torch.no_grad():
-                t_grid = torch.arange(Tm1, device=device)[None, :].expand(Bm, Tm1)
-                r2 = r[targets, t_grid]
-                dr = (r - r2).abs().reshape(-1)
-
-                if args.pullback_bisim:
-                    dnext, _, _, _ = geodesic_pb_knn(
-                        decoder=models.decoder,
-                        phi_target=models.phi_net_target,
-                        h=hn,
-                        z=zn,
-                        targets=targets,
-                        k=args.geo_knn_k,
-                        time_subsample=args.geo_time_subsample,
-                        t_idx=t_idx,
-                        create_graph=False,
-                        return_mask=True,
-                        is_feature_decoder=args.use_feature_decoder,
-                    )
+            needs_grad = bisim_weight > 0.0 or bisim_weight_geo > 0.0
+            
+            # Geometric bisimulation using μ-pullback
+            if use_geo and bisim_weight_geo > 0.0:
+                def mu_fn_only(h, s):
+                    """Extract only mu (ignore log_sigma)"""
+                    mu, _ = models.decoder(h, s)
+                    return mu
+                
+                # Compute pullback distances for now and next
+                dz_list = []
+                dnext_list = []
+                dr_list = []
+                
+                # Use time subsampling if specified
+                if args.geo_time_subsample > 0 and args.geo_time_subsample < Tm1:
+                    sampled_t = torch.randperm(Tm1, device=device)[:args.geo_time_subsample]
                 else:
-                    n2 = zn[targets, t_grid]
-                    dnext = torch.norm(zn - n2, p=2, dim=-1).reshape(-1)
-
+                    sampled_t = torch.arange(Tm1, device=device)
+                
+                for t_val in sampled_t.tolist():
+                    t_targets = targets[:, t_val]
+                    
+                    # Current state distances
+                    h_src = h[:, t_val]
+                    s_src = z[:, t_val]
+                    h_dst = h[t_targets, t_val]
+                    s_dst = z[t_targets, t_val]
+                    
+                    dz_t = pullback_len_mu_split(h_src, s_src, h_dst, s_dst, mu_fn_only, create_graph=needs_grad)
+                    dz_list.append(dz_t)
+                    
+                    # Next state distances (no grad)
+                    with torch.no_grad():
+                        h_next_src = hn[:, t_val]
+                        s_next_src = zn[:, t_val]
+                        h_next_dst = hn[t_targets, t_val]
+                        s_next_dst = zn[t_targets, t_val]
+                        dnext_t = pullback_len_mu_split(h_next_src, s_next_src, h_next_dst, s_next_dst, mu_fn_only, create_graph=False)
+                        dnext_list.append(dnext_t)
+                    
+                    # Reward differences
+                    r_src = r[:, t_val]
+                    r_dst = r[t_targets, t_val]
+                    dr_t = (r_src - r_dst).abs()
+                    dr_list.append(dr_t)
+                
+                dz = torch.stack(dz_list, dim=0).reshape(-1)
+                dnext = torch.stack(dnext_list, dim=0).reshape(-1).detach()
+                dr = torch.stack(dr_list, dim=0).reshape(-1).detach()
+                
+                # Bisimulation target
                 raw_target = dr + args.gamma * dnext
                 batch_scale = raw_target.mean()
                 target_scale_ema = 0.99 * target_scale_ema + 0.01 * batch_scale.item()
                 safe_scale = max(target_scale_ema, 1e-4)
                 normalized_target = raw_target / safe_scale
+                
+                bisim_loss_val = F.mse_loss(dz, normalized_target)
+                
+                # Stats
+                if args.bisimulation_weight > 0.0 or bisim_weight_geo > 0.0:
+                    with torch.no_grad():
+                        dz_detached = dz.detach()
+                        target_detached = normalized_target.detach()
+                        dz_mean = dz_detached.mean().item()
+                        dz_std = dz_detached.std().item()
+                        target_mean = target_detached.mean().item()
+                        target_std = target_detached.std().item()
+                        abs_err = (dz_detached - target_detached).abs()
+                        abs_err_mean = abs_err.mean().item()
+                        rel_err = abs_err_mean / (target_mean + 1e-6)
+                        dz_centered = dz_detached - dz_detached.mean()
+                        target_centered = target_detached - target_detached.mean()
+                        numerator = (dz_centered * target_centered).mean()
+                        dz_var = dz_centered.pow(2).mean()
+                        target_var = target_centered.pow(2).mean()
+                        corr = (numerator / (dz_var.sqrt() * target_var.sqrt() + 1e-8)).item()
 
-            mask = dz_mask.bool()
-            dz_m = dz[mask]
-            tgt_m = normalized_target[mask]
-            bisim_loss_val = F.mse_loss(dz_m, tgt_m)
+                        bisim_stats_accum["dz_mean"] += dz_mean
+                        bisim_stats_accum["dz_std"] += dz_std
+                        bisim_stats_accum["target_mean"] += target_mean
+                        bisim_stats_accum["target_std"] += target_std
+                        bisim_stats_accum["abs_err_mean"] += abs_err_mean
+                        bisim_stats_accum["rel_err"] += rel_err
+                        bisim_stats_accum["corr"] += corr
+                        bisim_stats_accum["target_scale_ema"] = bisim_stats_accum.get("target_scale_ema", 0.0) + target_scale_ema
+                        n_bisim_computations += 1
+                
+                # Geo bisim path is complete - skip legacy paths
+                pass
+            
+            else:
+                # Legacy bisimulation paths (pullback_bisim or simple L2)
+                if args.pullback_bisim:
+                    dz, dz_mask, t_idx, edge_weights = geodesic_pb_knn(
+                        decoder=models.decoder,
+                        phi_target=models.phi_net_target,
+                        h=h,
+                        z=z,
+                        targets=targets,
+                        k=args.geo_knn_k,
+                        time_subsample=args.geo_time_subsample,
+                        create_graph=needs_grad,
+                        return_mask=True,
+                        is_feature_decoder=args.use_feature_decoder,
+                    )
+                else:
+                    t_grid = torch.arange(Tm1, device=device)[None, :].expand(Bm, Tm1)
+                    z2 = z[targets, t_grid].detach()
+                    dz = torch.norm(z - z2, p=2, dim=-1).reshape(-1)
+                    dz_mask = torch.zeros((Bm * Tm1,), device=device, dtype=torch.bool)
+                    dz_mask[(t_grid.reshape(-1).unsqueeze(0) == t_idx.reshape(-1).unsqueeze(1)).any(dim=0)] = True
+                    edge_weights = torch.tensor([], device=device)
 
-            if args.bisimulation_weight > 0.0:
                 with torch.no_grad():
-                    dz_detached = dz.detach()[mask]
-                    target_detached = normalized_target.detach()[mask]
-                    dz_mean = dz_detached.mean().item()
-                    dz_std = dz_detached.std().item()
-                    target_mean = target_detached.mean().item()
-                    target_std = target_detached.std().item()
-                    abs_err = (dz_detached - target_detached).abs()
-                    abs_err_mean = abs_err.mean().item()
-                    rel_err = abs_err_mean / (target_mean + 1e-6)
-                    dz_centered = dz_detached - dz_detached.mean()
-                    target_centered = target_detached - target_detached.mean()
-                    numerator = (dz_centered * target_centered).mean()
-                    dz_var = dz_centered.pow(2).mean()
-                    target_var = target_centered.pow(2).mean()
-                    corr = (numerator / (dz_var.sqrt() * target_var.sqrt() + 1e-8)).item()
-                    edge_weight_mean = edge_weights.mean().item() if len(edge_weights) > 0 else 0.0
-                    edge_weight_std = edge_weights.std().item() if len(edge_weights) > 0 else 0.0
-                    feat_norm_mean = feat_target.norm(dim=-1).mean().item()
-                    feat_std = feat_target.std(dim=-1).mean().item()
+                    t_grid = torch.arange(Tm1, device=device)[None, :].expand(Bm, Tm1)
+                    r2 = r[targets, t_grid]
+                    dr = (r - r2).abs().reshape(-1)
 
-                    bisim_stats_accum["dz_mean"] += dz_mean
-                    bisim_stats_accum["dz_std"] += dz_std
-                    bisim_stats_accum["target_mean"] += target_mean
-                    bisim_stats_accum["target_std"] += target_std
-                    bisim_stats_accum["abs_err_mean"] += abs_err_mean
-                    bisim_stats_accum["rel_err"] += rel_err
-                    bisim_stats_accum["corr"] += corr
-                    bisim_stats_accum["edge_weight_mean"] = bisim_stats_accum.get("edge_weight_mean", 0.0) + edge_weight_mean
-                    bisim_stats_accum["edge_weight_std"] = bisim_stats_accum.get("edge_weight_std", 0.0) + edge_weight_std
-                    bisim_stats_accum["feat_norm_mean"] = bisim_stats_accum.get("feat_norm_mean", 0.0) + feat_norm_mean
-                    bisim_stats_accum["feat_std"] = bisim_stats_accum.get("feat_std", 0.0) + feat_std
-                    bisim_stats_accum["target_scale_ema"] = bisim_stats_accum.get("target_scale_ema", 0.0) + target_scale_ema
-                    n_bisim_computations += 1
+                    if args.pullback_bisim:
+                        dnext, _, _, _ = geodesic_pb_knn(
+                            decoder=models.decoder,
+                            phi_target=models.phi_net_target,
+                            h=hn,
+                            z=zn,
+                            targets=targets,
+                            k=args.geo_knn_k,
+                            time_subsample=args.geo_time_subsample,
+                            t_idx=t_idx,
+                            create_graph=False,
+                            return_mask=True,
+                            is_feature_decoder=args.use_feature_decoder,
+                        )
+                    else:
+                        n2 = zn[targets, t_grid]
+                        dnext = torch.norm(zn - n2, p=2, dim=-1).reshape(-1)
 
+                    raw_target = dr + args.gamma * dnext
+                    batch_scale = raw_target.mean()
+                    target_scale_ema = 0.99 * target_scale_ema + 0.01 * batch_scale.item()
+                    safe_scale = max(target_scale_ema, 1e-4)
+                    normalized_target = raw_target / safe_scale
+
+                mask = dz_mask.bool()
+                dz_m = dz[mask]
+                tgt_m = normalized_target[mask]
+                bisim_loss_val = F.mse_loss(dz_m, tgt_m)
+
+                if args.bisimulation_weight > 0.0:
+                    with torch.no_grad():
+                        dz_detached = dz.detach()[mask]
+                        target_detached = normalized_target.detach()[mask]
+                        dz_mean = dz_detached.mean().item()
+                        dz_std = dz_detached.std().item()
+                        target_mean = target_detached.mean().item()
+                        target_std = target_detached.std().item()
+                        abs_err = (dz_detached - target_detached).abs()
+                        abs_err_mean = abs_err.mean().item()
+                        rel_err = abs_err_mean / (target_mean + 1e-6)
+                        dz_centered = dz_detached - dz_detached.mean()
+                        target_centered = target_detached - target_detached.mean()
+                        numerator = (dz_centered * target_centered).mean()
+                        dz_var = dz_centered.pow(2).mean()
+                        target_var = target_centered.pow(2).mean()
+                        corr = (numerator / (dz_var.sqrt() * target_var.sqrt() + 1e-8)).item()
+                        edge_weight_mean = edge_weights.mean().item() if len(edge_weights) > 0 else 0.0
+                        edge_weight_std = edge_weights.std().item() if len(edge_weights) > 0 else 0.0
+                        if args.use_feature_decoder:
+                            feat_norm_mean = feat_target.norm(dim=-1).mean().item()
+                            feat_std = feat_target.std(dim=-1).mean().item()
+                        else:
+                            feat_norm_mean = 0.0
+                            feat_std = 0.0
+
+                        bisim_stats_accum["dz_mean"] += dz_mean
+                        bisim_stats_accum["dz_std"] += dz_std
+                        bisim_stats_accum["target_mean"] += target_mean
+                        bisim_stats_accum["target_std"] += target_std
+                        bisim_stats_accum["abs_err_mean"] += abs_err_mean
+                        bisim_stats_accum["rel_err"] += rel_err
+                        bisim_stats_accum["corr"] += corr
+                        bisim_stats_accum["edge_weight_mean"] = bisim_stats_accum.get("edge_weight_mean", 0.0) + edge_weight_mean
+                        bisim_stats_accum["edge_weight_std"] = bisim_stats_accum.get("edge_weight_std", 0.0) + edge_weight_std
+                        bisim_stats_accum["feat_norm_mean"] = bisim_stats_accum.get("feat_norm_mean", 0.0) + feat_norm_mean
+                        bisim_stats_accum["feat_std"] = bisim_stats_accum.get("feat_std", 0.0) + feat_std
+                        bisim_stats_accum["target_scale_ema"] = bisim_stats_accum.get("target_scale_ema", 0.0) + target_scale_ema
+                        n_bisim_computations += 1
+
+        # Determine which bisimulation weight to use
+        effective_bisim_weight = bisim_weight_geo if (use_geo and bisim_weight_geo > 0.0) else bisim_weight
+        
         total = (
             rec_loss
             + args.kl_weight * kld_loss
             + rew_loss
-            + bisim_weight * bisim_loss_val
+            + effective_bisim_weight * bisim_loss_val
             + feat_align_weight * feat_loss
             + args.aux_pixel_weight * aux_pix_loss
         )
@@ -975,7 +1406,7 @@ def train_world_model(
         optimizers.world.zero_grad()
         total.backward()
 
-        bisim_grad_norm = bisim_weight * bisim_loss_val.item() if bisim_weight > 0 else 0.0
+        bisim_grad_norm = effective_bisim_weight * bisim_loss_val.item() if effective_bisim_weight > 0 else 0.0
         with torch.no_grad():
             total_grad_norm = torch.nn.utils.clip_grad_norm_(list(optimizers.world.param_groups[0]["params"]), float("inf"), norm_type=2)
             encoder_grad_norm = torch.nn.utils.clip_grad_norm_(encoder_params, float("inf"), norm_type=2) if encoder_params else torch.tensor(0.0)
@@ -1001,7 +1432,7 @@ def train_world_model(
             do_phi_update = do_phi_update and (total_steps < args.phi_freeze_steps)
 
         if do_phi_update:
-            if args.use_feature_decoder:
+            if args.use_feature_decoder or args.use_geo_decoder:
                 real = x[:, 1:T + 1].reshape(-1, x.size(2), x.size(3), x.size(4)).detach()
             else:
                 real = target.reshape(-1, x.size(2), x.size(3), x.size(4)).detach()
@@ -1082,16 +1513,23 @@ def train_world_model(
     writer.add_scalar("loss/bisimulation", loss_accum["bisim"] / n_updates, total_steps)
     writer.add_scalar("loss/bisimulation_weighted", loss_accum.get("bisim_weighted", 0.0) / n_updates, total_steps)
 
-    if args.use_feature_decoder:
+    if args.use_feature_decoder or args.use_geo_decoder:
         writer.add_scalar("loss/feature_rec", loss_accum["rec"] / n_updates, total_steps)
         writer.add_scalar("loss/aux_pixel", loss_accum.get("aux_pix", 0.0) / n_updates, total_steps)
         writer.add_scalar("config/mask_ratio", compute_mask_ratio(args, total_steps), total_steps)
-        writer.add_scalar("config/feature_rec_scale", args.feature_rec_scale, total_steps)
+        
+        if args.use_geo_decoder:
+            writer.add_scalar("config/lambda_geo_rec", args.lambda_geo_rec, total_steps)
+            writer.add_scalar("config/lambda_bisim_geo", args.lambda_bisim_geo, total_steps)
+        else:
+            writer.add_scalar("config/feature_rec_scale", args.feature_rec_scale, total_steps)
+            
         if args.phi_warmup_steps > 0:
             phi_warmup_factor = min(1.0, total_steps / args.phi_warmup_steps)
             writer.add_scalar("config/phi_warmup_factor", phi_warmup_factor, total_steps)
 
-    writer.add_scalar("loss/bisim_weight", bisim_weight, total_steps)
+    effective_weight_display = args.lambda_bisim_geo if args.use_geo_decoder else bisim_weight
+    writer.add_scalar("loss/bisim_weight", effective_weight_display, total_steps)
 
     if args.pullback_bisim and n_bisim_computations > 0:
         n_bisim_updates = n_bisim_computations
@@ -1183,6 +1621,12 @@ def main(args):
             models.encoder.eval()
             models.rssm.eval()
             models.reward_model.eval()
+            
+            # Use geo_decoder for planning if available
+            geo_decoder_for_plan = models.decoder if args.use_geo_decoder else None
+            if geo_decoder_for_plan is not None:
+                geo_decoder_for_plan.eval()
+            
             action = cem_plan_action_rssm(
                 rssm=models.rssm,
                 reward_model=models.reward_model,
@@ -1197,6 +1641,9 @@ def main(args):
                 device=device,
                 explore=True,
                 explore_noise=args.explore_noise,
+                geo_decoder=geo_decoder_for_plan,
+                lambda_sigma=args.lambda_sigma_plan,
+                sigma_threshold=args.sigma_threshold,
             )
             action = np.asarray(action, dtype=np.float32).reshape(act_dim,)
 
@@ -1265,6 +1712,8 @@ def main(args):
                 candidates=args.plan_candidates,
                 iters=args.plan_iters,
                 top_k=args.plan_top_k,
+                lambda_sigma=args.lambda_sigma_plan,
+                sigma_threshold=args.sigma_threshold,
             )
             mean_ret, std_ret = evaluate_planner_rssm(
                 env_id=args.env_id,
@@ -1278,6 +1727,7 @@ def main(args):
                 device=device,
                 bit_depth=args.bit_depth,
                 action_repeat=action_repeat,
+                geo_decoder=models.decoder if args.use_geo_decoder else None,
             )
             print(f"  [Eval] return: {mean_ret:.2f} ± {std_ret:.2f}")
             writer.add_scalar("eval/mean_return", mean_ret, episode)
