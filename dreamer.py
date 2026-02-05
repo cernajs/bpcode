@@ -834,63 +834,75 @@ def main(args):
                         s_imag = torch.stack(s_imag_list, dim=1)  # [B, H+1, D]
                         log_probs = torch.stack(log_prob_list, dim=1)  # [B, H]
 
-                        # Predict rewards and values
+                        # Predict rewards and discounts (these need gradients for actor)
                         rewards_imag = bottle(reward_model, h_imag[:, :-1], s_imag[:, :-1])  # [B, H] 
-                        values_imag = bottle(value_model, h_imag, s_imag)  # [B, H+1]
                         
-                        # Store values BEFORE update for stable advantage computation
-                        values_for_advantages = values_imag.detach().clone()
-
-                        # Compute λ-returns
                         # Continuation -> discounts per step: d_t = gamma^action_repeat * p_continue(s_{t+1})
                         cont_logits_imag = bottle(continue_model, h_imag[:, 1:], s_imag[:, 1:])  # [B_imag, H]
                         pcont_imag = torch.sigmoid(cont_logits_imag).clamp(0.0, 1.0)
                         discounts_imag = effective_gamma * pcont_imag
 
-                        # Targets for critic must be stop-grad (avoid λ-target leakage)
+                        # ========================================
+                        # Value Loss - use DETACHED imagination states
+                        # Value model should predict returns for visited states,
+                        # but NOT affect how those states are generated
+                        # ========================================
                         with torch.no_grad():
+                            # Compute targets with all detached
+                            values_for_targets = bottle(value_model, h_imag, s_imag)  # [B, H+1]
                             lambda_returns_tgt = compute_lambda_returns(
-                                rewards_imag.detach(), values_imag.detach(), discounts_imag.detach(), lambda_=args.lambda_
+                                rewards_imag.detach(), values_for_targets, discounts_imag.detach(), lambda_=args.lambda_
                             )
-                            weights_imag = compute_discount_weights(discounts_imag.detach())
+                            weights_for_value = compute_discount_weights(discounts_imag.detach())
+                        
+                        # Recompute values with detached states for value loss
+                        # This ensures value gradients don't flow to actor/RSSM
+                        values_for_value_loss = bottle(value_model, h_imag.detach(), s_imag.detach())
+                        value_loss = ((values_for_value_loss[:, :-1] - lambda_returns_tgt) ** 2 * weights_for_value).mean()
 
-                        # For actor objective we keep gradients through imagined dynamics -> rewards/value/continue outputs
-                        lambda_returns = compute_lambda_returns(
-                            rewards_imag, values_imag, discounts_imag, lambda_=args.lambda_
+                        # ========================================
+                        # Actor Loss - gradients through dynamics, NOT through value model
+                        # ========================================
+                        # Get values but DETACH them - actor should maximize returns through
+                        # dynamics/rewards, not by manipulating value predictions
+                        with torch.no_grad():
+                            values_imag_detached = bottle(value_model, h_imag, s_imag)
+                        
+                        # Lambda returns for actor: gradients flow through rewards_imag and discounts_imag
+                        # (which depend on h_imag, s_imag -> actions -> actor), but NOT through values
+                        lambda_returns_actor = compute_lambda_returns(
+                            rewards_imag, values_imag_detached, discounts_imag, lambda_=args.lambda_
                         )
 
-                        # Discount weights for actor objective
-                        weights_actor = compute_discount_weights(discounts_imag)
+                        # Discount weights for actor objective (detached - just for weighting)
+                        with torch.no_grad():
+                            weights_actor = compute_discount_weights(discounts_imag)
 
-
-
-                        # Value loss
-                        value_loss = ((values_imag[:, :-1] - lambda_returns_tgt) ** 2 * weights_imag).mean()
-
-                    # Value optimizer step
+                    # Value optimizer step - no retain_graph needed since we use detached states
                     value_optim.zero_grad()
                     if use_amp:
-                        scaler.scale(value_loss).backward(retain_graph=True)
+                        scaler.scale(value_loss).backward()
                         scaler.unscale_(value_optim)
                         torch.nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm)
                         scaler.step(value_optim)
-                        # Don't update scaler here - we still need to do actor backward
                     else:
-                        value_loss.backward(retain_graph=True)
+                        value_loss.backward()
                         torch.nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm)
                         value_optim.step()
 
                     # Actor loss: maximize imagined returns
-                    # Use advantage = λ-returns - baseline (use values from BEFORE update for stability)
+                    # Gradients flow through lambda_returns_actor -> rewards/discounts -> h_imag/s_imag -> actions -> actor
                     # Skip actor training during warmup period
                     if total_steps >= args.actor_warmup_steps:
                         with autocast(device_type='cuda', enabled=use_amp): 
-                            dist = actor.get_dist(h_imag[:, :-1], s_imag[:, :-1])
-
+                            # Entropy bonus for exploration (DreamerV1 uses 1e-3)
+                            # Use detached states for entropy - we only want gradients through lambda_returns
+                            dist = actor.get_dist(h_imag[:, :-1].detach(), s_imag[:, :-1].detach())
                             entropy = dist.entropy().sum(dim=-1).mean()
-
-                            actor_entropy_scale = 1e-4 
-                            actor_loss = -(weights_actor * lambda_returns).mean() - (actor_entropy_scale * entropy)
+                            actor_entropy_scale = 1e-3  # DreamerV1 default
+                            
+                            # Actor objective: maximize λ-returns (weighted by discount)
+                            actor_loss = -(weights_actor * lambda_returns_actor).mean() - (actor_entropy_scale * entropy)
 
                         actor_optim.zero_grad()
                         if use_amp:
@@ -898,7 +910,7 @@ def main(args):
                             scaler.unscale_(actor_optim)
                             torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
                             scaler.step(actor_optim)
-                            scaler.update()  # Update scaler after all backward passes
+                            scaler.update()
                         else:
                             actor_loss.backward()
                             torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
@@ -922,7 +934,7 @@ def main(args):
                     
                     # Log advantage statistics for debugging
                     with torch.no_grad():
-                        raw_adv = lambda_returns_tgt - values_for_advantages[:, :-1]
+                        raw_adv = lambda_returns_tgt - values_for_targets[:, :-1]
                         loss_accum["adv_mean"] += raw_adv.mean().item()
                         loss_accum["adv_std"] += raw_adv.std().item()
                         loss_accum["adv_min"] += raw_adv.min().item()
