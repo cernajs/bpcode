@@ -416,6 +416,12 @@ def main(args):
     device = get_device()
     print(f"Using device: {device}")
     
+    # CUDA performance optimizations (RTX 3090 / Ampere)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True       # auto-tune conv kernels
+        torch.backends.cuda.matmul.allow_tf32 = True # TF32 on Ampere matmuls
+        torch.backends.cudnn.allow_tf32 = True       # TF32 on Ampere convs
+
     # Check for CUDA and set up AMP
     use_amp = args.use_amp and device.type == "cuda"
     scaler = GradScaler("cuda") if use_amp else None
@@ -783,7 +789,6 @@ def main(args):
                         scaler.unscale_(model_optim)
                         torch.nn.utils.clip_grad_norm_(world_model_params, args.grad_clip_norm)
                         scaler.step(model_optim)
-                        scaler.update()
                     else:
                         model_loss.backward()
                         torch.nn.utils.clip_grad_norm_(world_model_params, args.grad_clip_norm)
@@ -854,29 +859,30 @@ def main(args):
                                 rewards_imag.detach(), values_for_targets, discounts_imag.detach(), lambda_=args.lambda_
                             )
                             weights_for_value = compute_discount_weights(discounts_imag.detach())
-                        
-                        # Recompute values with detached states for value loss
-                        # This ensures value gradients don't flow to actor/RSSM
-                        values_for_value_loss = bottle(value_model, h_imag.detach(), s_imag.detach())
-                        value_loss = ((values_for_value_loss[:, :-1] - lambda_returns_tgt) ** 2 * weights_for_value).mean()
 
-                        # ========================================
-                        # Actor Loss - gradients through dynamics, NOT through value model
-                        # ========================================
-                        # Get values but DETACH them - actor should maximize returns through
-                        # dynamics/rewards, not by manipulating value predictions
-                        with torch.no_grad():
-                            values_imag_detached = bottle(value_model, h_imag, s_imag)
-                        
-                        # Lambda returns for actor: gradients flow through rewards_imag and discounts_imag
-                        # (which depend on h_imag, s_imag -> actions -> actor), but NOT through values
+                    # Value loss computed OUTSIDE autocast so it stays float32 with
+                    # a reliable grad_fn (avoids float16 graph issues with GradScaler).
+                    values_for_value_loss = bottle(value_model, h_imag.detach().float(), s_imag.detach().float())
+                    value_loss = ((values_for_value_loss[:, :-1] - lambda_returns_tgt.float()) ** 2 * weights_for_value.float()).mean()
+
+                    # ========================================
+                    # Actor Loss - gradients through dynamics, NOT through value model
+                    # ========================================
+                    # Get values but DETACH them - actor should maximize returns through
+                    # dynamics/rewards, not by manipulating value predictions
+                    with torch.no_grad():
+                        values_imag_detached = bottle(value_model, h_imag, s_imag)
+                    
+                    # Lambda returns for actor: gradients flow through rewards_imag and discounts_imag
+                    # (which depend on h_imag, s_imag -> actions -> actor), but NOT through values
+                    with autocast(device_type='cuda', enabled=use_amp):
                         lambda_returns_actor = compute_lambda_returns(
                             rewards_imag, values_imag_detached, discounts_imag, lambda_=args.lambda_
                         )
 
-                        # Discount weights for actor objective (detached - just for weighting)
-                        with torch.no_grad():
-                            weights_actor = compute_discount_weights(discounts_imag)
+                    # Discount weights for actor objective (detached - just for weighting)
+                    with torch.no_grad():
+                        weights_actor = compute_discount_weights(discounts_imag)
 
                     # Value optimizer step - no retain_graph needed since we use detached states
                     value_optim.zero_grad()
@@ -910,16 +916,17 @@ def main(args):
                             scaler.unscale_(actor_optim)
                             torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
                             scaler.step(actor_optim)
-                            scaler.update()
                         else:
                             actor_loss.backward()
                             torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
                             actor_optim.step()
                     else:
-                        # During warmup, still update scaler but skip actor training
                         actor_loss = torch.zeros((), device=device)
-                        if use_amp:
-                            scaler.update()
+
+                    # Single scaler.update() per iteration, AFTER all optimizer steps
+                    # (PyTorch AMP requires exactly one update per iteration)
+                    if use_amp:
+                        scaler.update()
 
                     # Accumulate losses
                     loss_accum["model_total"] += model_loss.item()
