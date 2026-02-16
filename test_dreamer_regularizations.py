@@ -11,8 +11,9 @@ Notes
 """
 
 import os
-if 'MUJOCO_GL' not in os.environ:
-    os.environ['MUJOCO_GL'] = 'glfw'
+
+if "MUJOCO_GL" not in os.environ:
+    os.environ["MUJOCO_GL"] = "glfw"
 
 import argparse
 import time
@@ -20,46 +21,47 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
 
-from utils import (
-    ReplayBuffer,
-    get_device,
-    set_seed,
-    preprocess_img,
-    bottle,
-    make_env,
-    ENV_ACTION_REPEAT,
-    no_param_grads,
-)
-
 from models import (
-    ConvEncoder,
-    ConvDecoder,
     RSSM,
-    RewardModel,
-    ContinueModel,
     Actor,
+    ContinueModel,
+    ConvDecoder,
+    ConvEncoder,
+    RewardModel,
     ValueModel,
 )
-
+from utils import (
+    ENV_ACTION_REPEAT,
+    ReplayBuffer,
+    bottle,
+    get_device,
+    make_env,
+    no_param_grads,
+    preprocess_img,
+    set_seed,
+)
 
 # ===============================
 #  Small helper modules
 # ===============================
 
+
 class FeatureHead(nn.Module):
     """phi(s) -> e  (geometry anchor into encoder feature space)."""
+
     def __init__(self, stoch_dim: int, embed_dim: int, hidden_dim: int = 256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(stoch_dim, hidden_dim), nn.ELU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ELU(),
+            nn.Linear(stoch_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
             nn.Linear(hidden_dim, embed_dim),
         )
 
@@ -67,10 +69,12 @@ class FeatureHead(nn.Module):
         return self.net(s)
 
 
-def compute_lambda_returns(rewards: torch.Tensor,
-                           values: torch.Tensor,
-                           discounts: torch.Tensor,
-                           lambda_: float = 0.95) -> torch.Tensor:
+def compute_lambda_returns(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    discounts: torch.Tensor,
+    lambda_: float = 0.95,
+) -> torch.Tensor:
     """Dreamer-style lambda returns.
 
     rewards:   [B, H]
@@ -100,10 +104,10 @@ def compute_discount_weights(discounts: torch.Tensor) -> torch.Tensor:
 #  Regularizers
 # ===============================
 
-def l2_bisim_loss(z: torch.Tensor,
-                  z_next: torch.Tensor,
-                  r: torch.Tensor,
-                  gamma: float = 0.99) -> torch.Tensor:
+
+def l2_bisim_loss(
+    z: torch.Tensor, z_next: torch.Tensor, r: torch.Tensor, gamma: float = 0.99
+) -> torch.Tensor:
     """L2 bisimulation on flattened pairs.
 
     z, z_next: [N, Dz]
@@ -121,9 +125,9 @@ def l2_bisim_loss(z: torch.Tensor,
     return F.mse_loss(dz / scale, target / scale)
 
 
-def jacobian_isometry_jvp(phi: nn.Module,
-                          s: torch.Tensor,
-                          num_projections: int = 4) -> torch.Tensor:
+def jacobian_isometry_jvp(
+    phi: nn.Module, s: torch.Tensor, num_projections: int = 4
+) -> torch.Tensor:
     """Directional JVP estimate encouraging ||Jv||^2 ~= ||v||^2.
 
     Uses Rademacher v for stability. Returns scalar.
@@ -132,9 +136,11 @@ def jacobian_isometry_jvp(phi: nn.Module,
     loss = 0.0
     for _ in range(num_projections):
         v = (torch.randint(0, 2, s.shape, device=s.device) * 2 - 1).to(s.dtype)
-        _, jv = torch.autograd.functional.jvp(lambda ss: phi(ss), (s,), (v,), create_graph=True)
-        jv2 = (jv.pow(2).mean(dim=1))
-        v2 = (v.pow(2).mean(dim=1))
+        _, jv = torch.autograd.functional.jvp(
+            lambda ss: phi(ss), (s,), (v,), create_graph=True
+        )
+        jv2 = jv.pow(2).mean(dim=1)
+        v2 = v.pow(2).mean(dim=1)
         loss = loss + (jv2 - v2).pow(2).mean()
     return loss / float(num_projections)
 
@@ -143,24 +149,29 @@ def jacobian_isometry_jvp(phi: nn.Module,
 #  Evaluation
 # ===============================
 
+
 @torch.no_grad()
-def evaluate_actor_policy(env_id: str,
-                          img_size: int,
-                          encoder: nn.Module,
-                          rssm: nn.Module,
-                          actor: nn.Module,
-                          episodes: int,
-                          seed: int,
-                          device: torch.device,
-                          bit_depth: int,
-                          action_repeat: int) -> Tuple[float, float]:
+def evaluate_actor_policy(
+    env_id: str,
+    img_size: int,
+    encoder: nn.Module,
+    rssm: nn.Module,
+    actor: nn.Module,
+    episodes: int,
+    seed: int,
+    device: torch.device,
+    bit_depth: int,
+    action_repeat: int,
+) -> Tuple[float, float]:
     env = make_env(env_id, img_size=(img_size, img_size), num_stack=1)
     try:
         env.reset(seed=seed)
     except TypeError:
         pass
 
-    encoder.eval(); rssm.eval(); actor.eval()
+    encoder.eval()
+    rssm.eval()
+    actor.eval()
     returns: List[float] = []
 
     for _ in range(episodes):
@@ -168,7 +179,9 @@ def evaluate_actor_policy(env_id: str,
         done = False
         ep_ret = 0.0
 
-        obs_t = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device)
+        obs_t = torch.tensor(
+            np.ascontiguousarray(obs), dtype=torch.float32, device=device
+        )
         obs_t = obs_t.permute(2, 0, 1).unsqueeze(0)
         preprocess_img(obs_t, depth=bit_depth)
         e = encoder(obs_t)
@@ -187,7 +200,9 @@ def evaluate_actor_policy(env_id: str,
             done = bool(term or trunc)
             ep_ret += total_reward
 
-            obs_t = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device)
+            obs_t = torch.tensor(
+                np.ascontiguousarray(obs), dtype=torch.float32, device=device
+            )
             obs_t = obs_t.permute(2, 0, 1).unsqueeze(0)
             preprocess_img(obs_t, depth=bit_depth)
             e = encoder(obs_t)
@@ -202,6 +217,7 @@ def evaluate_actor_policy(env_id: str,
 # ===============================
 #  Training
 # ===============================
+
 
 @dataclass
 class VariantCfg:
@@ -227,31 +243,60 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     H, W, C = env.observation_space.shape
     act_dim = env.action_space.shape[0]
 
-    action_repeat = args.action_repeat if args.action_repeat > 0 else ENV_ACTION_REPEAT.get(args.env_id, 2)
-    effective_gamma = args.gamma ** action_repeat
+    action_repeat = (
+        args.action_repeat
+        if args.action_repeat > 0
+        else ENV_ACTION_REPEAT.get(args.env_id, 2)
+    )
+    effective_gamma = args.gamma**action_repeat
 
     # Models
     encoder = ConvEncoder(embedding_size=args.embed_dim, in_channels=C).to(device)
-    decoder = ConvDecoder(args.deter_dim, args.stoch_dim, embedding_size=args.embed_dim, out_channels=C).to(device)
-    rssm = RSSM(args.stoch_dim, args.deter_dim, act_dim, args.embed_dim, args.hidden_dim).to(device)
-    reward_model = RewardModel(args.deter_dim, args.stoch_dim, args.hidden_dim).to(device)
-    cont_model = ContinueModel(args.deter_dim, args.stoch_dim, args.hidden_dim).to(device)
-    actor = Actor(args.deter_dim, args.stoch_dim, act_dim, args.actor_hidden_dim).to(device)
-    value_model = ValueModel(args.deter_dim, args.stoch_dim, args.value_hidden_dim).to(device)
+    decoder = ConvDecoder(
+        args.deter_dim, args.stoch_dim, embedding_size=args.embed_dim, out_channels=C
+    ).to(device)
+    rssm = RSSM(
+        args.stoch_dim, args.deter_dim, act_dim, args.embed_dim, args.hidden_dim
+    ).to(device)
+    reward_model = RewardModel(args.deter_dim, args.stoch_dim, args.hidden_dim).to(
+        device
+    )
+    cont_model = ContinueModel(args.deter_dim, args.stoch_dim, args.hidden_dim).to(
+        device
+    )
+    actor = Actor(args.deter_dim, args.stoch_dim, act_dim, args.actor_hidden_dim).to(
+        device
+    )
+    value_model = ValueModel(args.deter_dim, args.stoch_dim, args.value_hidden_dim).to(
+        device
+    )
 
     phi = None
-    if cfg.geom_head_weight > 0 or cfg.geom_iso_weight > 0 or cfg.actor_geom_smooth_weight > 0:
-        phi = FeatureHead(args.stoch_dim, args.embed_dim, hidden_dim=args.geom_hidden_dim).to(device)
+    if (
+        cfg.geom_head_weight > 0
+        or cfg.geom_iso_weight > 0
+        or cfg.actor_geom_smooth_weight > 0
+    ):
+        phi = FeatureHead(
+            args.stoch_dim, args.embed_dim, hidden_dim=args.geom_hidden_dim
+        ).to(device)
 
     # Optims
     world_params = (
-        list(encoder.parameters()) + list(decoder.parameters()) + list(rssm.parameters()) +
-        list(reward_model.parameters()) + list(cont_model.parameters()) +
-        ([] if phi is None else list(phi.parameters()))
+        list(encoder.parameters())
+        + list(decoder.parameters())
+        + list(rssm.parameters())
+        + list(reward_model.parameters())
+        + list(cont_model.parameters())
+        + ([] if phi is None else list(phi.parameters()))
     )
     model_optim = torch.optim.Adam(world_params, lr=args.model_lr, eps=args.adam_eps)
-    actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=args.adam_eps)
-    value_optim = torch.optim.Adam(value_model.parameters(), lr=args.value_lr, eps=args.adam_eps)
+    actor_optim = torch.optim.Adam(
+        actor.parameters(), lr=args.actor_lr, eps=args.adam_eps
+    )
+    value_optim = torch.optim.Adam(
+        value_model.parameters(), lr=args.value_lr, eps=args.adam_eps
+    )
 
     replay = ReplayBuffer(args.replay_capacity, obs_shape=(H, W, C), act_dim=act_dim)
     free_nats = torch.ones(1, device=device) * args.kl_free_nats
@@ -287,7 +332,11 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         obs, _ = env.reset()
         done = False
         # init belief
-        obs_t = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+        obs_t = (
+            torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+        )
         preprocess_img(obs_t, depth=args.bit_depth)
         with torch.no_grad():
             e0 = encoder(obs_t)
@@ -295,7 +344,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
         while not done:
             # action
-            encoder.eval(); rssm.eval(); actor.eval()
+            encoder.eval()
+            rssm.eval()
+            actor.eval()
             with torch.no_grad():
                 a_t, _ = actor.get_action(h, s, deterministic=False)
                 if expl > 0:
@@ -321,35 +372,54 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             total_steps += 1
 
             # belief update
-            obs_t = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+            obs_t = (
+                torch.tensor(
+                    np.ascontiguousarray(obs), dtype=torch.float32, device=device
+                )
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+            )
             preprocess_img(obs_t, depth=args.bit_depth)
             with torch.no_grad():
                 e = encoder(obs_t)
-                act_t = torch.tensor(a_np, dtype=torch.float32, device=device).unsqueeze(0)
+                act_t = torch.tensor(
+                    a_np, dtype=torch.float32, device=device
+                ).unsqueeze(0)
                 h, s, _, _ = rssm.observe_step(e, act_t, h, s, sample=False)
 
             # training bursts
-            if total_steps % args.collect_interval == 0 and replay.size > (args.seq_len + 2):
-                encoder.train(); decoder.train(); rssm.train(); reward_model.train(); cont_model.train();
-                actor.train(); value_model.train();
+            if total_steps % args.collect_interval == 0 and replay.size > (
+                args.seq_len + 2
+            ):
+                encoder.train()
+                decoder.train()
+                rssm.train()
+                reward_model.train()
+                cont_model.train()
+                actor.train()
+                value_model.train()
                 if phi is not None:
                     phi.train()
 
                 for _ in range(args.train_steps):
                     batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
-                    obs_seq = torch.as_tensor(batch.obs, device=device).float()      # [B, T+1, H, W, C]
-                    act_seq = torch.as_tensor(batch.actions, device=device)          # [B, T+1, A]
-                    rew_seq = torch.as_tensor(batch.rews, device=device)             # [B, T+1]
-                    done_seq = torch.as_tensor(batch.dones, device=device)           # [B, T+1]
+                    obs_seq = torch.as_tensor(
+                        batch.obs, device=device
+                    ).float()  # [B, T+1, H, W, C]
+                    act_seq = torch.as_tensor(
+                        batch.actions, device=device
+                    )  # [B, T+1, A]
+                    rew_seq = torch.as_tensor(batch.rews, device=device)  # [B, T+1]
+                    done_seq = torch.as_tensor(batch.dones, device=device)  # [B, T+1]
 
                     B, T1 = rew_seq.shape
                     T = T1 - 1
 
-                    x = obs_seq.permute(0, 1, 4, 2, 3).contiguous()                  # [B, T+1, C, H, W]
+                    x = obs_seq.permute(0, 1, 4, 2, 3).contiguous()  # [B, T+1, C, H, W]
                     preprocess_img(x, depth=args.bit_depth)
 
                     # ------------------- World model -------------------
-                    e_t = bottle(encoder, x)                                         # [B, T+1, E]
+                    e_t = bottle(encoder, x)  # [B, T+1, E]
                     h_t, s_t = rssm.get_init_state(e_t[:, 0])
                     h_list, s_list = [], []
                     pri_list, post_list = [], []
@@ -363,32 +433,40 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         h_list.append(h_t)
                         s_list.append(s_t)
 
-                    h_seq = torch.stack(h_list, dim=1)                               # [B, T, Dh]
-                    s_seq = torch.stack(s_list, dim=1)                               # [B, T, Ds]
+                    h_seq = torch.stack(h_list, dim=1)  # [B, T, Dh]
+                    s_seq = torch.stack(s_list, dim=1)  # [B, T, Ds]
 
-                    pri_m = torch.stack([p[0] for p in pri_list], dim=0)             # [T, B, Ds]
+                    pri_m = torch.stack([p[0] for p in pri_list], dim=0)  # [T, B, Ds]
                     pri_s = torch.stack([p[1] for p in pri_list], dim=0)
                     pos_m = torch.stack([p[0] for p in post_list], dim=0)
                     pos_s = torch.stack([p[1] for p in post_list], dim=0)
                     kld = torch.max(
-                        kl_divergence(Normal(pos_m, pos_s), Normal(pri_m, pri_s)).sum(-1),
+                        kl_divergence(Normal(pos_m, pos_s), Normal(pri_m, pri_s)).sum(
+                            -1
+                        ),
                         free_nats,
                     ).mean()
 
                     recon = bottle(decoder, h_seq, s_seq)
-                    rec_loss = F.mse_loss(recon, x[:, 1:T+1], reduction='none').sum((2, 3, 4)).mean()
+                    rec_loss = (
+                        F.mse_loss(recon, x[:, 1 : T + 1], reduction="none")
+                        .sum((2, 3, 4))
+                        .mean()
+                    )
                     rew_pred = bottle(reward_model, h_seq, s_seq)
                     rew_loss = F.mse_loss(rew_pred, rew_seq[:, :T])
                     cont_logits = bottle(cont_model, h_seq, s_seq)
                     cont_target = (1.0 - done_seq[:, :T]).clamp(0.0, 1.0)
-                    cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
+                    cont_loss = F.binary_cross_entropy_with_logits(
+                        cont_logits, cont_target
+                    )
 
                     # L2 bisim (local)
                     bisim_val = torch.zeros((), device=device)
                     if cfg.l2_bisim_weight > 0 and T > 2:
                         z = s_seq[:, :-1]
                         zn = s_seq[:, 1:]
-                        r = rew_seq[:, :T-1]
+                        r = rew_seq[:, : T - 1]
                         z_ln = F.layer_norm(z, (z.size(-1),))
                         zn_ln = F.layer_norm(zn, (zn.size(-1),))
                         bisim_val = l2_bisim_loss(
@@ -401,10 +479,14 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     # Geometry head: match phi(s) to encoder features
                     geom_fit = torch.zeros((), device=device)
                     geom_iso = torch.zeros((), device=device)
-                    if phi is not None and (cfg.geom_head_weight > 0 or cfg.geom_iso_weight > 0):
+                    if phi is not None and (
+                        cfg.geom_head_weight > 0 or cfg.geom_iso_weight > 0
+                    ):
                         # Target: encoder features at t+1 to align with posterior at t
                         # (both correspond to the same observation index)
-                        e_target = e_t[:, 1:T+1].detach().reshape(-1, args.embed_dim)
+                        e_target = (
+                            e_t[:, 1 : T + 1].detach().reshape(-1, args.embed_dim)
+                        )
                         s_flat = s_seq.reshape(-1, args.stoch_dim)
                         e_pred = phi(s_flat)
                         # Normalize (helps when encoder has LN/VICReg-style scale)
@@ -412,16 +494,18 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         e_tgt_n = F.layer_norm(e_target, (e_target.size(-1),))
                         geom_fit = F.mse_loss(e_pred_n, e_tgt_n)
                         if cfg.geom_iso_weight > 0:
-                            geom_iso = jacobian_isometry_jvp(phi, s_flat, num_projections=cfg.geom_iso_projections)
+                            geom_iso = jacobian_isometry_jvp(
+                                phi, s_flat, num_projections=cfg.geom_iso_projections
+                            )
 
                     model_loss = (
-                        rec_loss +
-                        args.kl_weight * kld +
-                        rew_loss +
-                        args.cont_weight * cont_loss +
-                        cfg.l2_bisim_weight * bisim_val +
-                        cfg.geom_head_weight * geom_fit +
-                        cfg.geom_iso_weight * geom_iso
+                        rec_loss
+                        + args.kl_weight * kld
+                        + rew_loss
+                        + args.cont_weight * cont_loss
+                        + cfg.l2_bisim_weight * bisim_val
+                        + cfg.geom_head_weight * geom_fit
+                        + cfg.geom_iso_weight * geom_iso
                     )
 
                     model_optim.zero_grad(set_to_none=True)
@@ -437,76 +521,114 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         if 0 < args.imagination_starts < T:
                             K = args.imagination_starts
                             t_idx = torch.randint(0, T, (B, K), device=device)
-                            h0 = h_seq.gather(1, t_idx.unsqueeze(-1).expand(-1, -1, Dh)).reshape(-1, Dh).detach()
-                            s0 = s_seq.gather(1, t_idx.unsqueeze(-1).expand(-1, -1, Ds)).reshape(-1, Ds).detach()
+                            h0 = (
+                                h_seq.gather(1, t_idx.unsqueeze(-1).expand(-1, -1, Dh))
+                                .reshape(-1, Dh)
+                                .detach()
+                            )
+                            s0 = (
+                                s_seq.gather(1, t_idx.unsqueeze(-1).expand(-1, -1, Ds))
+                                .reshape(-1, Ds)
+                                .detach()
+                            )
                         else:
                             h0 = h_seq.reshape(-1, Dh).detach()
                             s0 = s_seq.reshape(-1, Ds).detach()
 
-                    # Rollout imagination
-                    h_im_list = [h0]
-                    s_im_list = [s0]
-                    logp_list = []
-                    h_im, s_im = h0, s0
-                    for _ in range(args.imagination_horizon):
-                        a_im, logp = actor.get_action(h_im, s_im, deterministic=False)
-                        logp_list.append(logp)
-                        h_im = rssm.deterministic_state_fwd(h_im, s_im, a_im)
-                        s_im = rssm.state_prior(h_im, sample=True)
-                        h_im_list.append(h_im)
-                        s_im_list.append(s_im)
-                    h_imag = torch.stack(h_im_list, dim=1)            # [B_im, H+1, Dh]
-                    s_imag = torch.stack(s_im_list, dim=1)            # [B_im, H+1, Ds]
+                    with (
+                        no_param_grads(rssm),
+                        no_param_grads(reward_model),
+                        no_param_grads(cont_model),
+                    ):
+                        # Rollout imagination
+                        h_im_list = [h0]
+                        s_im_list = [s0]
+                        logp_list = []
+                        h_im, s_im = h0, s0
+                        for _ in range(args.imagination_horizon):
+                            a_im, logp = actor.get_action(
+                                h_im, s_im, deterministic=False
+                            )
+                            logp_list.append(logp)
+                            h_im = rssm.deterministic_state_fwd(h_im, s_im, a_im)
+                            s_im = rssm.state_prior(h_im, sample=True)
+                            h_im_list.append(h_im)
+                            s_im_list.append(s_im)
+                        h_imag = torch.stack(h_im_list, dim=1)  # [B_im, H+1, Dh]
+                        s_imag = torch.stack(s_im_list, dim=1)  # [B_im, H+1, Ds]
 
-                    # Rewards & discounts
-                    rewards_im = bottle(reward_model, h_imag[:, :-1], s_imag[:, :-1])
-                    cont_logits_im = bottle(cont_model, h_imag[:, 1:], s_imag[:, 1:])
-                    pcont = torch.sigmoid(cont_logits_im).clamp(0.0, 1.0)
-                    discounts = effective_gamma * pcont
+                        # Rewards & discounts
+                        # rewards_im = bottle(reward_model, h_imag[:, :-1], s_imag[:, :-1])
+                        rewards_im = bottle(reward_model, h_imag[:, 1:], s_imag[:, 1:])
+                        cont_logits_im = bottle(
+                            cont_model, h_imag[:, 1:], s_imag[:, 1:]
+                        )
+                        pcont = torch.sigmoid(cont_logits_im).clamp(0.0, 1.0)
+                        discounts = effective_gamma * pcont
 
                     # Value targets (no grad). Important: value targets should NOT
                     # backprop into the imagination rollout.
                     with torch.no_grad():
-                        values_tgt = bottle(value_model, h_imag, s_imag)                 # [B_im, H+1]
+                        values_tgt = bottle(value_model, h_imag, s_imag)  # [B_im, H+1]
                         lam_ret_tgt = compute_lambda_returns(
-                            rewards_im.detach(), values_tgt, discounts.detach(), lambda_=args.lambda_
-                        )                                                                # [B_im, H]
-                        w_tgt = compute_discount_weights(discounts.detach())             # [B_im, H]
+                            rewards_im.detach(),
+                            values_tgt,
+                            discounts.detach(),
+                            lambda_=args.lambda_,
+                        )  # [B_im, H]
+                        w_tgt = compute_discount_weights(
+                            discounts.detach()
+                        )  # [B_im, H]
 
                     # Value loss (predict the target returns)
                     v_pred = bottle(value_model, h_imag.detach(), s_imag.detach())
                     value_loss = ((v_pred[:, :-1] - lam_ret_tgt) ** 2 * w_tgt).mean()
                     value_optim.zero_grad(set_to_none=True)
                     value_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        value_model.parameters(), args.grad_clip_norm
+                    )
                     value_optim.step()
 
                     # Actor loss
                     actor_entropy_scale = args.actor_entropy_scale
-                    dist = actor.get_dist(h_imag[:, :-1].detach(), s_imag[:, :-1].detach())
+                    dist = actor.get_dist(
+                        h_imag[:, :-1].detach(), s_imag[:, :-1].detach()
+                    )
                     entropy = dist.entropy().sum(dim=-1).mean()
                     # Actor objective: maximize imagined returns.
                     # Gradients should flow through rewards/discounts/dynamics, but not
                     # through the value model.
                     with torch.no_grad():
-                        values_for_actor = bottle(value_model, h_imag, s_imag)  # detached from graph
-                        w_actor = compute_discount_weights(discounts)           # just weights
+                        values_for_actor = bottle(
+                            value_model, h_imag, s_imag
+                        )  # detached from graph
+                        w_actor = compute_discount_weights(discounts)  # just weights
                     lam_ret_actor = compute_lambda_returns(
                         rewards_im, values_for_actor, discounts, lambda_=args.lambda_
                     )
-                    actor_loss = -(w_actor.detach() * lam_ret_actor).mean() - actor_entropy_scale * entropy
+                    actor_loss = (
+                        -(w_actor.detach() * lam_ret_actor).mean()
+                        - actor_entropy_scale * entropy
+                    )
 
                     # Geometry-aware actor smoothness (feature space)
                     if phi is not None and cfg.actor_geom_smooth_weight > 0:
                         with no_param_grads(phi):
-                            f_prev = phi(s_imag[:, :-1].reshape(-1, args.stoch_dim)).view(s_imag.size(0), -1, args.embed_dim)
-                            f_next = phi(s_imag[:, 1:].reshape(-1, args.stoch_dim)).view(s_imag.size(0), -1, args.embed_dim)
+                            f_prev = phi(
+                                s_imag[:, :-1].reshape(-1, args.stoch_dim)
+                            ).view(s_imag.size(0), -1, args.embed_dim)
+                            f_next = phi(
+                                s_imag[:, 1:].reshape(-1, args.stoch_dim)
+                            ).view(s_imag.size(0), -1, args.embed_dim)
                         smooth = (f_next - f_prev).pow(2).mean()
                         actor_loss = actor_loss + cfg.actor_geom_smooth_weight * smooth
 
                     actor_optim.zero_grad(set_to_none=True)
                     actor_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        actor.parameters(), args.grad_clip_norm
+                    )
                     actor_optim.step()
 
         # (optional) exploration decay
@@ -515,8 +637,10 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
         if (ep + 1) % max(1, args.max_episodes // 5) == 0:
             dt = time.time() - t_start
-            print(f"    [{cfg.name} | seed {seed}] ep {ep+1}/{args.max_episodes}  "
-                  f"steps={total_steps}  buf={replay.size}  ({dt:.0f}s)")
+            print(
+                f"    [{cfg.name} | seed {seed}] ep {ep + 1}/{args.max_episodes}  "
+                f"steps={total_steps}  buf={replay.size}  ({dt:.0f}s)"
+            )
 
     env.close()
 
@@ -545,8 +669,11 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 #  CLI
 # ===============================
 
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Dreamer ablation: baseline vs L2 bisim vs geometry-aware")
+    p = argparse.ArgumentParser(
+        description="Dreamer ablation: baseline vs L2 bisim vs geometry-aware"
+    )
     p.add_argument("--env_id", type=str, default="cartpole-swingup")
     p.add_argument("--img_size", type=int, default=64)
     p.add_argument("--bit_depth", type=int, default=5)
@@ -651,7 +778,9 @@ def main():
         rets = [r["eval_mean"] for r in all_results[v.name]]
         if len(rets) == 0:
             continue
-        print(f"{v.name:16s}  mean={np.mean(rets):7.2f}  std={np.std(rets):7.2f}  n={len(rets)}")
+        print(
+            f"{v.name:16s}  mean={np.mean(rets):7.2f}  std={np.std(rets):7.2f}  n={len(rets)}"
+        )
 
 
 if __name__ == "__main__":
