@@ -191,6 +191,7 @@ def evaluate_actor_policy(
             action, _ = actor.get_action(h, s, deterministic=True)
             a_np = action.squeeze(0).cpu().numpy().astype(np.float32)
 
+            """
             total_reward = 0.0
             for _ in range(action_repeat):
                 obs, r, term, trunc, _ = env.step(a_np)
@@ -199,6 +200,11 @@ def evaluate_actor_policy(
                     break
             done = bool(term or trunc)
             ep_ret += total_reward
+            """
+
+            obs, total_reward, term, trunc, _ = env.step(a_np, repeat=action_repeat)
+            done = bool(term or trunc)
+            ep_ret += float(total_reward)
 
             obs_t = torch.tensor(
                 np.ascontiguousarray(obs), dtype=torch.float32, device=device
@@ -307,6 +313,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         done = False
         while not done:
             action = env.action_space.sample()
+            """
             total_reward = 0.0
             for _ in range(action_repeat):
                 next_obs, r, term, trunc, _ = env.step(action)
@@ -314,6 +321,13 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 if term or trunc:
                     break
             done = bool(term or trunc)
+            """
+
+            next_obs, total_reward, term, trunc, _ = env.step(
+                action, repeat=action_repeat
+            )
+            done = bool(term or trunc)
+
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=np.asarray(action, np.float32),
@@ -354,12 +368,18 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 a_np = a_t.squeeze(0).cpu().numpy().astype(np.float32)
 
             # env step
+            """
             total_reward = 0.0
             for _ in range(action_repeat):
                 next_obs, r, term, trunc, _ = env.step(a_np)
                 total_reward += float(r)
                 if term or trunc:
                     break
+            done = bool(term or trunc)
+            """
+            next_obs, total_reward, term, trunc, _ = env.step(
+                a_np, repeat=action_repeat
+            )
             done = bool(term or trunc)
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
@@ -743,9 +763,44 @@ def main():
         args.seq_len = 32
         args.imagination_starts = 4
 
+    """
     variants: List[VariantCfg] = [
         VariantCfg(name="dreamer"),
         VariantCfg(name="dreamer+l2bisim", l2_bisim_weight=0.03),
+        VariantCfg(
+            name="dreamer+geometry",
+            l2_bisim_weight=0.03,
+            geom_head_weight=1.0,
+            geom_iso_weight=0.05,
+            geom_iso_projections=2,
+            actor_geom_smooth_weight=1e-3,
+        ),
+    ]
+    """
+
+    variants: List[VariantCfg] = [
+        # 0) baseline
+        VariantCfg(name="dreamer"),
+        # 1) representation shaping only
+        VariantCfg(name="dreamer+l2bisim", l2_bisim_weight=0.03),
+        # 2) geometry head ONLY (no isometry, no actor smoothness)
+        VariantCfg(
+            name="dreamer+geom_head",
+            l2_bisim_weight=0.03,
+            geom_head_weight=1.0,
+            geom_iso_weight=0.0,
+            actor_geom_smooth_weight=0.0,
+        ),
+        # 3) isometry ONLY (IMPORTANT: give it a *tiny* head fit so phi doesn't drift arbitrarily)
+        VariantCfg(
+            name="dreamer+iso_only",
+            l2_bisim_weight=0.03,
+            geom_head_weight=0.05,  # tiny anchor
+            geom_iso_weight=0.05,
+            geom_iso_projections=2,
+            actor_geom_smooth_weight=0.0,
+        ),
+        # 4) full
         VariantCfg(
             name="dreamer+geometry",
             l2_bisim_weight=0.03,
