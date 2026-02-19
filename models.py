@@ -314,7 +314,7 @@ class Actor(nn.Module):
         latent_size=30,
         act_dim=6,
         hidden_dim=400,
-        min_std=1e-4,
+        min_std=0.2,
         init_std=5.0,
         mean_scale=5.0,
         activation_function="elu",

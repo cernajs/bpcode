@@ -445,19 +445,20 @@ class ReplayBuffer:
         self.actions = np.zeros((capacity, act_dim), dtype=np.float32)
         self.rews = np.zeros(capacity, dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.float32)
-        self.next_obs = np.zeros((capacity, *obs_shape), dtype=np.uint8)
 
         self.idx = 0
         self.size = 0
+        self.full = False
 
     def add(self, obs, action, reward, next_obs, done: bool):
         self.obs[self.idx] = obs
         self.actions[self.idx] = action
         self.rews[self.idx] = reward
         self.dones[self.idx] = float(done)
-        self.next_obs[self.idx] = next_obs
 
         self.idx = (self.idx + 1) % self.capacity
+        if self.idx == 0:
+            self.full = True
         self.size = min(self.size + 1, self.capacity)
 
     @dataclass
@@ -468,53 +469,55 @@ class ReplayBuffer:
         dones: np.ndarray  # [B, T]
 
     def sample_sequences(self, batch_size: int, seq_len: int):
-        """
-        Sample sequences consistent with episode boundaries and buffer pointers.
-        Fixes the 'teleportation' issue by rejecting invalid indices.
-        """
-        assert self.size > seq_len + 1, "Not enough data to sample sequences."
+        # 1. Generate candidate indices
+        # We need batch_size valid indices. We sample more to account for rejections.
+        candidates = np.random.randint(0, self.size - seq_len, size=batch_size * 2)
 
-        obs_seq = []
-        act_seq = []
-        rew_seq = []
-        done_seq = []
+        # 2. Vectorized Validity Checks
 
-        # We need to find 'batch_size' valid starting indices
-        count = 0
-        while count < batch_size:
-            # 1. Sample a random start index
-            # We subtract seq_len to ensure the slice fits in the array
-            start = np.random.randint(0, self.size - seq_len)
+        # Wrap-around boundary (only if buffer is full)
+        if self.full:
+            # Invalid if the sequence [start, start+seq_len] overlaps the write pointer (self.idx)
+            # This happens if start < idx < start+seq_len
+            # Easier check: The sequence indices must not contain self.idx
+            # Since indices are contiguous, we just check if self.idx falls in the range
+            wrap_mask = (candidates < self.idx) & (self.idx < candidates + seq_len)
+            candidates = candidates[~wrap_mask]
+
+        # reject if any 'done' exists in the window.
+        valid_indices = []
+        for start in candidates:
             end = start + seq_len
-
-            # 2. Check for Buffer Overwrite (Circular Buffer "Head")
-            # If the buffer is full, self.idx is the split between oldest and newest data.
-            # We cannot sample a sequence that crosses this boundary.
-            if self.size == self.capacity:
-                # If the interval [start, end] contains the write head 'self.idx'
-                if start < self.idx < end:
-                    continue
-
-            # 3. Check for Episode Boundaries
-            # If any step (except the last one) is 'done', the sequence contains a reset.
-            # We want transitions: s_0->s_1, ..., s_{T-1}->s_T.
-            # If s_k is terminal, the transition s_k -> s_{k+1} is invalid (teleportation).
+            # Fast numpy check for 1s in the dones array slice
             if np.any(self.dones[start : end - 1]):
                 continue
 
-            # If valid, append to batch
-            obs_seq.append(self.obs[start:end])
-            act_seq.append(self.actions[start:end])
-            rew_seq.append(self.rews[start:end])
-            done_seq.append(self.dones[start:end])
-            count += 1
+            valid_indices.append(start)
+            if len(valid_indices) == batch_size:
+                break
 
-        obs_seq = np.stack(obs_seq, axis=0)  # [B, T, H, W, C]
-        act_seq = np.stack(act_seq, axis=0)  # [B, T, act_dim]
-        rew_seq = np.stack(rew_seq, axis=0)  # [B, T]
-        done_seq = np.stack(done_seq, axis=0)  # [B, T]
+        # Fallback if we didn't find enough (rare)
+        while len(valid_indices) < batch_size:
+            start = np.random.randint(0, self.size - seq_len)
+            end = start + seq_len
+            if self.full and start < self.idx < end:
+                continue
+            if np.any(self.dones[start : end - 1]):
+                continue
+            valid_indices.append(start)
 
-        return ReplayBuffer.Batch(obs_seq, act_seq, rew_seq, done_seq)
+        # 3. Retrieve Data
+        idx_array = np.array(valid_indices)
+        # Advanced indexing to retrieve sequences [B, T, ...]
+        # Create a range [0, 1, ..., seq_len-1]
+        seq_idx = idx_array[:, None] + np.arange(seq_len)[None, :]
+
+        return ReplayBuffer.Batch(
+            self.obs[seq_idx],  # Returns [B, T, H, W, C]
+            self.actions[seq_idx],
+            self.rews[seq_idx],
+            self.dones[seq_idx],
+        )
 
 
 # ===============================

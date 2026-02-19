@@ -15,6 +15,14 @@ import os
 if "MUJOCO_GL" not in os.environ:
     os.environ["MUJOCO_GL"] = "glfw"
 
+
+def _f(x, n=4):
+    try:
+        return f"{float(x):.{n}f}"
+    except Exception:
+        return str(x)
+
+
 import argparse
 import time
 from dataclasses import dataclass
@@ -26,6 +34,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
+
+torch.set_float32_matmul_precision("high")
 
 from models import (
     RSSM,
@@ -277,6 +287,12 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         device
     )
 
+    encoder = torch.compile(encoder)
+    decoder = torch.compile(decoder)
+    rssm = torch.compile(rssm)
+    actor = torch.compile(actor)
+    value_model = torch.compile(value_model)
+
     phi = None
     if (
         cfg.geom_head_weight > 0
@@ -332,7 +348,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=np.asarray(action, np.float32),
                 reward=total_reward,
-                next_obs=np.ascontiguousarray(next_obs, np.uint8),
+                next_obs=None,  # not needed
                 done=done,
             )
             obs = next_obs
@@ -340,6 +356,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     total_steps = 0
     expl = args.expl_amount
     t_start = time.time()
+    train_updates = 0
 
     # Online episodes
     for ep in range(args.max_episodes):
@@ -385,7 +402,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=a_np,
                 reward=total_reward,
-                next_obs=np.ascontiguousarray(next_obs, np.uint8),
+                next_obs=None,
                 done=done,
             )
             obs = next_obs
@@ -619,11 +636,18 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     # Actor objective: maximize imagined returns.
                     # Gradients should flow through rewards/discounts/dynamics, but not
                     # through the value model.
+                    """
                     with torch.no_grad():
                         values_for_actor = bottle(
                             value_model, h_imag, s_imag
                         )  # detached from graph
                         w_actor = compute_discount_weights(discounts)  # just weights
+                    """
+                    with no_param_grads(value_model):
+                        values_for_actor = bottle(
+                            value_model, h_imag, s_imag
+                        )  # gradients flow to h/s
+                    w_actor = compute_discount_weights(discounts.detach())
                     lam_ret_actor = compute_lambda_returns(
                         rewards_im, values_for_actor, discounts, lambda_=args.lambda_
                     )
@@ -651,6 +675,74 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     )
                     actor_optim.step()
 
+                    train_updates += 1
+
+                    if args.train_log_interval > 0 and (
+                        train_updates % args.train_log_interval == 0
+                    ):
+                        # raw KL diagnostic (useful to see if you're always clamped by free_nats)
+                        raw_kl = kl_divergence(
+                            Normal(pos_m, pos_s), Normal(pri_m, pri_s)
+                        ).sum(-1)  # [T, B]
+                        kl_raw_mean = raw_kl.mean().item()
+                        kl_clamp_frac = (raw_kl < free_nats).float().mean().item()
+
+                        # geometry diagnostics (cheap-ish)
+                        iso_ratio = None
+                        if (phi is not None) and (cfg.geom_iso_weight > 0):
+                            s_flat_dbg = s_seq.reshape(-1, args.stoch_dim).detach()
+                            # subsample to keep JVP diagnostic cheap (up to ~256 points)
+                            step = max(1, s_flat_dbg.shape[0] // 256)
+                            s_sub = s_flat_dbg[::step].requires_grad_(True)
+                            v = (
+                                torch.randint(0, 2, s_sub.shape, device=s_sub.device)
+                                * 2
+                                - 1
+                            ).to(s_sub.dtype)
+                            _, jv = torch.autograd.functional.jvp(
+                                lambda ss: phi(ss), (s_sub,), (v,), create_graph=False
+                            )
+                            iso_ratio = (
+                                (
+                                    jv.pow(2).mean(dim=1)
+                                    / v.pow(2).mean(dim=1).clamp_min(1e-8)
+                                )
+                                .mean()
+                                .item()
+                            )
+
+                        head_cos = None
+                        if (phi is not None) and (cfg.geom_head_weight > 0):
+                            # reuse the same alignment you train on
+                            e_target = (
+                                e_t[:, 1 : T + 1].detach().reshape(-1, args.embed_dim)
+                            )
+                            s_flat = s_seq.reshape(-1, args.stoch_dim).detach()
+                            e_pred = phi(s_flat).detach()
+                            e_pred_n = F.layer_norm(e_pred, (e_pred.size(-1),))
+                            e_tgt_n = F.layer_norm(e_target, (e_target.size(-1),))
+                            head_cos = (
+                                F.cosine_similarity(e_pred_n, e_tgt_n, dim=-1)
+                                .mean()
+                                .item()
+                            )
+
+                        smooth_val = None
+                        if (phi is not None) and (cfg.actor_geom_smooth_weight > 0):
+                            smooth_val = smooth.detach().item()
+
+                        print(
+                            f"[{cfg.name} | seed {seed}] upd={train_updates:6d} env={total_steps:7d} "
+                            f"rec={_f(rec_loss)} kl={_f(kld)} (raw={kl_raw_mean:.3f}, clamp={kl_clamp_frac:.2f}) "
+                            f"rew={_f(rew_loss)} cont={_f(cont_loss)} bis={_f(bisim_val, 3)} "
+                            f"gfit={_f(geom_fit)} isoL={_f(geom_iso)} "
+                            f"isoR={(f'{iso_ratio:.2f}' if iso_ratio is not None else 'NA')} "
+                            f"cos={(f'{head_cos:.2f}' if head_cos is not None else 'NA')} "
+                            f"sm={(f'{smooth_val:.2e}' if smooth_val is not None else 'NA')} "
+                            f"act={_f(actor_loss)} val={_f(value_loss)} ent={_f(entropy)}",
+                            flush=True,
+                        )
+
         # (optional) exploration decay
         if args.expl_decay > 0:
             expl = max(args.expl_min, expl - args.expl_decay)
@@ -660,6 +752,24 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             print(
                 f"    [{cfg.name} | seed {seed}] ep {ep + 1}/{args.max_episodes}  "
                 f"steps={total_steps}  buf={replay.size}  ({dt:.0f}s)"
+            )
+
+        if args.eval_interval > 0 and (ep + 1) % args.eval_interval == 0:
+            eval_mean, eval_std = evaluate_actor_policy(
+                env_id=args.env_id,
+                img_size=args.img_size,
+                encoder=encoder,
+                rssm=rssm,
+                actor=actor,
+                episodes=args.eval_episodes,
+                seed=seed + 10000,  # Keep seed fixed for consistent validation set
+                device=device,
+                bit_depth=args.bit_depth,
+                action_repeat=action_repeat,
+            )
+            print(
+                f"    [Eval @ ep {ep + 1}] mean={eval_mean:.2f} std={eval_std:.2f}",
+                flush=True,
             )
 
     env.close()
@@ -735,7 +845,7 @@ def parse_args():
     p.add_argument("--cont_weight", type=float, default=1.0)
     p.add_argument("--imagination_horizon", type=int, default=15)
     p.add_argument("--imagination_starts", type=int, default=8)
-    p.add_argument("--actor_entropy_scale", type=float, default=1e-3)
+    p.add_argument("--actor_entropy_scale", type=float, default=3e-3)
 
     # Exploration
     p.add_argument("--expl_amount", type=float, default=0.3)
@@ -744,6 +854,16 @@ def parse_args():
 
     # Evaluation
     p.add_argument("--eval_episodes", type=int, default=10)
+    p.add_argument(
+        "--eval_interval", type=int, default=50, help="Run eval every N episodes"
+    )
+
+    p.add_argument(
+        "--train_log_interval",
+        type=int,
+        default=20,
+        help="print every N gradient updates",
+    )
 
     return p.parse_args()
 
