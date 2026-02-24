@@ -467,8 +467,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     rssm = torch.compile(rssm)
     actor = torch.compile(actor)
     value_model = torch.compile(value_model)
-    rssm_jvp = getattr(rssm, "_orig_mod", rssm)
     """
+    rssm_jvp = getattr(rssm, "_orig_mod", rssm)
+    
 
     run_name = f"{args.env_id}_{cfg.name}_seed{seed}"
     writer = SummaryWriter(log_dir=os.path.join(args.log_dir, run_name))
