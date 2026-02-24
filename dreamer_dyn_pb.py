@@ -680,6 +680,12 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     dyn_pb_bisim = torch.zeros((), device=device)
                     dyn_pb_dz_mean = None
                     dyn_pb_dnext_mean = None
+                    dyn_pb_dz_std = None
+                    dyn_pb_target_mean = None
+                    dyn_pb_target_std = None
+                    dyn_pb_corr = None
+                    dyn_pb_scale = None
+                    dyn_pb_ratio = None
                     if cfg.dyn_pb_reg_weight > 0:
                         h_flat = h_prev_seq.reshape(-1, h_prev_seq.size(-1))
                         s_flat = s_prev_seq.reshape(-1, s_prev_seq.size(-1))
@@ -768,6 +774,19 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         dyn_pb_bisim = F.mse_loss(dz / scale, target / scale)
                         dyn_pb_dz_mean = dz.mean().item()
                         dyn_pb_dnext_mean = dnext.mean().item()
+                        with torch.no_grad():
+                            dyn_pb_dz_std = dz.std().item()
+                            dyn_pb_target_mean = target.mean().item()
+                            dyn_pb_target_std = target.std().item()
+                            dyn_pb_scale = scale.item()
+                            denom = dz.std() * target.std() + 1e-8
+                            dyn_pb_corr = (
+                                ((dz - dz.mean()) * (target - target.mean())).mean()
+                                / denom
+                            ).item()
+                            dyn_pb_ratio = (
+                                dz.mean() / target.mean().clamp_min(1e-8)
+                            ).item()
 
                     model_loss = (
                         rec_loss
@@ -922,17 +941,167 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         writer.add_scalar("loss/actor", actor_loss.item(), total_steps)
                         writer.add_scalar("loss/value", value_loss.item(), total_steps)
                         writer.add_scalar("train/exploration", expl, total_steps)
+                        writer.add_scalar(
+                            "geom/dynpb_trace", dyn_pb_reg.item(), total_steps
+                        )
+                        writer.add_scalar(
+                            "geom/dynpb_bisim_loss", dyn_pb_bisim.item(), total_steps
+                        )
                         if dyn_pb_dz_mean is not None:
                             writer.add_scalar(
                                 "train/dyn_pb_dz_mean",
                                 dyn_pb_dz_mean,
                                 total_steps,
                             )
+                            writer.add_scalar(
+                                "geom/dynpb_dz_mean", dyn_pb_dz_mean, total_steps
+                            )
                         if dyn_pb_dnext_mean is not None:
                             writer.add_scalar(
                                 "train/dyn_pb_dnext_mean",
                                 dyn_pb_dnext_mean,
                                 total_steps,
+                            )
+                            writer.add_scalar(
+                                "geom/dynpb_dnext_mean", dyn_pb_dnext_mean, total_steps
+                            )
+                        if dyn_pb_target_mean is not None:
+                            writer.add_scalar(
+                                "geom/dynpb_target_mean",
+                                dyn_pb_target_mean,
+                                total_steps,
+                            )
+                        if dyn_pb_target_std is not None:
+                            writer.add_scalar(
+                                "geom/dynpb_target_std",
+                                dyn_pb_target_std,
+                                total_steps,
+                            )
+                        if dyn_pb_dz_std is not None:
+                            writer.add_scalar(
+                                "geom/dynpb_dz_std", dyn_pb_dz_std, total_steps
+                            )
+                        if dyn_pb_corr is not None:
+                            writer.add_scalar(
+                                "geom/dynpb_corr", dyn_pb_corr, total_steps
+                            )
+                        if dyn_pb_scale is not None:
+                            writer.add_scalar(
+                                "geom/dynpb_scale", dyn_pb_scale, total_steps
+                            )
+                        if dyn_pb_ratio is not None:
+                            writer.add_scalar(
+                                "geom/dynpb_ratio", dyn_pb_ratio, total_steps
+                            )
+
+                        with torch.no_grad():
+                            Dh = h_seq.size(-1)
+                            Ds = s_seq.size(-1)
+                            h_flat = h_seq.reshape(-1, Dh)
+                            s_flat = s_seq.reshape(-1, Ds)
+                            h_norm = h_flat.norm(dim=1)
+                            s_norm = s_flat.norm(dim=1)
+                            writer.add_scalar(
+                                "geom/h_norm_mean", h_norm.mean().item(), total_steps
+                            )
+                            writer.add_scalar(
+                                "geom/h_norm_std", h_norm.std().item(), total_steps
+                            )
+                            writer.add_scalar(
+                                "geom/s_norm_mean", s_norm.mean().item(), total_steps
+                            )
+                            writer.add_scalar(
+                                "geom/s_norm_std", s_norm.std().item(), total_steps
+                            )
+                            h_var = h_flat.var(dim=0, unbiased=False)
+                            s_var = s_flat.var(dim=0, unbiased=False)
+                            writer.add_scalar(
+                                "geom/h_var_mean", h_var.mean().item(), total_steps
+                            )
+                            writer.add_scalar(
+                                "geom/h_var_min", h_var.min().item(), total_steps
+                            )
+                            writer.add_scalar(
+                                "geom/s_var_mean", s_var.mean().item(), total_steps
+                            )
+                            writer.add_scalar(
+                                "geom/s_var_min", s_var.min().item(), total_steps
+                            )
+                            if T > 1:
+                                dh = h_seq[:, 1:] - h_seq[:, :-1]
+                                ds = s_seq[:, 1:] - s_seq[:, :-1]
+                                step_len = torch.sqrt(
+                                    dh.pow(2).mean(dim=-1) + ds.pow(2).mean(dim=-1)
+                                )
+                                writer.add_scalar(
+                                    "geom/step_len_mean",
+                                    step_len.mean().item(),
+                                    total_steps,
+                                )
+                                writer.add_scalar(
+                                    "geom/step_len_std",
+                                    step_len.std().item(),
+                                    total_steps,
+                                )
+
+                            max_pts = args.geom_log_max_pts
+                            n_pts = min(max_pts, s_flat.size(0))
+                            if n_pts >= 2:
+                                idx = torch.randperm(s_flat.size(0), device=device)[
+                                    :n_pts
+                                ]
+                                s_sub = s_flat[idx]
+                                dists = torch.cdist(s_sub, s_sub)
+                                dists.fill_diagonal_(float("inf"))
+                                nn = dists.min(dim=1).values
+                                writer.add_scalar(
+                                    "geom/s_nn_mean",
+                                    nn.mean().item(),
+                                    total_steps,
+                                )
+                                writer.add_scalar(
+                                    "geom/s_nn_p90",
+                                    torch.quantile(nn, 0.90).item(),
+                                    total_steps,
+                                )
+                                pdist_mean = dists[torch.isfinite(dists)].mean().item()
+                                writer.add_scalar(
+                                    "geom/s_pdist_mean", pdist_mean, total_steps
+                                )
+
+                        max_pts = args.geom_log_max_pts
+                        h_prev_flat = h_prev_seq.reshape(-1, h_prev_seq.size(-1))
+                        s_prev_flat = s_prev_seq.reshape(-1, s_prev_seq.size(-1))
+                        a_prev_flat = a_prev_seq.reshape(-1, a_prev_seq.size(-1))
+                        n_pts = min(max_pts, h_prev_flat.size(0))
+                        if n_pts > 0:
+                            idx = torch.randperm(h_prev_flat.size(0), device=device)[
+                                :n_pts
+                            ]
+                            h_sub = h_prev_flat[idx]
+                            s_sub = s_prev_flat[idx]
+                            a_sub = a_prev_flat[idx]
+                            v_h = _rademacher_like(h_sub)
+                            v_s = _rademacher_like(s_sub)
+                            v_a = _rademacher_like(a_sub)
+                            jv2 = dynamics_pullback_len_jvp(
+                                rssm_jvp,
+                                h_sub,
+                                s_sub,
+                                a_sub,
+                                v_h,
+                                v_s,
+                                v_a,
+                                create_graph=False,
+                            )
+                            v2 = (
+                                v_h.pow(2).mean(dim=1)
+                                + v_s.pow(2).mean(dim=1)
+                                + v_a.pow(2).mean(dim=1)
+                            )
+                            iso_ratio = (jv2 / v2.clamp_min(1e-8)).mean().item()
+                            writer.add_scalar(
+                                "geom/dynpb_iso_ratio", iso_ratio, total_steps
                             )
 
 
@@ -1052,6 +1221,7 @@ def parse_args():
     p.add_argument("--dyn_pb_reg_projections", type=int, default=2)
     p.add_argument("--dyn_pb_bisim_weight", type=float, default=0.03)
     p.add_argument("--dyn_pb_max_pts", type=int, default=256)
+    p.add_argument("--geom_log_max_pts", type=int, default=256)
 
     p.add_argument("--geom_iso_max_pts", type=int, default=256)
     p.add_argument(
