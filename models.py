@@ -125,6 +125,7 @@ class RSSM(nn.Module):
 
         # GRU for deterministic state (takes transformed input, hidden state)
         self.grucell = nn.GRUCell(deter_dim, deter_dim)
+        self.h_norm = nn.LayerNorm(deter_dim)
 
         # Linear layer to transform [s, a] before GRU
         self.lat_act_layer = nn.Linear(stoch_dim + act_dim, deter_dim)
@@ -159,7 +160,7 @@ class RSSM(nn.Module):
         """
         x = torch.cat([s_t, a_t], dim=-1)
         x = self.act_fn(self.lat_act_layer(x))
-        return self.grucell(x, h_t)
+        return self.h_norm(self.grucell(x, h_t))
 
     def state_prior(self, h_t, sample=False):
         """
