@@ -658,12 +658,19 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     pri_s = torch.stack([p[1] for p in pri_list], dim=0)
                     pos_m = torch.stack([p[0] for p in post_list], dim=0)
                     pos_s = torch.stack([p[1] for p in post_list], dim=0)
+                    """
                     kld = torch.max(
                         kl_divergence(Normal(pos_m, pos_s), Normal(pri_m, pri_s)).sum(
                             -1
                         ),
                         free_nats,
                     ).mean()
+                    """
+                    # stop grad on each dist as in dreamerv2
+                    kl_lhs = kl_divergence(Normal(pos_m.detach(), pos_s.detach()), Normal(pri_m, pri_s))
+                    kl_rhs = kl_divergence(Normal(pos_m, pos_s), Normal(pri_m.detach(), pri_s.detach()))
+                    kld = 0.5 * (kl_lhs + kl_rhs)
+                    kld = torch.max(kld.sum(-1), free_nats).mean()
 
                     recon = bottle(decoder, h_seq, s_seq)
                     rec_loss = (
