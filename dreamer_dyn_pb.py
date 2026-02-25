@@ -891,10 +891,19 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
                     # Actor loss
                     actor_entropy_scale = args.actor_entropy_scale
+                    """
                     dist = actor.get_dist(
                         h_imag[:, :-1].detach(), s_imag[:, :-1].detach()
                     )
                     entropy = dist.entropy().sum(dim=-1).mean()
+                    """
+                    # use post tanh entropy
+                    mean, std = actor.forward(h_imag[:, :-1].detach(), s_imag[:, :-1].detach())
+                    noise = torch.randn_like(mean)
+                    raw = mean + std * noise
+                    entropy = (Normal(mean, std).entropy() 
+                            + torch.log(1 - torch.tanh(raw).pow(2) + 1e-6)
+                            ).sum(dim=-1).mean()
                     # Actor objective: maximize imagined returns.
                     # Gradients should flow through rewards/discounts/dynamics, but not
                     # through the value model.
