@@ -289,7 +289,7 @@ class RewardModel(nn.Module):
         self.fc_reward_1 = nn.Linear(state_size + latent_size, hidden_dim)
         self.fc_reward_2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc_reward_3 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_reward_3 = nn.Linear(hidden_dim, 1)
+        self.fc_reward_4 = nn.Linear(hidden_dim, 1)
 
     def forward(self, h, s=None):
         """
@@ -303,7 +303,7 @@ class RewardModel(nn.Module):
         r = self.act_fn(self.fc_reward_1(x))
         r = self.act_fn(self.fc_reward_2(r))
         r = self.act_fn(self.fc_reward_3(r))
-        return self.fc_reward_3(r).squeeze(-1)
+        return self.fc_reward_4(r).squeeze(-1)
 
 
 class Actor(nn.Module):
@@ -437,7 +437,7 @@ class ValueModel(nn.Module):
     """
 
     def __init__(
-        self, state_size=200, latent_size=30, hidden_dim=200, activation_function="elu"
+        self, state_size=200, latent_size=30, hidden_dim=400, activation_function="elu"
     ):
         super().__init__()
         self.act_fn = getattr(F, activation_function)
@@ -468,7 +468,7 @@ class ValueModel(nn.Module):
             x = h
         x = self.act_fn(self.fc1(x))
         x = self.act_fn(self.fc2(x))
-        #x = self.act_fn(self.fc3(x))
+        x = self.act_fn(self.fc3(x))
         return self.fc_out(x).squeeze(-1)
 
 
