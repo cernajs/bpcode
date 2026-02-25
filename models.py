@@ -437,7 +437,7 @@ class ValueModel(nn.Module):
     """
 
     def __init__(
-        self, state_size=200, latent_size=30, hidden_dim=400, activation_function="elu"
+        self, state_size=200, latent_size=30, hidden_dim=200, activation_function="elu"
     ):
         super().__init__()
         self.act_fn = getattr(F, activation_function)
@@ -468,7 +468,7 @@ class ValueModel(nn.Module):
             x = h
         x = self.act_fn(self.fc1(x))
         x = self.act_fn(self.fc2(x))
-        x = self.act_fn(self.fc3(x))
+        #x = self.act_fn(self.fc3(x))
         return self.fc_out(x).squeeze(-1)
 
 
