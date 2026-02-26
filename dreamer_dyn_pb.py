@@ -1390,14 +1390,14 @@ def main():
         VariantCfg(name="dreamer"),
         VariantCfg(
             name="dreamer+gelato",
-            geo_aux_weight=0.10,
+            geo_aux_weight=0.50,
             geo_reward_bonus_weight=0.03,
             geo_plan_penalty_weight=1e-3,
             geo_plan_penalty=False,
         ),
         VariantCfg(
             name="dreamer+gelato+plan",
-            geo_aux_weight=0.10,
+            geo_aux_weight=0.50,
             geo_reward_bonus_weight=0.03,
             geo_plan_penalty_weight=1e-3,
             geo_plan_penalty=True,
