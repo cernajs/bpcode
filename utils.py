@@ -430,7 +430,7 @@ def make_env(env_id: str, img_size=(64, 64), num_stack=1):
     dm_control envs: "cheetah-run", "reacher-easy", "ball_in_cup-catch", "finger-spin", "cartpole-swingup", "walker-walk"
     gymnasium envs: "Pendulum-v1", "MountainCarContinuous-v0", etc.
     """
-    if env_id.lower().contains("maze"):
+    if "maze" in env_id.lower():
         return PixelObsWrapper(env_id, img_size=img_size, num_stack=num_stack)
     # Check if it's a dm_control env (contains hyphen but no version suffix like -v1)
     if "-" in env_id and not any(env_id.endswith(f"-v{i}") for i in range(10)):
