@@ -908,12 +908,39 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         pcont = torch.sigmoid(cont_logits_im).clamp(0.0, 1.0)
                         discounts = effective_gamma * pcont
 
+                    rewards_im_raw = rewards_im
+                    rewards_total = rewards_im
+                    geo_frontier_bonus = torch.zeros_like(rewards_im)
+                    geo_jump_pen = torch.zeros((), device=device)
+
+                    if geo is not None:
+                        with torch.no_grad():
+                            # step penalty should shape the actor, not train geo
+                            g_imag = bottle(geo, h_imag.detach(), s_imag.detach())  # [B_im, H+1, Dg]
+
+                        # reward shaping starts after geometry has had time to learn
+                        if total_steps >= args.geo_reward_after_steps and geo_bank is not None and geo_bank.n > 0:
+                            bank_sub = geo_bank.sample(args.geo_bank_sample, device)
+                            d_novel = min_bank_dist(g_imag[:, 1:], bank_sub)  # [B_im, H]
+
+                            geo_frontier_bonus = torch.relu(d_novel - args.geo_frontier_tau)
+                            if args.geo_frontier_cap > 0:
+                                geo_frontier_bonus = geo_frontier_bonus.clamp(max=args.geo_frontier_cap)
+
+                            rewards_total = rewards_total + cfg.geo_reward_bonus_weight * geo_frontier_bonus
+
+                            rewards_im = rewards_total
+
+                        # planning constraint (defined here, applied later)
+                        if total_steps >= args.geo_plan_after_steps and args.geo_plan_penalty:
+                            geo_jump_pen = geo_step_penalty(g_imag, args.geo_step_radius)
+
                     # Value targets (no grad). Important: value targets should NOT
                     # backprop into the imagination rollout.
                     with torch.no_grad():
                         values_tgt = bottle(value_model, h_imag, s_imag)  # [B_im, H+1]
                         lam_ret_tgt = compute_lambda_returns(
-                            rewards_im.detach(),
+                            rewards_im_raw.detach(),
                             values_tgt,
                             discounts.detach(),
                             lambda_=args.lambda_,
@@ -968,6 +995,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     actor_loss = (
                         -(w_actor.detach() * lam_ret_actor).mean()
                         - actor_entropy_scale * entropy
+                        + cfg.geo_plan_penalty_weight * geo_jump_pen
                     )
 
                     actor_optim.zero_grad(set_to_none=True)
@@ -1009,6 +1037,12 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         writer.add_scalar(
                             "geom/dynpb_bisim_loss", dyn_pb_bisim.item(), total_steps
                         )
+
+                        if geo is not None:
+                            writer.add_scalar("loss/geo_aux", geo_aux_loss.item(), total_steps)
+                            writer.add_scalar("train/geo_frontier_bonus", geo_frontier_bonus.mean().item(), total_steps)
+                            writer.add_scalar("loss/geo_jump_pen", geo_jump_pen.item(), total_steps)
+
                         if dyn_pb_dz_mean is not None:
                             writer.add_scalar(
                                 "train/dyn_pb_dz_mean",
@@ -1318,7 +1352,7 @@ def parse_args():
     p.add_argument("--geo_learn_after_steps", type=int, default=2_000)
     p.add_argument("--geo_reward_after_steps", type=int, default=10_000)
     p.add_argument("--geo_plan_after_steps", type=int, default=20_000)
-
+    p.add_argument("--geo_plan_penalty", action="store_true", default=False)
 
     # Evaluation
     p.add_argument("--eval_episodes", type=int, default=10)
@@ -1355,21 +1389,18 @@ def main():
     variants: List[VariantCfg] = [
         VariantCfg(name="dreamer"),
         VariantCfg(
-            name="dreamer+dynpb_reg",
-            dyn_pb_reg_weight=args.dyn_pb_reg_weight,
-            dyn_pb_reg_projections=args.dyn_pb_reg_projections,
+            name="dreamer+gelato",
+            geo_aux_weight=0.10,
+            geo_reward_bonus_weight=0.03,
+            geo_plan_penalty_weight=1e-3,
+            geo_plan_penalty=False,
         ),
         VariantCfg(
-            name="dreamer+dynpb_bisim",
-            dyn_pb_bisim_weight=args.dyn_pb_bisim_weight,
-        ),
-        VariantCfg(
-            name="dreamer+geometry",
-            l2_bisim_weight=0.03,
-            geom_head_weight=1.0,
-            geom_iso_weight=0.05,
-            geom_iso_projections=2,
-            actor_geom_smooth_weight=1e-3,
+            name="dreamer+gelato+plan",
+            geo_aux_weight=0.10,
+            geo_reward_bonus_weight=0.03,
+            geo_plan_penalty_weight=1e-3,
+            geo_plan_penalty=True,
         ),
     ]
 
