@@ -18,6 +18,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn.functional as F
+import gymnasium_robotics
 
 __all__ = [
     "ReplayBuffer",
