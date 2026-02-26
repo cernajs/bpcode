@@ -57,6 +57,7 @@ from utils import (
     preprocess_img,
     set_seed,
 )
+from geom_head import GeoEncoder, temporal_reachability_loss, geo_step_penalty, min_bank_dist
 
 # ===============================
 #  Small helper modules
@@ -421,6 +422,10 @@ class VariantCfg:
     actor_geom_smooth_weight: float = 0.0
     actor_knn_gate: bool = False
 
+    # GELATO fields
+    geo_aux_weight: float = 0.0
+    geo_reward_bonus_weight: float = 0.0
+    geo_plan_penalty_weight: float = 0.0
 
 def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     set_seed(seed)
@@ -486,6 +491,26 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             args.stoch_dim, args.embed_dim, hidden_dim=args.geom_hidden_dim
         ).to(device)
 
+    geo = None
+    geo_bank = None
+
+    if (
+        cfg.geo_aux_weight > 0
+        or cfg.geo_reward_bonus_weight > 0
+        or cfg.geo_plan_penalty_weight > 0
+    ):
+        geo = GeoEncoder(
+            args.deter_dim,
+            args.stoch_dim,
+            geo_dim=args.geo_dim,
+            hidden_dim=args.geom_hidden_dim,
+        ).to(device)
+        geo_bank = LatentBank(
+            capacity=args.geo_bank_capacity,
+            ds=args.geo_dim,
+            device="cpu",
+        )
+
     # Optims
     world_params = (
         list(encoder.parameters())
@@ -494,6 +519,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         + list(reward_model.parameters())
         + list(cont_model.parameters())
         + ([] if phi is None else list(phi.parameters()))
+        + ([] if geo is None else list(geo.parameters()))
     )
     model_optim = torch.optim.Adam(world_params, lr=args.model_lr, eps=args.adam_eps)
     actor_optim = torch.optim.Adam(
@@ -686,6 +712,16 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         cont_logits, cont_target
                     )
 
+                    geo_aux_loss = torch.zeros((), device=device)
+                    if geo is not None and total_steps >= args.geo_learn_after_steps:
+                        g_real = bottle(geo, h_seq, s_seq)  # [B, T, Dg]
+                        geo_aux_loss = temporal_reachability_loss(
+                            g_real,
+                            pos_k=args.geo_pos_k,
+                            neg_k=args.geo_neg_k,
+                            margin=args.geo_margin,
+                        )
+
                     dyn_pb_reg = torch.zeros((), device=device)
                     dyn_pb_bisim = torch.zeros((), device=device)
                     dyn_pb_dz_mean = None
@@ -805,12 +841,19 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         + args.cont_weight * cont_loss
                         + cfg.dyn_pb_reg_weight * dyn_pb_reg
                         + cfg.dyn_pb_bisim_weight * dyn_pb_bisim
+                        + cfg.geo_aux_weight * geo_aux_loss
                     )
 
                     model_optim.zero_grad(set_to_none=True)
                     model_loss.backward()
                     torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip_norm)
                     model_optim.step()
+
+                    if geo is not None:
+                        with torch.no_grad():
+                            g_bank_add = bottle(geo, h_seq.detach(), s_seq.detach()).reshape(-1, args.geo_dim)
+                            g_bank_add = subsample_rows(g_bank_add, args.geo_bank_sample)
+                            geo_bank.add(g_bank_add.cpu())
 
                     # ------------------- Actor-Critic (imagination) -------------------
                     # Choose imagination starts
@@ -1254,6 +1297,28 @@ def parse_args():
     p.add_argument("--expl_amount", type=float, default=0.3)
     p.add_argument("--expl_decay", type=float, default=0.0)
     p.add_argument("--expl_min", type=float, default=0.0)
+
+
+    # Geometry embedding
+    p.add_argument("--geo_dim", type=int, default=32)
+    p.add_argument("--geo_pos_k", type=int, default=3)
+    p.add_argument("--geo_neg_k", type=int, default=12)
+    p.add_argument("--geo_margin", type=float, default=0.25)
+
+    # Bank / frontier bonus
+    p.add_argument("--geo_bank_capacity", type=int, default=50_000)
+    p.add_argument("--geo_bank_sample", type=int, default=512)
+    p.add_argument("--geo_frontier_tau", type=float, default=0.10)
+    p.add_argument("--geo_frontier_cap", type=float, default=1.0)
+
+    # Planning constraint
+    p.add_argument("--geo_step_radius", type=float, default=0.35)
+
+    # Three activation phases (in env steps)
+    p.add_argument("--geo_learn_after_steps", type=int, default=2_000)
+    p.add_argument("--geo_reward_after_steps", type=int, default=10_000)
+    p.add_argument("--geo_plan_after_steps", type=int, default=20_000)
+
 
     # Evaluation
     p.add_argument("--eval_episodes", type=int, default=10)
