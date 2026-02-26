@@ -253,13 +253,7 @@ class PixelObsWrapper(gym.Wrapper):
     """Wrapper for Gymnasium environments to provide pixel observations."""
 
     def __init__(self, env_id: str, img_size=(64, 64), num_stack=1):
-        if "maze" in env_id.lower(): # maze env expose 4d vector without this
-            from gymnasium.wrappers import PixelObservationWrapper, ResizeObservation
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = PixelObservationWrapper(env, pixels_only=True)
-            env = ResizeObservation(env, img_size)
-        else:
-            env = gym.make(env_id, render_mode="rgb_array")
+        env = gym.make(env_id, render_mode="rgb_array")
         super().__init__(env)
         self.img_size = img_size
         self.num_stack = num_stack
