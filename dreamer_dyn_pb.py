@@ -426,6 +426,7 @@ class VariantCfg:
     geo_aux_weight: float = 0.0
     geo_reward_bonus_weight: float = 0.0
     geo_plan_penalty_weight: float = 0.0
+    geo_plan_penalty: bool = False
 
 def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     set_seed(seed)
