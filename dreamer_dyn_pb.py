@@ -720,7 +720,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
                     geo_aux_loss = torch.zeros((), device=device)
                     if geo is not None and total_steps >= args.geo_learn_after_steps:
-                        g_real = bottle(geo, h_seq, s_seq)  # [B, T, Dg]
+                        g_real = bottle(geo, h_seq.detach(), s_seq.detach())  # [B, T, Dg]
                         geo_aux_loss = temporal_reachability_loss(
                             g_real,
                             pos_k=args.geo_pos_k,
@@ -1417,7 +1417,7 @@ def main():
         args.imagination_starts = 4
 
     variants: List[VariantCfg] = [
-        VariantCfg(name="dreamer"),
+        #VariantCfg(name="dreamer"),
         VariantCfg(
             name="dreamer+gelato",
             geo_aux_weight=0.50,
