@@ -512,6 +512,12 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             device="cpu",
         )
 
+    geo_optim = None
+    if geo is not None:
+        geo_optim = torch.optim.Adam(
+            geo.parameters(), lr=args.geo_lr, eps=args.adam_eps
+        )
+
     # Optims
     world_params = (
         list(encoder.parameters())
@@ -520,7 +526,6 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         + list(reward_model.parameters())
         + list(cont_model.parameters())
         + ([] if phi is None else list(phi.parameters()))
-        + ([] if geo is None else list(geo.parameters()))
     )
     model_optim = torch.optim.Adam(world_params, lr=args.model_lr, eps=args.adam_eps)
     actor_optim = torch.optim.Adam(
@@ -842,13 +847,21 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         + args.cont_weight * cont_loss
                         + cfg.dyn_pb_reg_weight * dyn_pb_reg
                         + cfg.dyn_pb_bisim_weight * dyn_pb_bisim
-                        + cfg.geo_aux_weight * geo_aux_loss
+                        #+ cfg.geo_aux_weight * geo_aux_loss
                     )
 
                     model_optim.zero_grad(set_to_none=True)
                     model_loss.backward()
                     torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip_norm)
                     model_optim.step()
+
+                    if geo is not None and geo_optim is not None and cfg.geo_aux_weight > 0:
+                        geo_aux_loss_val = geo_aux_loss
+                        if geo_aux_loss_val.requires_grad:
+                            geo_optim.zero_grad(set_to_none=True)
+                            (cfg.geo_aux_weight * geo_aux_loss_val).backward()
+                            torch.nn.utils.clip_grad_norm_(geo.parameters(), args.grad_clip_norm)
+                            geo_optim.step()
 
                     if geo is not None:
                         with torch.no_grad():
@@ -1043,6 +1056,13 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                             writer.add_scalar("loss/geo_aux", geo_aux_loss.item(), total_steps)
                             writer.add_scalar("train/geo_frontier_bonus", geo_frontier_bonus.mean().item(), total_steps)
                             writer.add_scalar("loss/geo_jump_pen", geo_jump_pen.item(), total_steps)
+
+                            from geom_head import geo_embedding_stats
+                            with torch.no_grad():
+                                g_log = bottle(geo, h_seq.detach(), s_seq.detach())
+                            stats = geo_embedding_stats(g_log)
+                            for k, v in stats.items():
+                                writer.add_scalar(k, v, total_steps)
 
                         if dyn_pb_dz_mean is not None:
                             writer.add_scalar(
@@ -1337,8 +1357,8 @@ def parse_args():
     # Geometry embedding
     p.add_argument("--geo_dim", type=int, default=32)
     p.add_argument("--geo_pos_k", type=int, default=3)
-    p.add_argument("--geo_neg_k", type=int, default=12)
-    p.add_argument("--geo_margin", type=float, default=0.25)
+    #p.add_argument("--geo_neg_k", type=int, default=12)
+    #p.add_argument("--geo_margin", type=float, default=0.25)
 
     # Bank / frontier bonus
     p.add_argument("--geo_bank_capacity", type=int, default=50_000)
@@ -1348,6 +1368,14 @@ def parse_args():
 
     # Planning constraint
     p.add_argument("--geo_step_radius", type=float, default=0.35)
+
+    p.add_argument("--geo_lr", type=float, default=3e-4,
+               help="Separate lr for GeoEncoder (higher than model_lr)")
+    p.add_argument("--geo_margin", type=float, default=0.6,   # was 0.25
+                help="Ranking margin; 0.6 works on unit sphere")
+    p.add_argument("--geo_neg_k", type=int, default=8,        # was 12
+                help="Steps apart to count as negative — reduce if seq_len=50")
+    p.add_argument("--geo_uniformity_weight", type=float, default=0.1)
 
     # Three activation phases (in env steps)
     p.add_argument("--geo_learn_after_steps", type=int, default=2_000)
