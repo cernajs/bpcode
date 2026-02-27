@@ -928,9 +928,10 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     geo_jump_pen = torch.zeros((), device=device)
 
                     if geo is not None:
-                        with torch.no_grad():
-                            # step penalty should shape the actor, not train geo
-                            g_imag = bottle(geo, h_imag.detach(), s_imag.detach())  # [B_im, H+1, Dg]
+                        with no_param_grads(geo):
+                            # freeze geo weights, but keep gradient to h_imag / s_imag
+                            # before no_grad killed grad that shape actor
+                            g_imag = bottle(geo, h_imag, s_imag)
 
                         # reward shaping starts after geometry has had time to learn
                         if total_steps >= args.geo_reward_after_steps and geo_bank is not None and geo_bank.n > 0:
@@ -946,7 +947,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                             rewards_im = rewards_total
 
                         # planning constraint (defined here, applied later)
-                        if total_steps >= args.geo_plan_after_steps and args.geo_plan_penalty:
+                        if total_steps >= args.geo_plan_after_steps and cfg.geo_plan_penalty:
                             geo_jump_pen = geo_step_penalty(g_imag, args.geo_step_radius)
 
                     # Value targets (no grad). Important: value targets should NOT
