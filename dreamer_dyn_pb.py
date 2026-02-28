@@ -379,17 +379,6 @@ def evaluate_actor_policy(
             action, _ = actor.get_action(h, s, deterministic=True)
             a_np = action.squeeze(0).cpu().numpy().astype(np.float32)
 
-            """
-            total_reward = 0.0
-            for _ in range(action_repeat):
-                obs, r, term, trunc, _ = env.step(a_np)
-                total_reward += float(r)
-                if term or trunc:
-                    break
-            done = bool(term or trunc)
-            ep_ret += total_reward
-            """
-
             obs, total_reward, term, trunc, _ = env.step(a_np, repeat=action_repeat)
             done = bool(term or trunc)
             ep_ret += float(total_reward)
@@ -475,13 +464,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         device
     )
 
-    """
-    encoder = torch.compile(encoder)
-    decoder = torch.compile(decoder)
-    rssm = torch.compile(rssm)
-    actor = torch.compile(actor)
-    value_model = torch.compile(value_model)
-    """
+
     rssm_jvp = getattr(rssm, "_orig_mod", rssm)
     
 
@@ -698,14 +681,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     pri_s = torch.stack([p[1] for p in pri_list], dim=0)
                     pos_m = torch.stack([p[0] for p in post_list], dim=0)
                     pos_s = torch.stack([p[1] for p in post_list], dim=0)
-                    """
-                    kld = torch.max(
-                        kl_divergence(Normal(pos_m, pos_s), Normal(pri_m, pri_s)).sum(
-                            -1
-                        ),
-                        free_nats,
-                    ).mean()
-                    """
+
                     # stop grad on each dist as in dreamerv2
                     kl_lhs = kl_divergence(Normal(pos_m.detach(), pos_s.detach()), Normal(pri_m, pri_s))
                     kl_rhs = kl_divergence(Normal(pos_m, pos_s), Normal(pri_m.detach(), pri_s.detach()))
@@ -963,7 +939,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     with torch.no_grad():
                         values_tgt = bottle(value_model, h_imag, s_imag)  # [B_im, H+1]
                         lam_ret_tgt = compute_lambda_returns(
-                            rewards_im_raw.detach(),
+                            rewards_im.detach(),
                             values_tgt,
                             discounts.detach(),
                             lambda_=args.lambda_,
@@ -984,12 +960,6 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
                     # Actor loss
                     actor_entropy_scale = args.actor_entropy_scale
-                    """
-                    dist = actor.get_dist(
-                        h_imag[:, :-1].detach(), s_imag[:, :-1].detach()
-                    )
-                    entropy = dist.entropy().sum(dim=-1).mean()
-                    """
                     # use post tanh entropy
                     mean, std = actor.forward(h_imag[:, :-1].detach(), s_imag[:, :-1].detach())
                     noise = torch.randn_like(mean)
@@ -1000,13 +970,6 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     # Actor objective: maximize imagined returns.
                     # Gradients should flow through rewards/discounts/dynamics, but not
                     # through the value model.
-                    """
-                    with torch.no_grad():
-                        values_for_actor = bottle(
-                            value_model, h_imag, s_imag
-                        )  # detached from graph
-                        w_actor = compute_discount_weights(discounts)  # just weights
-                    """
                     with no_param_grads(value_model):
                         values_for_actor = bottle(
                             value_model, h_imag, s_imag
