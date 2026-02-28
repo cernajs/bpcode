@@ -140,9 +140,17 @@ class LatentBank:
         if x.ndim != 2 or x.size(1) != self.ds:
             raise ValueError("LatentBank.add: wrong shape")
         for row in x:
-            self.buf[self.i].copy_(row)
-            self.i = (self.i + 1) % self.capacity
-            self.n = min(self.n + 1, self.capacity)
+            if self.n < self.capacity:
+                # FIFO: add at next free slot
+                self.buf[self.i].copy_(row)
+                self.i = (self.i + 1) % self.capacity
+                self.n += 1
+            else:
+                # Buffer full: evict the bank point closest to this new point
+                d = torch.cdist(row.unsqueeze(0), self.buf[:self.n])  # [1, n]
+                evict_idx = d.squeeze(0).argmin().item()
+                self.buf[evict_idx].copy_(row)
+            
 
     def sample(self, m: int, device: torch.device) -> torch.Tensor:
         if self.n == 0:
@@ -1362,7 +1370,7 @@ def parse_args():
     #p.add_argument("--geo_margin", type=float, default=0.25)
 
     # Bank / frontier bonus
-    p.add_argument("--geo_bank_capacity", type=int, default=50_000)
+    p.add_argument("--geo_bank_capacity", type=int, default=500_000)
     p.add_argument("--geo_bank_sample", type=int, default=512)
     p.add_argument("--geo_frontier_tau", type=float, default=0.10)
     p.add_argument("--geo_frontier_cap", type=float, default=1.0)
