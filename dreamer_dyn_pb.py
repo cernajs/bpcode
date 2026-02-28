@@ -704,6 +704,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
                     geo_aux_loss = torch.zeros((), device=device)
                     if geo is not None and total_steps >= args.geo_learn_after_steps:
+                        # TODO: maybe let grad flow to world model so geo head doesnt have to do all heavy lifting
                         g_real = bottle(geo, h_seq.detach(), s_seq.detach())  # [B, T, Dg]
                         geo_aux_loss = temporal_reachability_loss(
                             g_real,
@@ -926,7 +927,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                             if args.geo_frontier_cap > 0:
                                 geo_frontier_bonus = geo_frontier_bonus.clamp(max=args.geo_frontier_cap)
 
-                            rewards_total = rewards_total + cfg.geo_reward_bonus_weight * geo_frontier_bonus
+                            bonus_weight = cfg.geo_reward_bonus_weight * max(0.05, 1.0 - total_steps / 200_000)
+                            rewards_total = rewards_total + bonus_weight * geo_frontier_bonus
 
                             rewards_im = rewards_total
 
@@ -1334,8 +1336,8 @@ def parse_args():
 
     # Bank / frontier bonus
     p.add_argument("--geo_bank_capacity", type=int, default=500_000)
-    p.add_argument("--geo_bank_sample", type=int, default=512)
-    p.add_argument("--geo_frontier_tau", type=float, default=0.10)
+    p.add_argument("--geo_bank_sample", type=int, default=2048)
+    p.add_argument("--geo_frontier_tau", type=float, default=0.30)
     p.add_argument("--geo_frontier_cap", type=float, default=1.0)
 
     # Planning constraint
@@ -1388,7 +1390,7 @@ def main():
         args.imagination_starts = 4
 
     variants: List[VariantCfg] = [
-        #VariantCfg(name="dreamer"),
+        VariantCfg(name="dreamer"),
         VariantCfg(
             name="dreamer+gelato",
             geo_aux_weight=0.50,
