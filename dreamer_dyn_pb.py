@@ -1419,7 +1419,7 @@ def main():
         args.imagination_starts = 4
 
     variants: List[VariantCfg] = [
-        VariantCfg(name="dreamer"),
+        #VariantCfg(name="dreamer"),
         VariantCfg(
             name="dreamer+gelato",
             geo_aux_weight=0.50,
