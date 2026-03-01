@@ -50,6 +50,12 @@ ENV_ACTION_REPEAT = {
     # Gymnasium fallbacks
     "Pendulum-v1": 2,
     "MountainCarContinuous-v0": 4,
+    # Custom point mazes (no repeat needed)
+    "custom_maze:corridor": 1,
+    "custom_maze:two_room": 1,
+    "custom_maze:loop": 1,
+    "custom_maze:four_room": 1,
+    "custom_maze:spiral": 1,
 }
 
 
@@ -420,11 +426,16 @@ class DMControlWrapper:
 
 def make_env(env_id: str, img_size=(64, 64), num_stack=1):
     """
-    Create environment - supports both dm_control (domain-task format) and gymnasium.
+    Create environment - supports dm_control, gymnasium, and custom point mazes.
 
+    Custom mazes:  "custom_maze:corridor", "custom_maze:loop", etc.
     dm_control envs: "cheetah-run", "reacher-easy", "ball_in_cup-catch", "finger-spin", "cartpole-swingup", "walker-walk"
     gymnasium envs: "Pendulum-v1", "MountainCarContinuous-v0", etc.
     """
+    if env_id.startswith("custom_maze:"):
+        from maze_env import PointMazeEnv
+        layout = env_id.split(":", 1)[1]
+        return PointMazeEnv(layout=layout, img_size=img_size)
     if "maze" in env_id.lower():
         return PixelObsWrapper(env_id, img_size=img_size, num_stack=num_stack)
     # Check if it's a dm_control env (contains hyphen but no version suffix like -v1)
