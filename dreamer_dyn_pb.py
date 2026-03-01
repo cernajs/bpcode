@@ -134,22 +134,51 @@ class LatentBank:
         self.n = 0
         self.i = 0
 
-    def add(self, x: torch.Tensor):
-        # x: [N, Ds] (cpu float32 preferred)
+    def add(self, x: torch.Tensor, min_dist: float = 0.0):
         x = x.detach().to(self.device, dtype=torch.float32)
         if x.ndim != 2 or x.size(1) != self.ds:
             raise ValueError("LatentBank.add: wrong shape")
-        for row in x:
-            if self.n < self.capacity:
-                # FIFO: add at next free slot
-                self.buf[self.i].copy_(row)
-                self.i = (self.i + 1) % self.capacity
-                self.n += 1
+        
+        if self.n == 0:
+            # Empty bank — add all points directly via vectorized write
+            n_add = min(len(x), self.capacity)
+            self.buf[:n_add].copy_(x[:n_add])
+            self.n = n_add
+            self.i = n_add % self.capacity
+            return
+
+        if min_dist > 0 and self.n > 0:
+            # Vectorized filter: compute all distances at once, keep only novel points
+            bank_filled = self.buf[:self.n]
+            # Subsample bank for speed if large
+            if self.n > 2048:
+                idx = torch.randperm(self.n, device=self.device)[:2048]
+                bank_sub = bank_filled[idx]
             else:
-                # Buffer full: evict the bank point closest to this new point
-                d = torch.cdist(row.unsqueeze(0), self.buf[:self.n])  # [1, n]
-                evict_idx = d.squeeze(0).argmin().item()
-                self.buf[evict_idx].copy_(row)
+                bank_sub = bank_filled
+            dists = torch.cdist(x, bank_sub).min(dim=1).values  # [N]
+            x = x[dists > min_dist]
+        
+        if len(x) == 0:
+            return
+        
+        # Vectorized FIFO write — no Python loop
+        N = len(x)
+        capacity = self.capacity
+        if N >= capacity:
+            x = x[-capacity:]
+            N = capacity
+        
+        end = self.i + N
+        if end <= capacity:
+            self.buf[self.i:end].copy_(x)
+        else:
+            first = capacity - self.i
+            self.buf[self.i:].copy_(x[:first])
+            self.buf[:end - capacity].copy_(x[first:])
+        
+        self.i = end % capacity
+        self.n = min(self.n + N, capacity)
             
 
     def sample(self, m: int, device: torch.device) -> torch.Tensor:
@@ -852,7 +881,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         with torch.no_grad():
                             g_bank_add = bottle(geo, h_seq.detach(), s_seq.detach()).reshape(-1, args.geo_dim)
                             g_bank_add = subsample_rows(g_bank_add, args.geo_bank_sample)
-                            geo_bank.add(g_bank_add.cpu())
+                            geo_bank.add(g_bank_add.cpu(), min_dist=0.15)
 
                     # ------------------- Actor-Critic (imagination) -------------------
                     # Choose imagination starts
