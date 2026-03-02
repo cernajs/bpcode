@@ -23,7 +23,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -35,7 +35,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats as sp_stats
 
-from maze_env import MAZE_LAYOUTS, PointMazeEnv, generate_random_maze
+from maze_env import MAZE_LAYOUTS, GeodesicComputer, PointMazeEnv, generate_random_maze
 from models import (
     RSSM,
     Actor,
@@ -91,6 +91,13 @@ class TrainCfg:
     geo_pos_k: int = 3
     geo_neg_k: int = 8
     geo_margin: float = 0.6
+    # Optional: geodesic-supervised GeoEncoder variant
+    geo_sup_epochs: int = 200
+    geo_sup_batch: int = 256
+    geo_sup_candidates: int = 64
+    geo_sup_margin: float = 0.2
+    geo_sup_uniformity_weight: float = 0.1
+    geo_sup_uniformity_t: float = 2.0
     collect_episodes: int = 60
     n_probe_epochs: int = 1500
     n_pairs: int = 8000
@@ -394,6 +401,103 @@ def train_geo_encoder(data: dict, cfg: TrainCfg, device: torch.device):
 
 
 # ===================================================================
+#  3b. Optional: geodesic-supervised GeoEncoder training
+# ===================================================================
+
+def _positions_to_cell_indices(geodesic: "GeodesicComputer", pos: np.ndarray) -> np.ndarray:
+    """Map continuous (x,y) positions to free-cell indices used by geodesic.dist_matrix."""
+    # geodesic.pos_to_cell expects (x,y) but returns (row,col)
+    cells = [geodesic.pos_to_cell(float(p[0]), float(p[1])) for p in pos]
+    return np.asarray([geodesic.cell_to_idx[c] for c in cells], dtype=np.int64)
+
+
+def _uniformity_loss_sphere(g: torch.Tensor, t: float = 2.0, max_uni: int = 256) -> torch.Tensor:
+    """Wang & Isola-style uniformity: logsumexp(-t * ||g_i - g_j||^2)."""
+    g_flat = g.reshape(-1, g.shape[-1])
+    n = g_flat.size(0)
+    if n <= 2:
+        return g.new_zeros(())
+    if n > max_uni:
+        idx = torch.randperm(n, device=g.device)[:max_uni]
+        g_flat = g_flat[idx]
+    sq = torch.cdist(g_flat, g_flat).pow(2)
+    mask = torch.eye(sq.size(0), device=g.device, dtype=torch.bool)
+    sq = sq.masked_fill(mask, 1e9)
+    return torch.logsumexp(-t * sq, dim=1).mean()
+
+
+def train_geo_encoder_geodesic(
+    data: dict,
+    cfg: TrainCfg,
+    device: torch.device,
+    geodesic: "GeodesicComputer",
+):
+    """Train GeoEncoder so ||g_i - g_j|| preserves geodesic ordering (triplet ranking)."""
+    geo = GeoEncoder(cfg.deter_dim, cfg.stoch_dim, geo_dim=cfg.geo_dim, hidden_dim=cfg.geo_hidden).to(device)
+    opt = torch.optim.Adam(geo.parameters(), lr=cfg.geo_lr)
+
+    pos = data["pos"]
+    h = data["h"]
+    s = data["s"]
+    N = len(pos)
+    if N < 512:
+        print("    WARNING: not enough points for geodesic-supervised GeoEncoder; skipping")
+        geo.eval()
+        return geo
+
+    cell_idx = _positions_to_cell_indices(geodesic, pos)
+    dist_mat = geodesic.dist_matrix  # numpy array [n_free, n_free]
+
+    for epoch in range(cfg.geo_sup_epochs):
+        # anchors and candidate pool
+        B = min(cfg.geo_sup_batch, N)
+        anchors = np.random.randint(0, N, size=B)
+        cand = np.random.randint(0, N, size=(B, cfg.geo_sup_candidates))
+
+        a_cell = cell_idx[anchors]  # [B]
+        c_cell = cell_idx[cand]     # [B, C]
+        d_geo = dist_mat[a_cell[:, None], c_cell]  # [B, C]
+
+        # avoid selecting self as positive
+        same = cand == anchors[:, None]
+        d_geo = np.where(same, np.inf, d_geo)
+
+        # positives: nearest geodesic; negatives: farthest geodesic
+        pos_j = cand[np.arange(B), np.argmin(d_geo, axis=1)]
+        neg_j = cand[np.arange(B), np.argmax(d_geo, axis=1)]
+
+        bh = torch.tensor(h[anchors], dtype=torch.float32, device=device)
+        bs = torch.tensor(s[anchors], dtype=torch.float32, device=device)
+        ph = torch.tensor(h[pos_j], dtype=torch.float32, device=device)
+        ps = torch.tensor(s[pos_j], dtype=torch.float32, device=device)
+        nh = torch.tensor(h[neg_j], dtype=torch.float32, device=device)
+        ns = torch.tensor(s[neg_j], dtype=torch.float32, device=device)
+
+        g_a = geo(bh, bs)
+        g_p = geo(ph, ps)
+        g_n = geo(nh, ns)
+
+        d_pos = torch.norm(g_a - g_p, dim=-1)
+        d_neg = torch.norm(g_a - g_n, dim=-1)
+        loss_rank = F.relu(d_pos + cfg.geo_sup_margin - d_neg).mean()
+        loss_uni = _uniformity_loss_sphere(g_a, t=cfg.geo_sup_uniformity_t)
+        loss = loss_rank + cfg.geo_sup_uniformity_weight * loss_uni
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        if (epoch + 1) % max(1, cfg.geo_sup_epochs // 3) == 0:
+            print(
+                f"    GeoSup epoch {epoch+1}/{cfg.geo_sup_epochs}  "
+                f"rank={loss_rank.item():.4f}  uni={loss_uni.item():.4f}  total={loss.item():.4f}"
+            )
+
+    geo.eval()
+    return geo
+
+
+# ===================================================================
 #  4. Probing — position decoding R²
 # ===================================================================
 
@@ -440,24 +544,36 @@ def _train_probe(probe, X_train, Y_train, X_test, Y_test, device, epochs=1500, l
     return r2
 
 
-def run_probes(data: dict, geo_encoder: nn.Module, cfg: TrainCfg, device: torch.device):
-    """Train linear + MLP probes on h, s, (h,s), g  ->  (x,y)."""
-    pos = data["pos"]
+def _build_feature_dict(
+    data: dict,
+    device: torch.device,
+    geo_temporal: Optional[nn.Module] = None,
+    geo_geodesic: Optional[nn.Module] = None,
+) -> Dict[str, np.ndarray]:
+    """Compute all feature representations to evaluate."""
     h = data["h"]
     s = data["s"]
-    hs = np.concatenate([h, s], axis=-1)
+    feats: Dict[str, np.ndarray] = {"h": h, "s": s, "h+s": np.concatenate([h, s], axis=-1)}
+    if geo_temporal is not None:
+        with torch.no_grad():
+            ht = torch.tensor(h, dtype=torch.float32, device=device)
+            st = torch.tensor(s, dtype=torch.float32, device=device)
+            feats["g(h,s)"] = geo_temporal(ht, st).cpu().numpy()
+    if geo_geodesic is not None:
+        with torch.no_grad():
+            ht = torch.tensor(h, dtype=torch.float32, device=device)
+            st = torch.tensor(s, dtype=torch.float32, device=device)
+            feats["g_geo(h,s)"] = geo_geodesic(ht, st).cpu().numpy()
+    return feats
 
-    with torch.no_grad():
-        ht = torch.tensor(h, dtype=torch.float32, device=device)
-        st = torch.tensor(s, dtype=torch.float32, device=device)
-        g = geo_encoder(ht, st).cpu().numpy()
 
+def run_probes(pos: np.ndarray, features: Dict[str, np.ndarray], cfg: TrainCfg, device: torch.device):
+    """Train linear + MLP probes on each feature -> (x,y)."""
     N = len(pos)
     idx = np.random.permutation(N)
     split = int(0.8 * N)
     tr, te = idx[:split], idx[split:]
 
-    features = {"h": h, "s": s, "h+s": hs, "g(h,s)": g}
     results = {}
     for name, feat in features.items():
         r2_lin = _train_probe(_LinearProbe(feat.shape[1]), feat[tr], pos[tr], feat[te], pos[te],
@@ -473,19 +589,9 @@ def run_probes(data: dict, geo_encoder: nn.Module, cfg: TrainCfg, device: torch.
 #  5. Distance analysis
 # ===================================================================
 
-def run_distance_analysis(data: dict, geo_encoder: nn.Module, geodesic: "GeodesicComputer",
-                          cfg: TrainCfg, device: torch.device):
+def run_distance_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geodesic: "GeodesicComputer",
+                          cfg: TrainCfg):
     """Pearson / Spearman of latent distance vs geodesic distance."""
-    pos = data["pos"]
-    h = data["h"]
-    s = data["s"]
-    hs = np.concatenate([h, s], axis=-1)
-
-    with torch.no_grad():
-        ht = torch.tensor(h, dtype=torch.float32, device=device)
-        st = torch.tensor(s, dtype=torch.float32, device=device)
-        g = geo_encoder(ht, st).cpu().numpy()
-
     N = len(pos)
     n_pairs = min(cfg.n_pairs, N * (N - 1) // 2)
     i1 = np.random.randint(0, N, n_pairs)
@@ -497,7 +603,6 @@ def run_distance_analysis(data: dict, geo_encoder: nn.Module, geodesic: "Geodesi
     valid = np.isfinite(geo_d) & (geo_d > 0)
     i1, i2, geo_d = i1[valid], i2[valid], geo_d[valid]
 
-    features = {"h": h, "s": s, "h+s": hs, "g(h,s)": g}
     results = {}
     for name, feat in features.items():
         lat_d = np.linalg.norm(feat[i1] - feat[i2], axis=1)
@@ -515,18 +620,9 @@ def run_distance_analysis(data: dict, geo_encoder: nn.Module, geodesic: "Geodesi
 #  6. Neighbourhood analysis — kNN overlap
 # ===================================================================
 
-def run_knn_analysis(data: dict, geo_encoder: nn.Module, geodesic: "GeodesicComputer",
-                     cfg: TrainCfg, device: torch.device):
+def run_knn_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geodesic: "GeodesicComputer",
+                     cfg: TrainCfg):
     """Fraction of k-nearest-neighbours shared between latent and geodesic spaces."""
-    pos = data["pos"]
-    h, s = data["h"], data["s"]
-    hs = np.concatenate([h, s], axis=-1)
-
-    with torch.no_grad():
-        ht = torch.tensor(h, dtype=torch.float32, device=device)
-        st = torch.tensor(s, dtype=torch.float32, device=device)
-        g = geo_encoder(ht, st).cpu().numpy()
-
     # Sub-sample for tractability
     N = min(800, len(pos))
     idx = np.random.choice(len(pos), N, replace=False)
@@ -536,9 +632,9 @@ def run_knn_analysis(data: dict, geo_encoder: nn.Module, geodesic: "GeodesicComp
     np.fill_diagonal(geo_dm, np.inf)
     geo_knn = np.argsort(geo_dm, axis=1)[:, :cfg.knn_k]
 
-    features = {"h": h[idx], "s": s[idx], "h+s": hs[idx], "g(h,s)": g[idx]}
     results = {}
-    for name, feat in features.items():
+    for name, feat_full in features.items():
+        feat = feat_full[idx]
         dm = np.linalg.norm(feat[:, None, :] - feat[None, :, :], axis=-1)
         np.fill_diagonal(dm, np.inf)
         lat_knn = np.argsort(dm, axis=1)[:, :cfg.knn_k]
@@ -558,23 +654,28 @@ def _pca_2d(X):
     return X @ Vt[:2].T
 
 
-def generate_plots(maze_name: str, data: dict, probe_res: dict, dist_res: dict,
-                   dist_raw: tuple, knn_res: dict, geo_encoder: nn.Module,
-                   env: PointMazeEnv, cfg: TrainCfg, device: torch.device, out_dir: str):
+def generate_plots(
+    maze_name: str,
+    pos: np.ndarray,
+    features: Dict[str, np.ndarray],
+    probe_res: dict,
+    dist_res: dict,
+    dist_raw: tuple,
+    knn_res: dict,
+    cfg: TrainCfg,
+    device: torch.device,
+    out_dir: str,
+):
     """Generate all per-maze figures."""
     os.makedirs(out_dir, exist_ok=True)
-    pos = data["pos"]
-    h, s = data["h"], data["s"]
-    hs = np.concatenate([h, s], axis=-1)
-
-    with torch.no_grad():
-        ht = torch.tensor(h, dtype=torch.float32, device=device)
-        st = torch.tensor(s, dtype=torch.float32, device=device)
-        g = geo_encoder(ht, st).cpu().numpy()
+    feat_items = list(features.items())
+    n_feat = len(feat_items)
 
     # --- Figure 1: PCA embeddings coloured by x, y ---
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-    for col, (name, feat) in enumerate([("h", h), ("s", s), ("h+s", hs), ("g(h,s)", g)]):
+    fig, axes = plt.subplots(2, n_feat, figsize=(5 * n_feat, 10))
+    if n_feat == 1:
+        axes = np.asarray(axes).reshape(2, 1)
+    for col, (name, feat) in enumerate(feat_items):
         z2d = _pca_2d(feat)
         for row, (coord_name, coord_idx) in enumerate([("x", 0), ("y", 1)]):
             ax = axes[row, col]
@@ -589,7 +690,9 @@ def generate_plots(maze_name: str, data: dict, probe_res: dict, dist_res: dict,
 
     # --- Figure 2: Distance scatter (latent vs geodesic) ---
     i1, i2, geo_d, features = dist_raw
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig, axes = plt.subplots(1, len(features), figsize=(5 * len(features), 5))
+    if len(features) == 1:
+        axes = [axes]
     for col, (name, feat) in enumerate(features.items()):
         lat_d = np.linalg.norm(feat[i1] - feat[i2], axis=1)
         ax = axes[col]
@@ -632,8 +735,10 @@ def generate_plots(maze_name: str, data: dict, probe_res: dict, dist_res: dict,
     plt.close(fig)
 
     # --- Figure 5: Position heatmap (predicted vs true) ---
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-    for col, (name, feat) in enumerate([("h", h), ("s", s), ("h+s", hs), ("g(h,s)", g)]):
+    fig, axes = plt.subplots(1, n_feat, figsize=(5 * n_feat, 5))
+    if n_feat == 1:
+        axes = [axes]
+    for col, (name, feat) in enumerate(feat_items):
         probe = _MLPProbe(feat.shape[1]).to(device)
         N = len(pos)
         idx_all = np.random.permutation(N)
@@ -659,15 +764,22 @@ def generate_summary_plots(all_results: dict, out_dir: str):
     """Cross-maze comparison figures."""
     os.makedirs(out_dir, exist_ok=True)
     mazes = list(all_results.keys())
-    feat_names = ["h", "s", "h+s", "g(h,s)"]
+    # Union of feature names across mazes, stable ordering
+    feat_set = set()
+    for m in mazes:
+        feat_set.update(all_results[m].get("probes", {}).keys())
+    base = ["h", "s", "h+s"]
+    extra = sorted([f for f in feat_set if f not in base])
+    feat_names = [f for f in base if f in feat_set] + extra
+    n_feat = max(1, len(feat_names))
 
     # --- Summary 1: MLP R² across mazes ---
     fig, ax = plt.subplots(figsize=(10, 6))
     x = np.arange(len(mazes))
-    w = 0.18
+    w = min(0.18, 0.80 / n_feat)
     for i, fn in enumerate(feat_names):
         vals = [all_results[m]["probes"].get(fn, {}).get("mlp_R2", 0) for m in mazes]
-        ax.bar(x + (i - 1.5) * w, vals, w, label=fn)
+        ax.bar(x + (i - (n_feat - 1) / 2) * w, vals, w, label=fn)
     ax.set_xticks(x); ax.set_xticklabels(mazes, rotation=15)
     ax.set_ylabel("MLP Probe R²"); ax.set_title("Position Decoding R² by Maze and Feature")
     ax.set_ylim(0, 1.05); ax.legend(); ax.grid(axis="y", alpha=0.3)
@@ -679,7 +791,7 @@ def generate_summary_plots(all_results: dict, out_dir: str):
     fig, ax = plt.subplots(figsize=(10, 6))
     for i, fn in enumerate(feat_names):
         vals = [all_results[m]["distances"].get(fn, {}).get("spearman_rho", 0) for m in mazes]
-        ax.bar(x + (i - 1.5) * w, vals, w, label=fn)
+        ax.bar(x + (i - (n_feat - 1) / 2) * w, vals, w, label=fn)
     ax.set_xticks(x); ax.set_xticklabels(mazes, rotation=15)
     ax.set_ylabel("Spearman ρ (latent vs geodesic)")
     ax.set_title("Distance Preservation by Maze and Feature")
@@ -692,7 +804,7 @@ def generate_summary_plots(all_results: dict, out_dir: str):
     fig, ax = plt.subplots(figsize=(10, 6))
     for i, fn in enumerate(feat_names):
         vals = [all_results[m]["knn"].get(fn, 0) for m in mazes]
-        ax.bar(x + (i - 1.5) * w, vals, w, label=fn)
+        ax.bar(x + (i - (n_feat - 1) / 2) * w, vals, w, label=fn)
     ax.set_xticks(x); ax.set_xticklabels(mazes, rotation=15)
     ax.set_ylabel("kNN Overlap"); ax.set_title("Neighbourhood Preservation by Maze and Feature")
     ax.set_ylim(0, 1.05); ax.legend(); ax.grid(axis="y", alpha=0.3)
@@ -728,17 +840,25 @@ def run_single_maze(maze_name: str, cfg: TrainCfg, device: torch.device, out_roo
     print("\n  [2/5] Collecting position-latent data ...")
     data = collect_data(env, models, cfg, device)
 
-    print("\n  [3/5] Training GeoEncoder (post-hoc) ...")
-    geo_enc = train_geo_encoder(data, cfg, device)
+    print("\n  [3/5] Training GeoEncoder (post-hoc, temporal) ...")
+    geo_temporal = train_geo_encoder(data, cfg, device)
 
     print("\n  [4/5] Running analyses ...")
-    probe_res = run_probes(data, geo_enc, cfg, device)
-    dist_res, dist_raw = run_distance_analysis(data, geo_enc, env.geodesic, cfg, device)
-    knn_res = run_knn_analysis(data, geo_enc, env.geodesic, cfg, device)
+    geo_geo = None
+    if cfg.geo_sup_epochs > 0 and getattr(cfg, "_do_geo_supervised", False):
+        print("    Training GeoEncoder (geodesic-supervised) ...")
+        geo_geo = train_geo_encoder_geodesic(data, cfg, device, env.geodesic)
+
+    pos = data["pos"]
+    feat_dict = _build_feature_dict(data, device, geo_temporal=geo_temporal, geo_geodesic=geo_geo)
+
+    probe_res = run_probes(pos, feat_dict, cfg, device)
+    dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg)
+    knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg)
 
     print("\n  [5/5] Generating plots ...")
-    generate_plots(maze_name, data, probe_res, dist_res, dist_raw, knn_res,
-                   geo_enc, env, cfg, device, out_dir)
+    generate_plots(maze_name, pos, feat_dict, probe_res, dist_res, dist_raw, knn_res,
+                   cfg, device, out_dir)
 
     env.close()
 
@@ -760,6 +880,11 @@ def parse_args():
     p.add_argument("--output_dir", default="maze_geometry_results")
     p.add_argument("--quick", action="store_true", help="Fast sanity-check run")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--geo_supervised",
+        action="store_true",
+        help="Also train a GeoEncoder supervised by ground-truth geodesic distances",
+    )
     return p.parse_args()
 
 
@@ -782,6 +907,12 @@ def main():
         cfg.n_probe_epochs = 600
         cfg.n_pairs = 3000
         cfg.replay_capacity = 40_000
+        cfg.geo_sup_epochs = 80
+        cfg.geo_sup_batch = 192
+        cfg.geo_sup_candidates = 48
+
+    # attach run-time flag without expanding dataclass API further
+    cfg._do_geo_supervised = bool(args.geo_supervised)
 
     print(f"Device: {device}")
     print(f"Mazes:  {args.mazes}")
@@ -807,7 +938,11 @@ def main():
     print("-" * len(header))
     for maze in args.mazes:
         r = all_results[maze]
-        for fn in ["h", "s", "h+s", "g(h,s)"]:
+        feat_set = set(r.get("probes", {}).keys())
+        base = ["h", "s", "h+s"]
+        extra = sorted([f for f in feat_set if f not in base])
+        feat_names = [f for f in base if f in feat_set] + extra
+        for fn in feat_names:
             pr = r["probes"].get(fn, {})
             dr = r["distances"].get(fn, {})
             knn = r["knn"].get(fn, 0)
