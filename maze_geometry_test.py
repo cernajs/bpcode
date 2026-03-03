@@ -506,6 +506,69 @@ def _positions_to_cell_indices(geodesic: "GeodesicComputer", pos: np.ndarray) ->
     return np.asarray([geodesic.cell_to_idx[c] for c in cells], dtype=np.int64)
 
 
+def _adj_from_distmat(dist_mat: np.ndarray):
+    """Build adjacency list of free-cell graph from geodesic.dist_matrix == 1 edges."""
+    n = dist_mat.shape[0]
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        js = np.where(dist_mat[i] == 1)[0]
+        adj[i] = [int(j) for j in js]
+    return adj
+
+
+def _find_bridges(adj):
+    """Tarjan-style bridge finder: edges whose removal disconnects the graph."""
+    n = len(adj)
+    tin = [-1] * n
+    low = [-1] * n
+    timer = 0
+    bridges = set()
+
+    def dfs(v, p):
+        nonlocal timer
+        tin[v] = low[v] = timer
+        timer += 1
+        for to in adj[v]:
+            if to == p:
+                continue
+            if tin[to] != -1:
+                low[v] = min(low[v], tin[to])
+            else:
+                dfs(to, v)
+                low[v] = min(low[v], low[to])
+                if low[to] > tin[v]:
+                    a, b = (v, to) if v < to else (to, v)
+                    bridges.add((a, b))
+
+    for v in range(n):
+        if tin[v] == -1:
+            dfs(v, -1)
+    return bridges
+
+
+def _components_without_bridges(adj, bridges):
+    """Connected components after removing bridge edges (\"rooms\")."""
+    n = len(adj)
+    comp = [-1] * n
+    cid = 0
+    for i in range(n):
+        if comp[i] != -1:
+            continue
+        q = [i]
+        comp[i] = cid
+        while q:
+            v = q.pop()
+            for to in adj[v]:
+                a, b = (v, to) if v < to else (to, v)
+                if (a, b) in bridges:
+                    continue
+                if comp[to] == -1:
+                    comp[to] = cid
+                    q.append(to)
+        cid += 1
+    return np.array(comp, dtype=np.int64), cid
+
+
 def _uniformity_loss_sphere(g: torch.Tensor, t: float = 2.0, max_uni: int = 256) -> torch.Tensor:
     """Wang & Isola-style uniformity: logsumexp(-t * ||g_i - g_j||^2)."""
     g_flat = g.reshape(-1, g.shape[-1])
@@ -991,17 +1054,39 @@ def compute_sanity_metrics(
     geodesic: "GeodesicComputer",
     cfg: TrainCfg,
 ) -> dict:
-    """Compute coverage and representation variance; set failed if below thresholds."""
+    """Compute coverage, room coverage, representation variance; set failed if below thresholds."""
     pos = data["pos"]
     h = data["h"]
     encoder_emb = data.get("encoder_emb")
 
-    # Coverage: fraction of free cells visited
-    cells_visited = set()
-    for i in range(len(pos)):
-        r, c = geodesic.pos_to_cell(float(pos[i, 0]), float(pos[i, 1]))
-        cells_visited.add((r, c))
-    coverage = len(cells_visited) / max(geodesic.n_free, 1)
+    # Cell coverage: fraction of free cells visited
+    cell_idx_all = _positions_to_cell_indices(geodesic, pos)
+    unique_cells = set(int(c) for c in cell_idx_all)
+    coverage = len(unique_cells) / max(geodesic.n_free, 1)
+
+    # Rooms / bottlenecks: compute from free-cell graph
+    dist_mat = geodesic.dist_matrix
+    adj = _adj_from_distmat(dist_mat)
+    bridges = _find_bridges(adj)
+    comp_id, n_rooms = _components_without_bridges(adj, bridges)
+    visited_rooms = set(int(comp_id[int(c)]) for c in cell_idx_all)
+    room_coverage = len(visited_rooms) / max(n_rooms, 1)
+
+    # Bridge crossings along trajectories (how often we pass through doors)
+    bridge_crossings = 0
+    traj_pos = data.get("traj_pos", [])
+    for traj in traj_pos:
+        if len(traj) < 2:
+            continue
+        cells_traj = _positions_to_cell_indices(geodesic, traj)
+        for t in range(len(cells_traj) - 1):
+            u = int(cells_traj[t])
+            v = int(cells_traj[t + 1])
+            if u == v:
+                continue
+            a, b = (u, v) if u < v else (v, u)
+            if (a, b) in bridges:
+                bridge_crossings += 1
 
     # Representation variance: mean over dimensions of var across samples (avoid collapse)
     var_h = float(np.mean(np.var(h, axis=0)))
@@ -1012,10 +1097,14 @@ def compute_sanity_metrics(
 
     return {
         "coverage": round(coverage, 4),
+        "room_coverage": round(room_coverage, 4),
+        "n_rooms_total": int(n_rooms),
+        "n_rooms_visited": int(len(visited_rooms)),
+        "bridge_crossings": int(bridge_crossings),
         "var_h": round(var_h, 6),
         "var_encoder_e": round(var_encoder_e, 6),
         "failed": failed,
-        "n_cells_visited": len(cells_visited),
+        "n_cells_visited": len(unique_cells),
         "n_free": geodesic.n_free,
     }
 
@@ -1051,9 +1140,13 @@ def run_single_maze(maze_name: str, cfg: TrainCfg, device: torch.device, out_roo
     data = collect_data(env, models, cfg, device)
 
     sanity = compute_sanity_metrics(data, env.geodesic, cfg)
-    print(f"    Sanity: coverage={sanity['coverage']:.2%} ({sanity['n_cells_visited']}/{sanity['n_free']})  "
-          f"var_h={sanity['var_h']:.2e}  var_encoder_e={sanity['var_encoder_e']:.2e}  "
-          f"{'FAILED' if sanity['failed'] else 'ok'}")
+    print(
+        f"    Sanity: cells={sanity['coverage']:.2%} ({sanity['n_cells_visited']}/{sanity['n_free']})  "
+        f"rooms={sanity['room_coverage']:.2%} ({sanity['n_rooms_visited']}/{sanity['n_rooms_total']})  "
+        f"bridges={sanity['bridge_crossings']}  "
+        f"var_h={sanity['var_h']:.2e}  var_encoder_e={sanity['var_encoder_e']:.2e}  "
+        f"{'FAILED' if sanity['failed'] else 'ok'}"
+    )
 
     print("\n  [3/5] Training GeoEncoder (post-hoc, temporal) ...")
     geo_temporal = train_geo_encoder(data, cfg, device, env.geodesic)
