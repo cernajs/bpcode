@@ -106,6 +106,9 @@ class TrainCfg:
     geo_sup_margin: float = 0.2
     geo_sup_uniformity_weight: float = 0.1
     geo_sup_uniformity_t: float = 2.0
+    # Pairwise stress (MDS-like): directly targets distance shape / Spearman
+    geo_sup_stress_weight: float = 1.0
+    geo_sup_stress_eps: float = 0.5   # 1/(d_geo+eps) weighting
     collect_episodes: int = 60
     n_probe_epochs: int = 1500
     n_pairs: int = 8000
@@ -524,9 +527,16 @@ def train_geo_encoder_geodesic(
     device: torch.device,
     geodesic: "GeodesicComputer",
 ):
-    """Train GeoEncoder so ||g_i - g_j|| preserves geodesic ordering (triplet ranking)."""
+    """Train GeoEncoder so ||g_i - g_j|| matches geodesic distance shape (pairwise stress + uniformity).
+
+    Uses MDS/Sammon-like pairwise stress: weighted (d_latent - scale*d_geo)^2 with
+    weight = 1/(d_geo+eps) to emphasize local pairs. Directly targets the distance
+    metric we evaluate (Spearman).
+    """
     geo = GeoEncoder(cfg.deter_dim, cfg.stoch_dim, geo_dim=cfg.geo_dim, hidden_dim=cfg.geo_hidden).to(device)
-    opt = torch.optim.Adam(geo.parameters(), lr=cfg.geo_lr)
+    # Learnable scale: g is unit-normalized so d_lat in [0,2]; d_geo can be 1..30+
+    scale = torch.nn.Parameter(torch.tensor(0.1, device=device))
+    opt = torch.optim.Adam(list(geo.parameters()) + [scale], lr=cfg.geo_lr)
 
     pos = data["pos"]
     h = data["h"]
@@ -539,41 +549,44 @@ def train_geo_encoder_geodesic(
 
     cell_idx = _positions_to_cell_indices(geodesic, pos)
     dist_mat = geodesic.dist_matrix  # numpy array [n_free, n_free]
+    eps = cfg.geo_sup_stress_eps
 
     for epoch in range(cfg.geo_sup_epochs):
-        # anchors and candidate pool
         B = min(cfg.geo_sup_batch, N)
-        anchors = np.random.randint(0, N, size=B)
-        cand = np.random.randint(0, N, size=(B, cfg.geo_sup_candidates))
+        # Sample B pairs (i, j) with i != j
+        ii = np.random.randint(0, N, size=B)
+        jj = np.random.randint(0, N, size=B)
+        same = ii == jj
+        jj[same] = (jj[same] + 1) % N  # ensure i != j
+        jj = np.clip(jj, 0, N - 1)
 
-        a_cell = cell_idx[anchors]  # [B]
-        c_cell = cell_idx[cand]     # [B, C]
-        d_geo = dist_mat[a_cell[:, None], c_cell]  # [B, C]
+        c_i = cell_idx[ii]
+        c_j = cell_idx[jj]
+        d_geo_np = dist_mat[c_i, c_j].astype(np.float32)
+        valid = np.isfinite(d_geo_np) & (d_geo_np > 0)
+        if valid.sum() < 4:
+            continue
+        # Use only valid pairs (re-index to contiguous for this batch)
+        ii, jj, d_geo_np = ii[valid], jj[valid], d_geo_np[valid]
+        B = len(ii)
 
-        # avoid selecting self as positive
-        same = cand == anchors[:, None]
-        d_geo = np.where(same, np.inf, d_geo)
+        d_geo_t = torch.tensor(d_geo_np, device=device, dtype=torch.float32)
+        weight = 1.0 / (d_geo_t + eps)
 
-        # positives: nearest geodesic; negatives: farthest geodesic
-        pos_j = cand[np.arange(B), np.argmin(d_geo, axis=1)]
-        neg_j = cand[np.arange(B), np.argmax(d_geo, axis=1)]
+        h_i = torch.tensor(h[ii], dtype=torch.float32, device=device)
+        s_i = torch.tensor(s[ii], dtype=torch.float32, device=device)
+        h_j = torch.tensor(h[jj], dtype=torch.float32, device=device)
+        s_j = torch.tensor(s[jj], dtype=torch.float32, device=device)
 
-        bh = torch.tensor(h[anchors], dtype=torch.float32, device=device)
-        bs = torch.tensor(s[anchors], dtype=torch.float32, device=device)
-        ph = torch.tensor(h[pos_j], dtype=torch.float32, device=device)
-        ps = torch.tensor(s[pos_j], dtype=torch.float32, device=device)
-        nh = torch.tensor(h[neg_j], dtype=torch.float32, device=device)
-        ns = torch.tensor(s[neg_j], dtype=torch.float32, device=device)
+        g_i = geo(h_i, s_i)
+        g_j = geo(h_j, s_j)
+        d_lat = torch.norm(g_i - g_j, dim=-1)
 
-        g_a = geo(bh, bs)
-        g_p = geo(ph, ps)
-        g_n = geo(nh, ns)
-
-        d_pos = torch.norm(g_a - g_p, dim=-1)
-        d_neg = torch.norm(g_a - g_n, dim=-1)
-        loss_rank = F.relu(d_pos + cfg.geo_sup_margin - d_neg).mean()
-        loss_uni = _uniformity_loss_sphere(g_a, t=cfg.geo_sup_uniformity_t)
-        loss = loss_rank + cfg.geo_sup_uniformity_weight * loss_uni
+        # Stress: weighted (d_latent - scale*d_geo)^2
+        scale_d_geo = scale.clamp(min=1e-4) * d_geo_t
+        stress = (weight * (d_lat - scale_d_geo).pow(2)).mean()
+        loss_uni = _uniformity_loss_sphere(torch.stack([g_i, g_j], 1), t=cfg.geo_sup_uniformity_t)
+        loss = cfg.geo_sup_stress_weight * stress + cfg.geo_sup_uniformity_weight * loss_uni
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -582,7 +595,7 @@ def train_geo_encoder_geodesic(
         if (epoch + 1) % max(1, cfg.geo_sup_epochs // 3) == 0:
             print(
                 f"    GeoSup epoch {epoch+1}/{cfg.geo_sup_epochs}  "
-                f"rank={loss_rank.item():.4f}  uni={loss_uni.item():.4f}  total={loss.item():.4f}"
+                f"stress={stress.item():.4f}  uni={loss_uni.item():.4f}  scale={scale.item():.4f}  total={loss.item():.4f}"
             )
 
     geo.eval()
