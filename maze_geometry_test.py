@@ -110,6 +110,9 @@ class TrainCfg:
     n_probe_epochs: int = 1500
     n_pairs: int = 8000
     knn_k: int = 10
+    # Sanity gates: mark run as "WM failed" if below these
+    coverage_min: float = 0.10  # fraction of free cells visited
+    var_min: float = 1e-6       # min mean(var(h)), mean(var(encoder_e)) to avoid collapsed repr
 
 
 # ===================================================================
@@ -967,6 +970,44 @@ def generate_plots(
 
 
 # ===================================================================
+#  7b. Sanity metrics (coverage, representation variance)
+# ===================================================================
+
+def compute_sanity_metrics(
+    data: dict,
+    geodesic: "GeodesicComputer",
+    cfg: TrainCfg,
+) -> dict:
+    """Compute coverage and representation variance; set failed if below thresholds."""
+    pos = data["pos"]
+    h = data["h"]
+    encoder_emb = data.get("encoder_emb")
+
+    # Coverage: fraction of free cells visited
+    cells_visited = set()
+    for i in range(len(pos)):
+        r, c = geodesic.pos_to_cell(float(pos[i, 0]), float(pos[i, 1]))
+        cells_visited.add((r, c))
+    coverage = len(cells_visited) / max(geodesic.n_free, 1)
+
+    # Representation variance: mean over dimensions of var across samples (avoid collapse)
+    var_h = float(np.mean(np.var(h, axis=0)))
+    var_encoder_e = float(np.mean(np.var(encoder_emb, axis=0))) if encoder_emb is not None else var_h
+
+    min_var = min(var_h, var_encoder_e)
+    failed = coverage < cfg.coverage_min or min_var < cfg.var_min
+
+    return {
+        "coverage": round(coverage, 4),
+        "var_h": round(var_h, 6),
+        "var_encoder_e": round(var_encoder_e, 6),
+        "failed": failed,
+        "n_cells_visited": len(cells_visited),
+        "n_free": geodesic.n_free,
+    }
+
+
+# ===================================================================
 #  8. Per-maze pipeline (single seed)
 # ===================================================================
 
@@ -996,6 +1037,11 @@ def run_single_maze(maze_name: str, cfg: TrainCfg, device: torch.device, out_roo
     print("\n  [2/5] Collecting position-latent data ...")
     data = collect_data(env, models, cfg, device)
 
+    sanity = compute_sanity_metrics(data, env.geodesic, cfg)
+    print(f"    Sanity: coverage={sanity['coverage']:.2%} ({sanity['n_cells_visited']}/{sanity['n_free']})  "
+          f"var_h={sanity['var_h']:.2e}  var_encoder_e={sanity['var_encoder_e']:.2e}  "
+          f"{'FAILED' if sanity['failed'] else 'ok'}")
+
     print("\n  [3/5] Training GeoEncoder (post-hoc, temporal) ...")
     geo_temporal = train_geo_encoder(data, cfg, device, env.geodesic)
 
@@ -1020,7 +1066,13 @@ def run_single_maze(maze_name: str, cfg: TrainCfg, device: torch.device, out_roo
 
     env.close()
 
-    results = {"probes": probe_res, "distances": dist_res, "knn": knn_res, "trust_cont": tc_res}
+    results = {
+        "sanity": sanity,
+        "probes": probe_res,
+        "distances": dist_res,
+        "knn": knn_res,
+        "trust_cont": tc_res,
+    }
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(results, f, indent=2)
 
@@ -1031,24 +1083,28 @@ def run_single_maze(maze_name: str, cfg: TrainCfg, device: torch.device, out_roo
 #  8b. Multi-seed aggregation
 # ===================================================================
 
-def _deep_scalar_paths(d: dict, prefix: str = "") -> List[Tuple[str, float]]:
-    """Recursively extract (dotted_key, scalar_value) pairs from nested dict."""
+def _deep_scalar_paths(d: dict, prefix: str = "", exclude_prefix: Optional[str] = None) -> List[Tuple[str, float]]:
+    """Recursively extract (dotted_key, scalar_value) pairs from nested dict.
+    If exclude_prefix is set (e.g. 'sanity'), skip keys under that prefix."""
     out = []
     for k, v in d.items():
         key = f"{prefix}.{k}" if prefix else k
+        if exclude_prefix and (key == exclude_prefix or key.startswith(exclude_prefix + ".")):
+            continue
         if isinstance(v, dict):
-            out.extend(_deep_scalar_paths(v, key))
+            out.extend(_deep_scalar_paths(v, key, exclude_prefix=exclude_prefix))
         elif isinstance(v, (int, float)):
             out.append((key, float(v)))
     return out
 
 
-def _aggregate_seed_results(seed_results: List[dict]) -> dict:
-    """Given a list of per-seed result dicts, compute mean±std for every scalar."""
+def _aggregate_seed_results(seed_results: List[dict], exclude_sanity: bool = True) -> dict:
+    """Given a list of per-seed result dicts, compute mean±std for every scalar.
+    If exclude_sanity, do not aggregate sanity.* keys (reported separately for failed runs)."""
     from collections import defaultdict
     buckets: Dict[str, List[float]] = defaultdict(list)
     for sr in seed_results:
-        for key, val in _deep_scalar_paths(sr):
+        for key, val in _deep_scalar_paths(sr, exclude_prefix="sanity" if exclude_sanity else None):
             buckets[key].append(val)
 
     agg = {}
@@ -1077,10 +1133,12 @@ def generate_summary_plots_multiseed(all_agg: dict, out_dir: str):
     """Cross-maze comparison with error bars from multi-seed aggregation.
 
     all_agg: {maze_name: aggregated_dict} where aggregated_dict has keys
-    like 'probes.h.mlp_R2' -> {mean, std, values}.
+    like 'probes.h.mlp_R2' -> {mean, std, values}. Skips mazes with empty agg (all failed).
     """
     os.makedirs(out_dir, exist_ok=True)
-    mazes = list(all_agg.keys())
+    mazes = [m for m in all_agg if all_agg[m]]
+    if not mazes:
+        return
 
     feat_set = set()
     for m in mazes:
@@ -1216,7 +1274,7 @@ def main():
     print(f"Seeds:  {args.seeds}  ({n_seeds} seeds)")
     print(f"Quick:  {args.quick}\n")
 
-    # {maze -> [per_seed_results]}
+    # {maze -> [per_seed_results]} (each result has "sanity": {coverage, var_h, var_encoder_e, failed})
     all_seed_results: Dict[str, List[dict]] = {m: [] for m in args.mazes}
 
     for seed in args.seeds:
@@ -1224,10 +1282,12 @@ def main():
             results = run_single_maze(maze_name, cfg, device, args.output_dir, seed=seed)
             all_seed_results[maze_name].append(results)
 
-    # Aggregate across seeds
+    # Aggregate only over successful runs (gate out WM failed)
     all_agg: Dict[str, dict] = {}
     for maze_name in args.mazes:
-        all_agg[maze_name] = _aggregate_seed_results(all_seed_results[maze_name])
+        successful = [r for r in all_seed_results[maze_name]
+                      if not r.get("sanity", {}).get("failed", False)]
+        all_agg[maze_name] = _aggregate_seed_results(successful) if successful else {}
 
     summary_dir = os.path.join(args.output_dir, "summary")
     os.makedirs(summary_dir, exist_ok=True)
@@ -1239,9 +1299,31 @@ def main():
     with open(os.path.join(summary_dir, "all_metrics_per_seed.json"), "w") as f:
         json.dump({m: sr for m, sr in zip(args.mazes, [all_seed_results[m] for m in args.mazes])}, f, indent=2)
 
-    # ---- Print summary table (mean±std) ----
+    # ---- WM failed runs (report separately) ----
+    failed_list = []
+    for maze_name in args.mazes:
+        for idx, r in enumerate(all_seed_results[maze_name]):
+            s = r.get("sanity", {})
+            if s.get("failed", False):
+                failed_list.append((maze_name, args.seeds[idx], s.get("coverage", 0), s.get("var_h", 0), s.get("var_encoder_e", 0)))
+    failed_records = [{"maze": m, "seed": s, "coverage": c, "var_h": vh, "var_encoder_e": ve}
+                     for m, s, c, vh, ve in failed_list]
+    with open(os.path.join(summary_dir, "wm_failed.json"), "w") as f:
+        json.dump({"thresholds": {"coverage_min": cfg.coverage_min, "var_min": cfg.var_min}, "runs": failed_records}, f, indent=2)
+    if failed_list:
+        print(f"\n{'='*80}")
+        print("  WM FAILED (excluded from summary; coverage < {:.0%} or var < {:.0e})".format(cfg.coverage_min, cfg.var_min))
+        print(f"{'='*80}")
+        print(f"{'Maze':12s} | {'Seed':6s} | {'Coverage':10s} | {'var_h':12s} | {'var_encoder_e':14s}")
+        print("-" * 60)
+        for maze, seed, cov, vh, ve in failed_list:
+            print(f"{maze:12s} | {seed:6d} | {cov:10.4f} | {vh:12.2e} | {ve:14.2e}")
+        print("-" * 60)
+        print(f"  Total failed: {len(failed_list)} run(s)\n")
+
+    # ---- Print summary table (mean±std, successful runs only) ----
     print(f"\n{'='*120}")
-    print(f"  SUMMARY  ({n_seeds} seeds: {args.seeds})")
+    print(f"  SUMMARY  (successful runs only; {n_seeds} seeds: {args.seeds})")
     print(f"{'='*120}")
     header = (f"{'Maze':12s} | {'Feature':12s} | {'Lin R²':14s} | {'MLP R²':14s} | "
               f"{'Pearson':14s} | {'Spearman':14s} | {'kNN':14s} | {'Trust':14s} | {'Cont':14s}")
@@ -1249,6 +1331,11 @@ def main():
     print("-" * len(header))
     for maze in args.mazes:
         agg = all_agg[maze]
+        if not agg:
+            n_fail = sum(1 for r in all_seed_results[maze] if r.get("sanity", {}).get("failed", False))
+            print(f"{maze:12s} | (all {n_fail} seed(s) failed)")
+            print("-" * len(header))
+            continue
         feat_set = set()
         for key in agg:
             parts = key.split(".")
