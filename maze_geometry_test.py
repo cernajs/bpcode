@@ -48,12 +48,10 @@ from scipy import stats as sp_stats
 from maze_env import MAZE_LAYOUTS, GeodesicComputer, PointMazeEnv, generate_random_maze
 from models import (
     RSSM,
-    Actor,
     ContinueModel,
     ConvDecoder,
     ConvEncoder,
     RewardModel,
-    ValueModel,
 )
 from geom_head import GeoEncoder, temporal_reachability_loss
 from utils import ReplayBuffer, bottle, get_device, preprocess_img, set_seed
@@ -118,20 +116,7 @@ class TrainCfg:
 #  1. Training
 # ===================================================================
 
-def _compute_lambda_returns(rewards, values, discounts, lambda_=0.95):
-    B, H = rewards.shape
-    last = values[:, -1]
-    out = torch.zeros_like(rewards)
-    nv = values[:, 1:]
-    for t in reversed(range(H)):
-        bootstrap = (1.0 - lambda_) * nv[:, t] + lambda_ * last
-        last = rewards[:, t] + discounts[:, t] * bootstrap
-        out[:, t] = last
-    return out
-
-
 def train_world_model(env: PointMazeEnv, cfg: TrainCfg, device: torch.device):
-    """Train full DreamerV1 on *env* and return model dict."""
     H, W, C = env.observation_space.shape
     act_dim = env.action_space.shape[0]
 
@@ -140,8 +125,6 @@ def train_world_model(env: PointMazeEnv, cfg: TrainCfg, device: torch.device):
     rssm = RSSM(cfg.stoch_dim, cfg.deter_dim, act_dim, cfg.embed_dim, cfg.hidden_dim).to(device)
     reward_model = RewardModel(cfg.deter_dim, cfg.stoch_dim, cfg.hidden_dim).to(device)
     cont_model = ContinueModel(cfg.deter_dim, cfg.stoch_dim, cfg.hidden_dim).to(device)
-    actor = Actor(cfg.deter_dim, cfg.stoch_dim, act_dim, cfg.actor_hidden_dim).to(device)
-    value_model = ValueModel(cfg.deter_dim, cfg.stoch_dim, cfg.value_hidden_dim).to(device)
 
     world_params = (
         list(encoder.parameters()) + list(decoder.parameters()) +
@@ -149,13 +132,11 @@ def train_world_model(env: PointMazeEnv, cfg: TrainCfg, device: torch.device):
         list(cont_model.parameters())
     )
     model_opt = torch.optim.Adam(world_params, lr=cfg.model_lr, eps=cfg.adam_eps)
-    actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr, eps=cfg.adam_eps)
-    value_opt = torch.optim.Adam(value_model.parameters(), lr=cfg.value_lr, eps=cfg.adam_eps)
 
     replay = ReplayBuffer(cfg.replay_capacity, obs_shape=(H, W, C), act_dim=act_dim)
     free_nats = torch.ones(1, device=device) * cfg.kl_free_nats
 
-    # Seed buffer
+    # Seed buffer with random actions
     for _ in range(cfg.seed_episodes):
         obs, _ = env.reset()
         done = False
@@ -181,12 +162,10 @@ def train_world_model(env: PointMazeEnv, cfg: TrainCfg, device: torch.device):
             h, s = rssm.get_init_state(e0)
 
         while not done:
-            encoder.eval(); rssm.eval(); actor.eval()
-            with torch.no_grad():
-                a_t, _ = actor.get_action(h, s, deterministic=False)
-                if cfg.expl_amount > 0:
-                    a_t = torch.clamp(a_t + cfg.expl_amount * torch.randn_like(a_t), -1, 1)
-                a_np = a_t.squeeze(0).cpu().numpy().astype(np.float32)
+            encoder.eval()
+            rssm.eval()
+            # Random actor: sample from env action space
+            a_np = env.action_space.sample().astype(np.float32)
 
             nobs, r, t, tr, _ = env.step(a_np, repeat=cfg.action_repeat)
             done = bool(t or tr)
@@ -203,8 +182,14 @@ def train_world_model(env: PointMazeEnv, cfg: TrainCfg, device: torch.device):
                 h, s, _, _ = rssm.observe_step(e, act_t, h, s, sample=False)
 
             if total_steps % cfg.collect_interval == 0 and replay.size > (cfg.seq_len + 2):
-                encoder.train(); decoder.train(); rssm.train()
-                reward_model.train(); cont_model.train(); actor.train(); value_model.train()
+                encoder.train()
+                decoder.train()
+                rssm.train()
+                reward_model.train()
+                cont_model.train()
+
+                log_rec, log_kld, log_rew, log_cont, log_total = 0.0, 0.0, 0.0, 0.0, 0.0
+                n_log = 0
 
                 for _ in range(cfg.train_steps):
                     batch = replay.sample_sequences(cfg.batch_size, cfg.seq_len + 1)
@@ -257,57 +242,23 @@ def train_world_model(env: PointMazeEnv, cfg: TrainCfg, device: torch.device):
                     nn.utils.clip_grad_norm_(world_params, cfg.grad_clip)
                     model_opt.step()
 
-                    # ---- actor-critic (imagination) ----
-                    with torch.no_grad():
-                        Dh, Ds = h_seq.size(-1), s_seq.size(-1)
-                        h0 = h_seq.reshape(-1, Dh).detach()
-                        s0 = s_seq.reshape(-1, Ds).detach()
+                    log_rec += rec_loss.item()
+                    log_kld += kld.item()
+                    log_rew += rew_loss.item()
+                    log_cont += cont_loss.item()
+                    log_total += model_loss.item()
+                    n_log += 1
 
-                    h_im, s_im = h0, s0
-                    h_im_l, s_im_l = [h0], [s0]
-                    for _ in range(cfg.imagination_horizon):
-                        a_im, _ = actor.get_action(h_im, s_im, deterministic=False)
-                        h_im = rssm.deterministic_state_fwd(h_im, s_im, a_im)
-                        s_im = rssm.state_prior(h_im, sample=True)
-                        h_im_l.append(h_im); s_im_l.append(s_im)
-                    h_imag = torch.stack(h_im_l, 1)
-                    s_imag = torch.stack(s_im_l, 1)
-                    r_im = bottle(reward_model, h_imag[:, 1:], s_imag[:, 1:])
-                    cl_im = bottle(cont_model, h_imag[:, 1:], s_imag[:, 1:])
-                    disc = cfg.gamma * torch.sigmoid(cl_im).clamp(0, 1)
-
-                    with torch.no_grad():
-                        v_tgt = bottle(value_model, h_imag, s_imag)
-                        lam_tgt = _compute_lambda_returns(r_im.detach(), v_tgt, disc.detach(), cfg.lambda_)
-                        w_tgt = torch.cumprod(torch.cat([torch.ones(h0.size(0), 1, device=device), disc.detach()], 1), 1)[:, :-1]
-
-                    v_pred = bottle(value_model, h_imag.detach(), s_imag.detach())
-                    value_loss = ((v_pred[:, :-1] - lam_tgt) ** 2 * w_tgt).mean()
-                    value_opt.zero_grad(set_to_none=True)
-                    value_loss.backward()
-                    nn.utils.clip_grad_norm_(value_model.parameters(), cfg.grad_clip)
-                    value_opt.step()
-
-                    mean, std = actor.forward(h_imag[:, :-1].detach(), s_imag[:, :-1].detach())
-                    from torch.distributions import Normal as Norm
-                    entropy = Norm(mean, std).entropy().sum(-1).mean()
-                    v_for_act = bottle(value_model, h_imag, s_imag)
-                    lam_act = _compute_lambda_returns(r_im, v_for_act, disc, cfg.lambda_)
-                    w_act = torch.cumprod(torch.cat([torch.ones(h0.size(0), 1, device=device), disc.detach()], 1), 1)[:, :-1]
-                    actor_loss = -(w_act.detach() * lam_act).mean() - cfg.actor_entropy_scale * entropy
-                    actor_opt.zero_grad(set_to_none=True)
-                    actor_loss.backward()
-                    nn.utils.clip_grad_norm_(actor.parameters(), cfg.grad_clip)
-                    actor_opt.step()
+                print(f"    [wm] steps={total_steps}  rec={log_rec/n_log:.4f}  kl={log_kld/n_log:.4f}  rew={log_rew/n_log:.4f}  cont={log_cont/n_log:.4f}  total={log_total/n_log:.4f}")
 
         if (ep + 1) % max(1, cfg.max_episodes // 5) == 0:
             print(f"    ep {ep+1}/{cfg.max_episodes}  steps={total_steps}  ret={ep_ret:.2f}  ({time.time()-t0:.0f}s)")
 
     models = dict(encoder=encoder, decoder=decoder, rssm=rssm,
-                  reward_model=reward_model, cont_model=cont_model,
-                  actor=actor, value_model=value_model)
+                  reward_model=reward_model, cont_model=cont_model, actor=None)
     for m in models.values():
-        m.eval()
+        if m is not None:
+            m.eval()
     return models
 
 
@@ -318,8 +269,9 @@ def train_world_model(env: PointMazeEnv, cfg: TrainCfg, device: torch.device):
 @torch.no_grad()
 def collect_data(env: PointMazeEnv, models: dict, cfg: TrainCfg, device: torch.device):
     """Run trained model, collect (pos, h, s, encoder_emb, raw_obs) per step, grouped by episode."""
-    encoder, rssm, actor = models["encoder"], models["rssm"], models["actor"]
-    encoder.eval(); rssm.eval(); actor.eval()
+    encoder, rssm = models["encoder"], models["rssm"]
+    encoder.eval()
+    rssm.eval()
 
     all_pos, all_h, all_s, all_e, all_obs = [], [], [], [], []
     traj_pos, traj_h, traj_s = [], [], []
@@ -340,9 +292,8 @@ def collect_data(env: PointMazeEnv, models: dict, cfg: TrainCfg, device: torch.d
         ep_obs = [obs.astype(np.float32).flatten() / 255.0]
 
         while not done:
-            a_t, _ = actor.get_action(h, s, deterministic=False)
-            a_t = torch.clamp(a_t + 0.1 * torch.randn_like(a_t), -1, 1)
-            a_np = a_t.squeeze(0).cpu().numpy().astype(np.float32)
+            # random actor
+            a_np = env.action_space.sample().astype(np.float32)
             obs, _, t, tr, _ = env.step(a_np, repeat=cfg.action_repeat)
             done = bool(t or tr)
 
