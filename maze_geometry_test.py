@@ -8,7 +8,7 @@ Pipeline per maze layout × seed:
   3. Post-hoc train GeoEncoder g(h,s) with revisit-aware temporal contrastive loss
   4. Probe analysis      — linear / MLP probes  position decoding  R²
                            (episode-wise train/test split to avoid trajectory interpolation)
-  5. Distance analysis   — Pearson / Spearman of latent dist vs geodesic dist
+  5. Distance analysis   — Pearson / Spearman (full + local-binned: pairs with geodesic ≤3, ≤5, ≤8)
   6. Neighbourhood analysis — kNN overlap (with chance baseline) + trustworthiness & continuity
   7. Visualizations      — PCA embeddings, scatter plots, summary comparison
 
@@ -113,6 +113,9 @@ class TrainCfg:
     n_probe_epochs: int = 1500
     n_pairs: int = 8000
     knn_k: int = 10
+    # Local-binned distance correlation: only pairs with geodesic <= threshold (aligns with kNN/T&C)
+    distance_local_bins: Tuple[float, ...] = (3, 5, 8)
+    min_pairs_local: int = 50  # minimum pairs in bin to compute correlation
     # Sanity gates: mark run as "WM failed" if below these
     coverage_min: float = 0.10  # fraction of free cells visited
     var_min: float = 1e-6       # min mean(var(h)), mean(var(encoder_e)) to avoid collapsed repr
@@ -795,7 +798,11 @@ def run_probes(
 
 def run_distance_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geodesic: "GeodesicComputer",
                           cfg: TrainCfg):
-    """Pearson / Spearman of latent distance vs geodesic distance."""
+    """Pearson / Spearman of latent distance vs geodesic distance (full + local-binned).
+
+    Local bins use only pairs with geodesic <= threshold (e.g. <= 3, <= 5, <= 8),
+    aligning the distance metric with kNN/T&C and avoiding far-pairs dominating Spearman.
+    """
     N = len(pos)
     n_pairs = min(cfg.n_pairs, N * (N - 1) // 2)
     i1 = np.random.randint(0, N, n_pairs)
@@ -816,7 +823,26 @@ def run_distance_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geod
             "pearson_r": round(float(pr), 4), "pearson_p": float(pp),
             "spearman_rho": round(float(sr), 4), "spearman_p": float(sp),
         }
-        print(f"    Distance {name:8s}  pearson={pr:.4f}  spearman={sr:.4f}")
+        # Local-binned: only pairs with geodesic <= bin (aligns with kNN/T&C)
+        for thresh in cfg.distance_local_bins:
+            key_suffix = f"_le{int(thresh)}"
+            local = geo_d <= thresh
+            n_local = int(np.sum(local))
+            if n_local >= cfg.min_pairs_local:
+                lat_d_local = lat_d[local]
+                geo_d_local = geo_d[local]
+                pr_l, _ = sp_stats.pearsonr(lat_d_local, geo_d_local)
+                sr_l, _ = sp_stats.spearmanr(lat_d_local, geo_d_local)
+                results[name][f"pearson_r{key_suffix}"] = round(float(pr_l), 4)
+                results[name][f"spearman_rho{key_suffix}"] = round(float(sr_l), 4)
+            else:
+                results[name][f"pearson_r{key_suffix}"] = None  # omit from JSON; not aggregated
+                results[name][f"spearman_rho{key_suffix}"] = None
+        def _fmt_local(t):
+            v = results[name].get(f"spearman_rho_le{int(t)}")
+            return f"≤{int(t)} ρ={v:.3f}" if v is not None and np.isfinite(v) else f"≤{int(t)} n/a"
+        local_str = "  ".join(_fmt_local(t) for t in cfg.distance_local_bins)
+        print(f"    Distance {name:8s}  pearson={pr:.4f}  spearman={sr:.4f}  (local: {local_str})")
     return results, (i1, i2, geo_d, features)
 
 
@@ -1216,8 +1242,13 @@ def _aggregate_seed_results(seed_results: List[dict], exclude_sanity: bool = Tru
     agg = {}
     for key, vals in buckets.items():
         arr = np.array(vals)
-        agg[key] = {"mean": round(float(arr.mean()), 4), "std": round(float(arr.std()), 4),
-                     "values": [round(v, 4) for v in vals]}
+        mean_val = arr.mean()
+        std_val = arr.std()
+        agg[key] = {
+            "mean": round(float(mean_val), 4) if np.isfinite(mean_val) else None,
+            "std": round(float(std_val), 4) if np.isfinite(std_val) else None,
+            "values": [round(v, 4) for v in vals],
+        }
     return agg
 
 
@@ -1232,6 +1263,8 @@ def _get_agg(agg: dict, dotted_key: str, stat: str = "mean") -> float:
 def _fmt_mean_std(agg: dict, dotted_key: str) -> str:
     m = _get_agg(agg, dotted_key, "mean")
     s = _get_agg(agg, dotted_key, "std")
+    if m is None or not np.isfinite(m):
+        return "n/a"
     return f"{m:.4f}±{s:.4f}"
 
 
@@ -1286,6 +1319,41 @@ def generate_summary_plots_multiseed(all_agg: dict, out_dir: str):
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "summary_spearman.png"), dpi=150)
     plt.close(fig)
+
+    # --- Summary 2b: Local-binned Spearman (pairs with geodesic ≤ threshold only) ---
+    local_suffixes = sorted(
+        set(
+            k.split(".")[-1].replace("spearman_rho_", "")
+            for m in mazes
+            for k in (all_agg[m] or {})
+            if k.startswith("distances.") and "spearman_rho_le" in k
+        ),
+        key=lambda s: int(s.replace("le", "")) if s.startswith("le") else 0,
+    )
+    if local_suffixes:
+        n_bins = len(local_suffixes)
+        fig, axes = plt.subplots(1, n_bins, figsize=(5 * n_bins, 6))
+        if n_bins == 1:
+            axes = [axes]
+        for ax, suffix in zip(axes, local_suffixes):
+            thresh = suffix.replace("le", "")
+            for i, fn in enumerate(feat_names):
+                key = f"distances.{fn}.spearman_rho_{suffix}"
+                means = np.array([_get_agg(all_agg[m], key) for m in mazes], dtype=float)
+                stds = np.array([_get_agg(all_agg[m], key, "std") for m in mazes], dtype=float)
+                means_plot = np.nan_to_num(means, nan=0.0)
+                stds_plot = np.nan_to_num(stds, nan=0.0)
+                ax.bar(x + (i - (n_feat - 1) / 2) * w, means_plot, w, yerr=stds_plot, capsize=3, label=fn)
+            ax.set_xticks(x)
+            ax.set_xticklabels(mazes, rotation=15)
+            ax.set_ylabel("Spearman ρ (mean±std)")
+            ax.set_title(f"Local distance (geodesic ≤ {thresh})")
+            ax.set_ylim(0, 1.05)
+            ax.legend(fontsize=8)
+            ax.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "summary_spearman_local.png"), dpi=150)
+        plt.close(fig)
 
     # --- Summary 3: kNN overlap ---
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -1431,8 +1499,20 @@ def main():
     print(f"\n{'='*120}")
     print(f"  SUMMARY  (successful runs only; {n_seeds} seeds: {args.seeds})")
     print(f"{'='*120}")
+    # Discover local-binned keys from first available agg
+    local_cols = []
+    for maze in args.mazes:
+        if all_agg[maze]:
+            for k in all_agg[maze]:
+                if ".spearman_rho_le" in k:
+                    suf = k.split(".")[-1].replace("spearman_rho_", "")
+                    if suf not in local_cols:
+                        local_cols.append(suf)
+            local_cols = sorted(local_cols, key=lambda s: int(s.replace("le", "")) if s.startswith("le") else 0)
+            break
+    local_headers = "".join(f" | {'ρ≤' + s.replace('le', ''):>10s}" for s in local_cols)
     header = (f"{'Maze':12s} | {'Feature':12s} | {'Lin R²':14s} | {'MLP R²':14s} | "
-              f"{'Pearson':14s} | {'Spearman':14s} | {'kNN':14s} | {'Trust':14s} | {'Cont':14s}")
+              f"{'Pearson':14s} | {'Spearman':14s}{local_headers} | {'kNN':14s} | {'Trust':14s} | {'Cont':14s}")
     print(header)
     print("-" * len(header))
     for maze in args.mazes:
@@ -1455,13 +1535,15 @@ def main():
             mlp = _fmt_mean_std(agg, f"probes.{fn}.mlp_R2")
             pr = _fmt_mean_std(agg, f"distances.{fn}.pearson_r")
             sr = _fmt_mean_std(agg, f"distances.{fn}.spearman_rho")
+            local_vals = "".join(f" | {_fmt_mean_std(agg, f'distances.{fn}.spearman_rho_{s}'):>10s}" for s in local_cols)
             knn = _fmt_mean_std(agg, f"knn.{fn}")
             tr = _fmt_mean_std(agg, f"trust_cont.{fn}.trustworthiness")
             co = _fmt_mean_std(agg, f"trust_cont.{fn}.continuity")
-            print(f"{maze:12s} | {fn:12s} | {lin:14s} | {mlp:14s} | {pr:14s} | {sr:14s} | {knn:14s} | {tr:14s} | {co:14s}")
+            print(f"{maze:12s} | {fn:12s} | {lin:14s} | {mlp:14s} | {pr:14s} | {sr:14s}{local_vals} | {knn:14s} | {tr:14s} | {co:14s}")
         chance = _get_agg(agg, "knn._chance_baseline")
         if chance > 0:
-            print(f"{'':12s} | {'(chance)':12s} | {'':14s} | {'':14s} | {'':14s} | {'':14s} | {chance:14.6f} | {'':14s} | {'':14s}")
+            pad = "".join(" | " + " " * 10 for _ in local_cols)
+            print(f"{'':12s} | {'(chance)':12s} | {'':14s} | {'':14s} | {'':14s} | {'':14s}{pad} | {chance:14.6f} | {'':14s} | {'':14s}")
         print("-" * len(header))
 
     print(f"\nResults saved to {args.output_dir}/")
