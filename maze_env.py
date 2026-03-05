@@ -12,7 +12,7 @@ same interface as DMControlWrapper / PixelObsWrapper:
 import numpy as np
 import gymnasium as gym
 from collections import deque
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
 
 # ---------------------------------------------------------------------------
 # Predefined maze layouts (1=wall, 0=free, S=start, G=goal)
@@ -255,13 +255,15 @@ class PointMazeEnv:
 
     def __init__(
         self,
-        layout: str = "corridor",
+        layout: Union[str, List[str]] = "corridor",
         img_size: Tuple[int, int] = (64, 64),
-        max_speed: float = 0.30,
-        goal_radius: float = 0.5,
+        max_speed: float = 0.12,
+        goal_radius: float = 0.25,
         max_episode_steps: int = 200,
-        step_penalty: float = -0.001,
+        step_penalty: float = 0.0,
         goal_reward: float = 1.0,
+        hide_goal: bool = True,
+        egocentric_crop_size: Optional[Tuple[int, int]] = None,
     ):
         if isinstance(layout, str) and layout in MAZE_LAYOUTS:
             lines = MAZE_LAYOUTS[layout]
@@ -279,6 +281,8 @@ class PointMazeEnv:
         self.max_episode_steps = max_episode_steps
         self.step_penalty = step_penalty
         self.goal_reward = goal_reward
+        self.hide_goal = hide_goal
+        self.egocentric_crop_size = egocentric_crop_size
 
         self.start_pos = np.array(
             [self.start_cell[1] + 0.5, self.start_cell[0] + 0.5], dtype=np.float32
@@ -292,14 +296,15 @@ class PointMazeEnv:
         self.steps: int = 0
 
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        obs_h, obs_w = egocentric_crop_size if egocentric_crop_size else img_size
         self.observation_space = gym.spaces.Box(
-            low=0, high=255, shape=(img_size[0], img_size[1], 3), dtype=np.uint8
+            low=0, high=255, shape=(obs_h, obs_w, 3), dtype=np.uint8
         )
 
         self.geodesic = GeodesicComputer(self.grid)
 
-        # Pre-render static maze image (walls + floor + goal)
-        self._bg = self._render_background()
+        # Pre-render static maze image (walls + floor; goal only if not hide_goal)
+        self._bg = self._render_background(include_goal=not hide_goal)
 
     # ----- public helpers -----
 
@@ -349,7 +354,7 @@ class PointMazeEnv:
                 total_reward += self.goal_reward
                 terminated = True
             else:
-                total_reward += self.step_penalty
+                total_reward += self.step_penalty  # 0 by default (sparse)
 
             if self.steps >= self.max_episode_steps:
                 truncated = True
@@ -369,7 +374,7 @@ class PointMazeEnv:
             return False
         return self.grid[r][c] == "0"
 
-    def _render_background(self) -> np.ndarray:
+    def _render_background(self, include_goal: bool = True) -> np.ndarray:
         h, w = self.img_size
         img = np.full((h, w, 3), 40, dtype=np.uint8)  # wall colour
         ch = h / self.grid_h
@@ -380,11 +385,11 @@ class PointMazeEnv:
                     y0, y1 = int(r * ch), int((r + 1) * ch)
                     x0, x1 = int(c * cw), int((c + 1) * cw)
                     img[y0:y1, x0:x1] = [220, 220, 220]
-        # goal marker
-        gx = int(self.goal_pos[0] * cw)
-        gy = int(self.goal_pos[1] * ch)
-        rad = max(2, int(min(ch, cw) * 0.30))
-        _draw_circle(img, gx, gy, rad, (0, 200, 0))
+        if include_goal:
+            gx = int(self.goal_pos[0] * cw)
+            gy = int(self.goal_pos[1] * ch)
+            rad = max(2, int(min(ch, cw) * 0.30))
+            _draw_circle(img, gx, gy, rad, (0, 200, 0))
         return img
 
     def _render_obs(self) -> np.ndarray:
@@ -395,7 +400,27 @@ class PointMazeEnv:
         ay = int(self.y * ch)
         rad = max(2, int(min(ch, cw) * 0.30))
         _draw_circle(img, ax, ay, rad, (220, 30, 30))
+        if self.egocentric_crop_size is not None:
+            img = self._crop_egocentric(img, ax, ay)
         return img
+
+    def _crop_egocentric(self, img: np.ndarray, ax: int, ay: int) -> np.ndarray:
+        """Crop observation to a window centered on the agent (egocentric view)."""
+        ch, cw = self.egocentric_crop_size
+        h, w = img.shape[:2]
+        y0 = ay - ch // 2
+        x0 = ax - cw // 2
+        out = np.full((ch, cw, 3), 40, dtype=np.uint8)  # wall colour for padding
+        src_y0 = max(0, y0)
+        src_y1 = min(h, y0 + ch)
+        src_x0 = max(0, x0)
+        src_x1 = min(w, x0 + cw)
+        dst_y0 = src_y0 - y0
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+        dst_x0 = src_x0 - x0
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+        out[dst_y0:dst_y1, dst_x0:dst_x1] = img[src_y0:src_y1, src_x0:src_x1]
+        return out
 
 
 def _draw_circle(img: np.ndarray, cx: int, cy: int, radius: int, colour):
