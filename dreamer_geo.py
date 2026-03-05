@@ -753,7 +753,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Dreamer + geodesic g_geo (plan_only / shaping / aux_backprop)")
-    p.add_argument("--env_id", type=str, default="custom_maze:corridor")
+    p.add_argument("--env_id", type=str, default="custom_maze:spiral")
     p.add_argument("--img_size", type=int, default=64)
     p.add_argument("--bit_depth", type=int, default=5)
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
@@ -793,7 +793,7 @@ def parse_args():
 
     p.add_argument("--geo_dim", type=int, default=32)
     p.add_argument("--geo_lr", type=float, default=3e-4)
-    p.add_argument("--geo_warmup_steps", type=int, default=5_000)
+    p.add_argument("--geo_warmup_steps", type=int, default=1_000)
     p.add_argument("--geo_data_max_points", type=int, default=50_000)
 
     p.add_argument("--geo_sup_epochs", type=int, default=200)
