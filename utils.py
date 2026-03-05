@@ -424,7 +424,7 @@ class DMControlWrapper:
         pass
 
 
-def make_env(env_id: str, img_size=(64, 64), num_stack=1):
+def make_env(env_id: str, img_size=(64, 64), num_stack=1, egocentric_crop_size=None):
     """
     Create environment - supports dm_control, gymnasium, and custom point mazes.
 
@@ -435,7 +435,7 @@ def make_env(env_id: str, img_size=(64, 64), num_stack=1):
     if env_id.startswith("custom_maze:"):
         from maze_env import PointMazeEnv
         layout = env_id.split(":", 1)[1]
-        return PointMazeEnv(layout=layout, img_size=img_size)
+        return PointMazeEnv(layout=layout, img_size=img_size, egocentric_crop_size=egocentric_crop_size)
     if "maze" in env_id.lower():
         return PixelObsWrapper(env_id, img_size=img_size, num_stack=num_stack)
     # Check if it's a dm_control env (contains hyphen but no version suffix like -v1)
