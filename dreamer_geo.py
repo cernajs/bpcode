@@ -8,7 +8,7 @@ Three variants (run as multiple variants in one script):
      planning time: minimize ||g_geo(z_t) - g_geo(z_goal)|| (goal from env).
   2. shaping: Same g_geo; reward shaping r_t' = r_t + alpha*(d_geo(t-1) - d_geo(t)).
   3. aux_backprop: Warm up WM, train g_geo, then unfreeze encoder+RSSM and add
-     small auxiliary loss from g_geo (representation shaper).
+     geodesic pairwise stress loss through g_geo(h,s) into encoder+RSSM.
 """
 
 import os
@@ -156,6 +156,115 @@ def train_geo_encoder_geodesic(
 
     geo.eval()
     return geo
+
+
+def sample_sequences_with_indices(
+    replay: ReplayBuffer,
+    batch_size: int,
+    seq_len: int,
+) -> Tuple[ReplayBuffer.Batch, np.ndarray]:
+    """Sample replay sequences and return both batch data and absolute buffer indices."""
+    candidates = np.random.randint(0, replay.size - seq_len, size=batch_size * 2)
+
+    if replay.full:
+        wrap_mask = (candidates < replay.idx) & (replay.idx < candidates + seq_len)
+        candidates = candidates[~wrap_mask]
+
+    valid_indices = []
+    for start in candidates:
+        end = start + seq_len
+        if np.any(replay.dones[start : end - 1]):
+            continue
+        valid_indices.append(start)
+        if len(valid_indices) == batch_size:
+            break
+
+    while len(valid_indices) < batch_size:
+        start = np.random.randint(0, replay.size - seq_len)
+        end = start + seq_len
+        if replay.full and start < replay.idx < end:
+            continue
+        if np.any(replay.dones[start : end - 1]):
+            continue
+        valid_indices.append(start)
+
+    idx_array = np.asarray(valid_indices, dtype=np.int64)
+    seq_idx = idx_array[:, None] + np.arange(seq_len, dtype=np.int64)[None, :]
+    batch = ReplayBuffer.Batch(
+        replay.obs[seq_idx],
+        replay.actions[seq_idx],
+        replay.rews[seq_idx],
+        replay.dones[seq_idx],
+    )
+    return batch, seq_idx
+
+
+def geo_aux_geodesic_stress_loss(
+    geo: GeoEncoder,
+    h_seq: torch.Tensor,
+    s_seq: torch.Tensor,
+    pos_seq: np.ndarray,
+    geodesic,
+    stress_eps: float,
+    num_pairs: int = 512,
+    min_pairs: int = 16,
+    freeze_geo: bool = True,
+) -> torch.Tensor:
+    """
+    Geodesic stress on current latent batch:
+      ||g(h_i,s_i)-g(h_j,s_j)|| should match geodesic(pos_i,pos_j).
+    """
+    device = h_seq.device
+    B, T = h_seq.shape[:2]
+    n = B * T
+    if n < 2:
+        return torch.zeros((), device=device)
+
+    pos_flat = pos_seq.reshape(-1, pos_seq.shape[-1])
+    if pos_flat.shape[0] != n:
+        return torch.zeros((), device=device)
+    valid_points = np.isfinite(pos_flat).all(axis=1)
+    if valid_points.sum() < 2:
+        return torch.zeros((), device=device)
+
+    valid_idx = np.where(valid_points)[0]
+    pair_count = min(int(num_pairs), valid_idx.size * max(valid_idx.size - 1, 1))
+    if pair_count < min_pairs:
+        return torch.zeros((), device=device)
+
+    ii = np.random.choice(valid_idx, size=pair_count, replace=True)
+    jj = np.random.choice(valid_idx, size=pair_count, replace=True)
+    same = ii == jj
+    if np.any(same):
+        jj[same] = valid_idx[(np.searchsorted(valid_idx, jj[same], side="left") + 1) % valid_idx.size]
+
+    try:
+        c_i = _positions_to_cell_indices(geodesic, pos_flat[ii])
+        c_j = _positions_to_cell_indices(geodesic, pos_flat[jj])
+    except Exception:
+        return torch.zeros((), device=device)
+
+    d_geo_np = geodesic.dist_matrix[c_i, c_j].astype(np.float32)
+    valid_pairs = np.isfinite(d_geo_np) & (d_geo_np > 0)
+    if valid_pairs.sum() < min_pairs:
+        return torch.zeros((), device=device)
+
+    ii_t = torch.as_tensor(ii[valid_pairs], device=device, dtype=torch.long)
+    jj_t = torch.as_tensor(jj[valid_pairs], device=device, dtype=torch.long)
+    d_geo_t = torch.as_tensor(d_geo_np[valid_pairs], device=device, dtype=torch.float32)
+    weight = 1.0 / (d_geo_t + stress_eps)
+
+    if freeze_geo:
+        with no_param_grads(geo):
+            g_real = bottle(geo, h_seq, s_seq)
+    else:
+        g_real = bottle(geo, h_seq, s_seq)
+    g_flat = g_real.reshape(-1, g_real.size(-1))
+
+    d_lat = torch.norm(g_flat[ii_t] - g_flat[jj_t], dim=-1)
+    # Closed-form scale on detached latent distances keeps stress shape-focused
+    scale = ((d_lat.detach() * d_geo_t).sum() / (d_geo_t.pow(2).sum() + 1e-6)).clamp(min=1e-4)
+    return (weight * (d_lat - scale * d_geo_t).pow(2)).mean()
 
 
 # ===============================
@@ -349,6 +458,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         value_model.parameters(), lr=args.value_lr, eps=args.adam_eps
     )
     replay = ReplayBuffer(args.replay_capacity, obs_shape=(H, W, C), act_dim=act_dim)
+    geo_pos_replay = (
+        np.full((args.replay_capacity, 2), np.nan, dtype=np.float32) if is_maze else None
+    )
     free_nats = torch.ones(1, device=device) * args.kl_free_nats
 
     # Geo data: (pos, h, s) for geodesic-supervised g_geo training (maze only)
@@ -371,9 +483,15 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         obs, _ = env.reset()
         done = False
         while not done:
+            pos_before = (
+                np.asarray(env.agent_pos, dtype=np.float32).copy()
+                if geo_pos_replay is not None
+                else None
+            )
             action = env.action_space.sample()
             next_obs, total_reward, term, trunc, _ = env.step(action, repeat=action_repeat)
             done = bool(term or trunc)
+            write_idx = replay.idx
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=np.asarray(action, np.float32),
@@ -381,6 +499,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 next_obs=None,
                 done=done,
             )
+            if geo_pos_replay is not None and pos_before is not None:
+                geo_pos_replay[write_idx] = pos_before
             obs = next_obs
 
     total_steps = 0
@@ -404,6 +524,10 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         with torch.no_grad():
             e0 = encoder(obs_t)
             h, s = rssm.get_init_state(e0)
+        if is_maze and geo is not None:
+            traj_pos.append(np.asarray(env.agent_pos, dtype=np.float32).copy())
+            traj_h.append(h.squeeze(0).cpu().numpy().copy())
+            traj_s.append(s.squeeze(0).cpu().numpy().copy())
 
         while not done:
             encoder.eval()
@@ -415,10 +539,16 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     a_t = torch.clamp(a_t + expl * torch.randn_like(a_t), -1.0, 1.0)
                 a_np = a_t.squeeze(0).cpu().numpy().astype(np.float32)
 
+            pos_before = (
+                np.asarray(env.agent_pos, dtype=np.float32).copy()
+                if geo_pos_replay is not None
+                else None
+            )
             next_obs, total_reward, term, trunc, _ = env.step(a_np, repeat=action_repeat)
             done = bool(term or trunc)
             ep_return += float(total_reward)
             ep_steps += 1
+            write_idx = replay.idx
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=a_np,
@@ -426,14 +556,10 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 next_obs=None,
                 done=done,
             )
+            if geo_pos_replay is not None and pos_before is not None:
+                geo_pos_replay[write_idx] = pos_before
             obs = next_obs
             total_steps += 1
-
-            if is_maze and geo is not None:
-                pos = env.agent_pos
-                traj_pos.append(pos.copy())
-                traj_h.append(h.squeeze(0).cpu().numpy().copy())
-                traj_s.append(s.squeeze(0).cpu().numpy().copy())
 
             obs_t = (
                 torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device)
@@ -445,6 +571,10 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 e = encoder(obs_t)
                 act_t = torch.tensor(a_np, dtype=torch.float32, device=device).unsqueeze(0)
                 h, s, _, _ = rssm.observe_step(e, act_t, h, s, sample=False)
+            if is_maze and geo is not None:
+                traj_pos.append(np.asarray(env.agent_pos, dtype=np.float32).copy())
+                traj_h.append(h.squeeze(0).cpu().numpy().copy())
+                traj_s.append(s.squeeze(0).cpu().numpy().copy())
 
             if total_steps % args.collect_interval == 0 and replay.size > (args.seq_len + 2):
                 encoder.train()
@@ -458,7 +588,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     geo.train()
 
                 for _ in range(args.train_steps):
-                    batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
+                    batch, seq_idx = sample_sequences_with_indices(
+                        replay, args.batch_size, args.seq_len + 1
+                    )
                     obs_seq = torch.as_tensor(batch.obs, device=device).float()
                     act_seq = torch.as_tensor(batch.actions, device=device)
                     rew_seq = torch.as_tensor(batch.rews, device=device)
@@ -515,16 +647,24 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     geo_aux_loss = torch.zeros((), device=device)
                     if (
                         geo is not None
+                        and is_maze
+                        and geodesic is not None
+                        and geo_pos_replay is not None
                         and cfg.geo_variant == "aux_backprop"
                         and geo_phase == "aux_backprop"
                     ):
-                        g_real = bottle(geo, h_seq, s_seq)
-                        g_flat = g_real.reshape(-1, g_real.size(-1))
-                        if g_flat.size(0) > 1:
-                            d_lat = torch.cdist(g_flat, g_flat)
-                            mask = torch.eye(d_lat.size(0), device=device, dtype=torch.bool)
-                            d_lat = d_lat.masked_fill(mask, 1e9)
-                            geo_aux_loss = -d_lat.min(dim=1).values.mean()
+                        pos_seq = geo_pos_replay[seq_idx][:, 1 : T + 1]
+                        geo_aux_loss = geo_aux_geodesic_stress_loss(
+                            geo=geo,
+                            h_seq=h_seq,
+                            s_seq=s_seq,
+                            pos_seq=pos_seq,
+                            geodesic=geodesic,
+                            stress_eps=args.geo_sup_stress_eps,
+                            num_pairs=max(512, args.geo_sup_batch),
+                            min_pairs=16,
+                            freeze_geo=True,
+                        )
 
                     model_loss = (
                         rec_loss
@@ -688,6 +828,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         writer.add_scalar("loss/kl_divergence", kld.item(), total_steps)
                         writer.add_scalar("loss/reward", rew_loss.item(), total_steps)
                         writer.add_scalar("loss/continue", cont_loss.item(), total_steps)
+                        if cfg.geo_variant == "aux_backprop" and geo_phase == "aux_backprop":
+                            writer.add_scalar("loss/geo_aux", geo_aux_loss.item(), total_steps)
                         writer.add_scalar("loss/actor", actor_loss.item(), total_steps)
                         writer.add_scalar("loss/value", value_loss.item(), total_steps)
                         writer.add_scalar("train/exploration", expl, total_steps)
