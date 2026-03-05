@@ -294,9 +294,12 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
+    # Encoder needs spatial size >= 46 (4 convs kernel 4 stride 2). Only use crop if large enough.
+    _crop = args.img_size // 2
+    _egocentric = (_crop, _crop) if _crop >= 48 else None
     env = make_env(
-        args.env_id, img_size=(args.img_size, args.img_size), num_stack=1, egocentric_crop_size=(args.img_size//2, args.img_size//2)
-        )
+        args.env_id, img_size=(args.img_size, args.img_size), num_stack=1, egocentric_crop_size=_egocentric
+    )
     obs, _ = env.reset()
     H, W, C = env.observation_space.shape
     act_dim = env.action_space.shape[0]
@@ -729,10 +732,12 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
     env.close()
 
+    _crop_final = args.img_size // 2
+    _egocentric_final = (_crop_final, _crop_final) if _crop_final >= 48 else None
     mean_ret, std_ret = evaluate_actor_policy(
         env=make_env(
-            args.env_id, img_size=(args.img_size, args.img_size), num_stack=1, egocentric_crop_size=(args.img_size//2, args.img_size//2)
-            ),
+            args.env_id, img_size=(args.img_size, args.img_size), num_stack=1, egocentric_crop_size=_egocentric_final
+        ),
         img_size=args.img_size,
         encoder=encoder,
         rssm=rssm,
@@ -758,7 +763,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 def parse_args():
     p = argparse.ArgumentParser(description="Dreamer + geodesic g_geo (plan_only / shaping / aux_backprop)")
     p.add_argument("--env_id", type=str, default="custom_maze:spiral")
-    p.add_argument("--img_size", type=int, default=64)
+    p.add_argument("--img_size", type=int, default=128)
     p.add_argument("--bit_depth", type=int, default=5)
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--quick", action="store_true")
