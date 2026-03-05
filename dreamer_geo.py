@@ -294,7 +294,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    env = make_env(args.env_id, img_size=(args.img_size, args.img_size), num_stack=1)
+    env = make_env(
+        args.env_id, img_size=(args.img_size, args.img_size), num_stack=1, egocentric_crop_size=(args.img_size//2, args.img_size//2)
+        )
     obs, _ = env.reset()
     H, W, C = env.observation_space.shape
     act_dim = env.action_space.shape[0]
@@ -728,7 +730,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     env.close()
 
     mean_ret, std_ret = evaluate_actor_policy(
-        env=make_env(args.env_id, img_size=(args.img_size, args.img_size), num_stack=1),
+        env=make_env(
+            args.env_id, img_size=(args.img_size, args.img_size), num_stack=1, egocentric_crop_size=(args.img_size//2, args.img_size//2)
+            ),
         img_size=args.img_size,
         encoder=encoder,
         rssm=rssm,
@@ -760,7 +764,7 @@ def parse_args():
     p.add_argument("--quick", action="store_true")
 
     p.add_argument("--seed_episodes", type=int, default=5)
-    p.add_argument("--max_episodes", type=int, default=100)
+    p.add_argument("--max_episodes", type=int, default=500)
     p.add_argument("--collect_interval", type=int, default=50)
     p.add_argument("--train_steps", type=int, default=30)
     p.add_argument("--action_repeat", type=int, default=0)
