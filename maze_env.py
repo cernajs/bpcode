@@ -307,6 +307,14 @@ class PointMazeEnv:
     def agent_pos(self) -> np.ndarray:
         return np.array([self.x, self.y], dtype=np.float32)
 
+    def get_goal_observation(self) -> np.ndarray:
+        """Render observation with agent drawn at goal (for encoding goal latent)."""
+        x_old, y_old = self.x, self.y
+        self.x, self.y = float(self.goal_pos[0]), float(self.goal_pos[1])
+        obs = self._render_obs()
+        self.x, self.y = x_old, y_old
+        return obs
+
     # ----- gym interface -----
 
     def reset(self, **kwargs):
