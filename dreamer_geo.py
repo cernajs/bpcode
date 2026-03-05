@@ -8,7 +8,8 @@ Three variants (run as multiple variants in one script):
      planning time: minimize ||g_geo(z_t) - g_geo(z_goal)|| (goal from env).
   2. shaping: Same g_geo; reward shaping r_t' = r_t + alpha*(d_geo(t-1) - d_geo(t)).
   3. aux_backprop: Warm up WM, train g_geo, then unfreeze encoder+RSSM and add
-     geodesic pairwise stress loss through g_geo(h,s) into encoder+RSSM.
+     geodesic pairwise stress loss through g_geo(h,s) into encoder+RSSM
+     (with periodic g_geo re-fit to reduce drift).
 """
 
 import os
@@ -477,6 +478,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     geo_phase = "warmup"
     wm_frozen = False
     geo_trained_once = False
+    geo_last_refit_step = -1
+    geo_refit_count = 0
 
     # Seed buffer
     for _ in range(args.seed_episodes):
@@ -737,7 +740,61 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                             if cfg.geo_variant == "aux_backprop":
                                 geo_phase = "aux_backprop"
                                 wm_frozen = False
+                                geo_last_refit_step = total_steps
                             geo_data.clear()
+
+                    # ---------- Periodic g_geo re-fit in aux phase (reduce drift) ----------
+                    if (
+                        geo is not None
+                        and is_maze
+                        and cfg.geo_variant == "aux_backprop"
+                        and geo_phase == "aux_backprop"
+                        and args.geo_aux_refit_interval > 0
+                        and geo_last_refit_step >= 0
+                        and (total_steps - geo_last_refit_step) >= args.geo_aux_refit_interval
+                    ):
+                        total_pts = sum(len(p) for p, _, _ in geo_data)
+                        if total_pts >= args.geo_aux_refit_min_points:
+                            geo_phase = "geo_refit"
+                            all_pos = np.concatenate([p for p, _, _ in geo_data], axis=0)
+                            all_h = np.concatenate([_h for _, _h, _ in geo_data], axis=0)
+                            all_s = np.concatenate([_s for _, _, _s in geo_data], axis=0)
+                            if len(all_pos) > geo_data_max_points:
+                                idx = np.random.choice(
+                                    len(all_pos), geo_data_max_points, replace=False
+                                )
+                                all_pos = all_pos[idx]
+                                all_h = all_h[idx]
+                                all_s = all_s[idx]
+                            data = {"pos": all_pos, "h": all_h, "s": all_s}
+                            refit_epochs = max(1, args.geo_aux_refit_epochs)
+                            print(
+                                f"    [{cfg.name} | seed {seed}] geo refit @ step {total_steps} "
+                                f"(pts={len(all_pos)}, epochs={refit_epochs})"
+                            )
+                            geo = train_geo_encoder_geodesic(
+                                data,
+                                args.deter_dim,
+                                args.stoch_dim,
+                                args.geo_dim,
+                                args.geom_hidden_dim,
+                                args.geo_lr,
+                                refit_epochs,
+                                args.geo_sup_batch,
+                                args.geo_sup_stress_eps,
+                                args.geo_sup_stress_weight,
+                                args.geo_sup_uniformity_weight,
+                                args.geo_sup_uniformity_t,
+                                device,
+                                geodesic,
+                            )
+                            geo_phase = "aux_backprop"
+                            geo_last_refit_step = total_steps
+                            geo_refit_count += 1
+                            writer.add_scalar("geo/refit_count", geo_refit_count, total_steps)
+                        else:
+                            # Not enough recent points yet; retry after another interval.
+                            geo_last_refit_step = total_steps
 
                     # ---------- Actor-Critic (imagination) ----------
                     with torch.no_grad():
@@ -769,7 +826,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     pcont = torch.sigmoid(cont_logits_im).clamp(0.0, 1.0)
                     discounts = effective_gamma * pcont
 
-                    if geo is not None and is_maze:
+                    if geo is not None and is_maze and cfg.geo_variant in ("plan_only", "shaping"):
                         goal_latent = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
                         if goal_latent is not None:
                             h_goal, s_goal = goal_latent
@@ -904,7 +961,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Dreamer + geodesic g_geo (plan_only / shaping / aux_backprop)")
-    p.add_argument("--env_id", type=str, default="custom_maze:spiral")
+    p.add_argument("--env_id", type=str, default="custom_maze:four_room")
     p.add_argument("--img_size", type=int, default=128)
     p.add_argument("--bit_depth", type=int, default=5)
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
@@ -944,7 +1001,7 @@ def parse_args():
 
     p.add_argument("--geo_dim", type=int, default=32)
     p.add_argument("--geo_lr", type=float, default=3e-4)
-    p.add_argument("--geo_warmup_steps", type=int, default=1_000)
+    p.add_argument("--geo_warmup_steps", type=int, default=5_000)
     p.add_argument("--geo_data_max_points", type=int, default=50_000)
 
     p.add_argument("--geo_sup_epochs", type=int, default=200)
@@ -953,6 +1010,9 @@ def parse_args():
     p.add_argument("--geo_sup_stress_weight", type=float, default=1.0)
     p.add_argument("--geo_sup_uniformity_weight", type=float, default=0.1)
     p.add_argument("--geo_sup_uniformity_t", type=float, default=2.0)
+    p.add_argument("--geo_aux_refit_interval", type=int, default=5_000)
+    p.add_argument("--geo_aux_refit_epochs", type=int, default=50)
+    p.add_argument("--geo_aux_refit_min_points", type=int, default=1_024)
 
     p.add_argument("--expl_amount", type=float, default=0.3)
     p.add_argument("--expl_decay", type=float, default=0.0)
