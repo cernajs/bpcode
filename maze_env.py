@@ -264,6 +264,7 @@ class PointMazeEnv:
         goal_reward: float = 1.0,
         hide_goal: bool = True,
         egocentric_crop_size: Optional[Tuple[int, int]] = None,
+        randomize_start: bool = True,
     ):
         if isinstance(layout, str) and layout in MAZE_LAYOUTS:
             lines = MAZE_LAYOUTS[layout]
@@ -283,6 +284,11 @@ class PointMazeEnv:
         self.goal_reward = goal_reward
         self.hide_goal = hide_goal
         self.egocentric_crop_size = egocentric_crop_size
+        self.randomize_start = randomize_start
+        self._free_cells = [
+            (r, c) for r in range(self.grid_h) for c in range(self.grid_w)
+            if self.grid[r][c] == "0"
+        ]
 
         self.start_pos = np.array(
             [self.start_cell[1] + 0.5, self.start_cell[0] + 0.5], dtype=np.float32
@@ -326,8 +332,13 @@ class PointMazeEnv:
         seed = kwargs.get("seed", None)
         if seed is not None:
             np.random.seed(seed)
-        self.x = self.start_pos[0]
-        self.y = self.start_pos[1]
+        if self.randomize_start and self._free_cells:
+            r, c = self._free_cells[np.random.randint(len(self._free_cells))]
+            self.x = float(c) + 0.5
+            self.y = float(r) + 0.5
+        else:
+            self.x = self.start_pos[0]
+            self.y = self.start_pos[1]
         self.steps = 0
         return self._render_obs(), {}
 
