@@ -260,7 +260,7 @@ class PointMazeEnv:
         max_speed: float = 0.12,
         goal_radius: float = 0.25,
         max_episode_steps: int = 200,
-        step_penalty: float = 0.0,
+        step_penalty: float = 0.1,
         goal_reward: float = 1.0,
         hide_goal: bool = True,
         egocentric_crop_size: Optional[Tuple[int, int]] = None,
