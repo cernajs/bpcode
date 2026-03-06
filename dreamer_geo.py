@@ -393,7 +393,7 @@ def evaluate_actor_policy(
 @dataclass
 class VariantCfg:
     name: str
-    # "plan_only" | "shaping" | "aux_backprop"
+    # "baseline" | "plan_only" | "shaping" | "aux_backprop"
     geo_variant: str = "plan_only"
     geo_plan_weight: float = 0.1
     geo_shaping_alpha: float = 0.3
@@ -1088,6 +1088,7 @@ def main():
         args.imagination_starts = 4
 
     variants: List[VariantCfg] = [
+        VariantCfg(name="baseline", geo_variant="baseline"),
         VariantCfg(name="geo_plan_only", geo_variant="plan_only", geo_plan_weight=0.15),
         VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.3),
         VariantCfg(name="geo_aux_backprop", geo_variant="aux_backprop", geo_aux_weight=0.05),
@@ -1095,7 +1096,7 @@ def main():
 
     all_results: Dict[str, List[Dict[str, float]]] = {v.name: [] for v in variants}
 
-    print("\nDreamer + geodesic g_geo (plan_only / shaping / aux_backprop)")
+    print("\nDreamer + geodesic g_geo (baseline / plan_only / shaping / aux_backprop)")
     print(f"Env: {args.env_id} | seeds={args.seeds} | quick={args.quick}")
     for v in variants:
         print(f"  - {v}")
