@@ -396,7 +396,7 @@ class VariantCfg:
     # "baseline" | "plan_only" | "shaping" | "aux_backprop"
     geo_variant: str = "plan_only"
     geo_plan_weight: float = 0.1
-    geo_shaping_alpha: float = 0.3
+    geo_shaping_alpha: float = 0.05  # keep shaping ~step signal; 0.3 dominated reward model
     geo_aux_weight: float = 0.05
 
 
@@ -547,16 +547,21 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             and is_maze
             and geo_trained_once
         )
+        # Use true env geodesic for replay shaping when available (avoids h_goal=zeros OOD)
+        use_true_geodesic_shaping = shaping_active and hasattr(env, "goal_pos")
         if shaping_active:
-            goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
-            if goal_lat is not None:
-                h_goal_real, s_goal_real = goal_lat
-                with torch.no_grad():
-                    g_init = geo(h, s)
-                    g_goal_init = geo(h_goal_real, s_goal_real)
-                    d_prev_geo = torch.norm(g_init - g_goal_init, dim=-1).item()
+            if use_true_geodesic_shaping:
+                d_prev_geo = geodesic.distance(env.agent_pos, env.goal_pos)
             else:
-                shaping_active = False
+                goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
+                if goal_lat is not None:
+                    h_goal_real, s_goal_real = goal_lat
+                    with torch.no_grad():
+                        g_init = geo(h, s)
+                        g_goal_init = geo(h_goal_real, s_goal_real)
+                        d_prev_geo = torch.norm(g_init - g_goal_init, dim=-1).item()
+                else:
+                    shaping_active = False
 
         while not done:
             encoder.eval()
@@ -602,10 +607,13 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 h, s, _, _ = rssm.observe_step(e, act_t, h, s, sample=False)
 
             if shaping_active:
-                with torch.no_grad():
-                    g_now = geo(h, s)
-                    g_goal_now = geo(h_goal_real, s_goal_real)
-                    d_now = torch.norm(g_now - g_goal_now, dim=-1).item()
+                if use_true_geodesic_shaping:
+                    d_now = geodesic.distance(env.agent_pos, env.goal_pos)
+                else:
+                    with torch.no_grad():
+                        g_now = geo(h, s)
+                        g_goal_now = geo(h_goal_real, s_goal_real)
+                        d_now = torch.norm(g_now - g_goal_now, dim=-1).item()
                 replay.rews[write_idx] = total_reward + cfg.geo_shaping_alpha * (d_prev_geo - d_now)
                 d_prev_geo = d_now
 
@@ -1090,7 +1098,7 @@ def main():
     variants: List[VariantCfg] = [
         VariantCfg(name="baseline", geo_variant="baseline"),
         VariantCfg(name="geo_plan_only", geo_variant="plan_only", geo_plan_weight=0.15),
-        VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.3),
+        VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.05),
         VariantCfg(name="geo_aux_backprop", geo_variant="aux_backprop", geo_aux_weight=0.05),
     ]
 
