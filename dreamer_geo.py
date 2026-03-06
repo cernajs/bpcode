@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 Dreamer with geodesic-trained g_geo (GeodesicComputer + train_geo_encoder_geodesic).
-No dyn_pb_reg_weight / dyn_pb_bisim_weight.
 
-Three variants (run as multiple variants in one script):
-  1. plan_only: Train Dreamer, freeze WM, train g_geo on replay; use g_geo only at
-     planning time: minimize ||g_geo(z_t) - g_geo(z_goal)|| (goal from env).
-  2. shaping: Same g_geo; reward shaping r_t' = r_t + alpha*(d_geo(t-1) - d_geo(t)).
-  3. aux_backprop: Warm up WM, train g_geo, then unfreeze encoder+RSSM and add
-     geodesic pairwise stress loss through g_geo(h,s) into encoder+RSSM
-     (with periodic g_geo re-fit to reduce drift).
+Three variants (all keep the world model training throughout):
+  1. plan_only: Continuous WM+AC training; g_geo penalises imagined trajectories
+     that move away from the goal in geodesic space.
+  2. shaping: Continuous WM+AC training; PBRS on *real* env rewards stored in
+     replay: r' = r + alpha*(d_geo(t-1) - d_geo(t)), so the reward model
+     learns a dense signal.  Imagined rewards also get the same shaping.
+  3. aux_backprop: Continuous WM training with an auxiliary geodesic stress loss
+     that regularises encoder+RSSM geometry (freeze_geo=False so g_geo
+     co-adapts; decoder/reward/cont grads zeroed to isolate the signal).
+     Periodic g_geo re-fit to bound representational drift.
 """
 
 import os
@@ -458,6 +460,11 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     value_optim = torch.optim.Adam(
         value_model.parameters(), lr=args.value_lr, eps=args.adam_eps
     )
+    geo_optim = (
+        torch.optim.Adam(geo.parameters(), lr=args.geo_lr, eps=args.adam_eps)
+        if geo is not None and cfg.geo_variant == "aux_backprop"
+        else None
+    )
     replay = ReplayBuffer(args.replay_capacity, obs_shape=(H, W, C), act_dim=act_dim)
     geo_pos_replay = (
         np.full((args.replay_capacity, 2), np.nan, dtype=np.float32) if is_maze else None
@@ -473,8 +480,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     writer.add_text("hyperparameters", str(vars(args)), 0)
     writer.add_text("variant", str(cfg), 0)
 
-    # Phasing: V1/V2: warmup -> freeze WM -> train g_geo once -> plan with g_geo.
-    #           V3: warmup -> train g_geo once -> aux_backprop (encoder+rssm only).
+    # Phasing: warmup WM -> train g_geo once -> continue WM+AC (all variants).
+    #   aux_backprop additionally applies stress loss and periodic g_geo refit.
     geo_phase = "warmup"
     wm_frozen = False
     geo_trained_once = False
@@ -532,6 +539,25 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             traj_h.append(h.squeeze(0).cpu().numpy().copy())
             traj_s.append(s.squeeze(0).cpu().numpy().copy())
 
+        d_prev_geo = 0.0
+        h_goal_real, s_goal_real = None, None
+        shaping_active = (
+            cfg.geo_variant == "shaping"
+            and geo is not None
+            and is_maze
+            and geo_trained_once
+        )
+        if shaping_active:
+            goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
+            if goal_lat is not None:
+                h_goal_real, s_goal_real = goal_lat
+                with torch.no_grad():
+                    g_init = geo(h, s)
+                    g_goal_init = geo(h_goal_real, s_goal_real)
+                    d_prev_geo = torch.norm(g_init - g_goal_init, dim=-1).item()
+            else:
+                shaping_active = False
+
         while not done:
             encoder.eval()
             rssm.eval()
@@ -574,6 +600,15 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 e = encoder(obs_t)
                 act_t = torch.tensor(a_np, dtype=torch.float32, device=device).unsqueeze(0)
                 h, s, _, _ = rssm.observe_step(e, act_t, h, s, sample=False)
+
+            if shaping_active:
+                with torch.no_grad():
+                    g_now = geo(h, s)
+                    g_goal_now = geo(h_goal_real, s_goal_real)
+                    d_now = torch.norm(g_now - g_goal_now, dim=-1).item()
+                replay.rews[write_idx] = total_reward + cfg.geo_shaping_alpha * (d_prev_geo - d_now)
+                d_prev_geo = d_now
+
             if is_maze and geo is not None:
                 traj_pos.append(np.asarray(env.agent_pos, dtype=np.float32).copy())
                 traj_h.append(h.squeeze(0).cpu().numpy().copy())
@@ -666,7 +701,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                             stress_eps=args.geo_sup_stress_eps,
                             num_pairs=max(512, args.geo_sup_batch),
                             min_pairs=16,
-                            freeze_geo=True,
+                            freeze_geo=False,
                         )
 
                     model_loss = (
@@ -697,6 +732,11 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip_norm)
                         model_optim.step()
 
+                    if geo_optim is not None and geo_phase == "aux_backprop":
+                        torch.nn.utils.clip_grad_norm_(geo.parameters(), args.grad_clip_norm)
+                        geo_optim.step()
+                        geo_optim.zero_grad(set_to_none=True)
+
                     # ---------- Train g_geo once after warmup (geodesic-supervised) ----------
                     if (
                         geo is not None
@@ -706,8 +746,6 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     ):
                         total_pts = sum(len(p) for p, _, _ in geo_data)
                         if total_pts >= 512:
-                            if cfg.geo_variant in ("plan_only", "shaping"):
-                                wm_frozen = True
                             geo_phase = "geo_train"
                             all_pos = np.concatenate([p for p, _, _ in geo_data], axis=0)
                             all_h = np.concatenate([_h for _, _h, _ in geo_data], axis=0)
@@ -741,6 +779,11 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 geo_phase = "aux_backprop"
                                 wm_frozen = False
                                 geo_last_refit_step = total_steps
+                                geo_optim = torch.optim.Adam(
+                                    geo.parameters(), lr=args.geo_lr, eps=args.adam_eps
+                                )
+                            else:
+                                geo_phase = "active"
                             geo_data.clear()
 
                     # ---------- Periodic g_geo re-fit in aux phase (reduce drift) ----------
@@ -791,6 +834,10 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                             geo_phase = "aux_backprop"
                             geo_last_refit_step = total_steps
                             geo_refit_count += 1
+                            if geo_optim is not None:
+                                geo_optim = torch.optim.Adam(
+                                    geo.parameters(), lr=args.geo_lr, eps=args.adam_eps
+                                )
                             writer.add_scalar("geo/refit_count", geo_refit_count, total_steps)
                         else:
                             # Not enough recent points yet; retry after another interval.
@@ -826,7 +873,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     pcont = torch.sigmoid(cont_logits_im).clamp(0.0, 1.0)
                     discounts = effective_gamma * pcont
 
-                    if geo is not None and is_maze and cfg.geo_variant in ("plan_only", "shaping"):
+                    if geo is not None and is_maze and geo_trained_once and cfg.geo_variant in ("plan_only", "shaping"):
                         goal_latent = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
                         if goal_latent is not None:
                             h_goal, s_goal = goal_latent
@@ -1001,7 +1048,7 @@ def parse_args():
 
     p.add_argument("--geo_dim", type=int, default=32)
     p.add_argument("--geo_lr", type=float, default=3e-4)
-    p.add_argument("--geo_warmup_steps", type=int, default=5_000)
+    p.add_argument("--geo_warmup_steps", type=int, default=20_000)
     p.add_argument("--geo_data_max_points", type=int, default=50_000)
 
     p.add_argument("--geo_sup_epochs", type=int, default=200)
@@ -1015,8 +1062,8 @@ def parse_args():
     p.add_argument("--geo_aux_refit_min_points", type=int, default=1_024)
 
     p.add_argument("--expl_amount", type=float, default=0.3)
-    p.add_argument("--expl_decay", type=float, default=0.0)
-    p.add_argument("--expl_min", type=float, default=0.0)
+    p.add_argument("--expl_decay", type=float, default=1e-4)
+    p.add_argument("--expl_min", type=float, default=0.05)
 
     p.add_argument("--eval_episodes", type=int, default=10)
     p.add_argument("--eval_interval", type=int, default=50)
