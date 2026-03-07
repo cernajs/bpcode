@@ -1064,7 +1064,7 @@ def parse_args():
 
     p.add_argument("--geo_dim", type=int, default=32)
     p.add_argument("--geo_lr", type=float, default=3e-4)
-    p.add_argument("--geo_warmup_steps", type=int, default=20_000)
+    p.add_argument("--geo_warmup_steps", type=int, default=40_000)
     p.add_argument("--geo_data_max_points", type=int, default=50_000)
 
     p.add_argument("--geo_sup_epochs", type=int, default=200)
