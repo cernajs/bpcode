@@ -800,6 +800,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                             else:
                                 geo_phase = "active"
                                 wm_frozen = True
+                                expl = args.expl_amount
                             geo_data.clear()
 
                     # ---------- Periodic g_geo re-fit in aux phase (reduce drift) ----------
@@ -1105,10 +1106,10 @@ def main():
         args.imagination_starts = 4
 
     variants: List[VariantCfg] = [
-        VariantCfg(name="baseline", geo_variant="baseline"),
-        VariantCfg(name="geo_plan_only", geo_variant="plan_only", geo_plan_weight=0.15),
+        #VariantCfg(name="baseline", geo_variant="baseline"),
+        #VariantCfg(name="geo_plan_only", geo_variant="plan_only", geo_plan_weight=0.15),
         VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.05),
-        VariantCfg(name="geo_aux_backprop", geo_variant="aux_backprop", geo_aux_weight=0.05),
+        #VariantCfg(name="geo_aux_backprop", geo_variant="aux_backprop", geo_aux_weight=0.05),
     ]
 
     all_results: Dict[str, List[Dict[str, float]]] = {v.name: [] for v in variants}
