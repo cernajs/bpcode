@@ -317,8 +317,15 @@ def get_goal_latent(
     preprocess_img(obs_t, depth=bit_depth)
     with torch.no_grad():
         e = encoder(obs_t)
-        h, s = rssm.get_init_state(e)
-    return h, s
+        h_init, s_init = rssm.get_init_state(e)
+        
+        # dummy step so h isnt all zeros
+        a_dummy = torch.zeros((1, env.action_space.shape[0]), device=device)
+        h_goal = rssm.deterministic_state_fwd(h_init, s_init, a_dummy)
+        
+        post_m, _ = rssm.state_posterior(h_goal, e)
+        s_goal = post_m
+    return h_goal, s_goal
 
 
 # ===============================
@@ -475,7 +482,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     geo_data: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     geo_data_max_points = getattr(args, "geo_data_max_points", 50_000)
 
-    run_name = f"{args.env_id}_{cfg.name}_seed{seed}"
+    run_name = f"{args.env_id}_{cfg.name}_seed{seed}_use_env_geodesic{args.use_env_geodesic}"
     writer = SummaryWriter(log_dir=os.path.join(args.log_dir, run_name))
     writer.add_text("hyperparameters", str(vars(args)), 0)
     writer.add_text("variant", str(cfg), 0)
@@ -550,7 +557,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
         # Use true env geodesic for replay shaping when available (avoids h_goal=zeros OOD)
         use_true_geodesic_shaping = shaping_active and hasattr(env, "goal_pos")
         if shaping_active:
-            if use_true_geodesic_shaping:
+            if use_true_geodesic_shaping and args.use_env_geodesic:
                 d_prev_geo = geodesic.distance(env.agent_pos, env.goal_pos)
             else:
                 goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
@@ -792,6 +799,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 )
                             else:
                                 geo_phase = "active"
+                                wm_frozen = True
                             geo_data.clear()
 
                     # ---------- Periodic g_geo re-fit in aux phase (reduce drift) ----------
@@ -1023,7 +1031,7 @@ def parse_args():
     p.add_argument("--quick", action="store_true")
 
     p.add_argument("--seed_episodes", type=int, default=5)
-    p.add_argument("--max_episodes", type=int, default=500)
+    p.add_argument("--max_episodes", type=int, default=1000)
     p.add_argument("--collect_interval", type=int, default=50)
     p.add_argument("--train_steps", type=int, default=30)
     p.add_argument("--action_repeat", type=int, default=0)
@@ -1068,6 +1076,7 @@ def parse_args():
     p.add_argument("--geo_aux_refit_interval", type=int, default=5_000)
     p.add_argument("--geo_aux_refit_epochs", type=int, default=50)
     p.add_argument("--geo_aux_refit_min_points", type=int, default=1_024)
+    p.add_argument("--use_env_geodesic", action="store_true", default=False)
 
     p.add_argument("--expl_amount", type=float, default=0.3)
     p.add_argument("--expl_decay", type=float, default=1e-4)
