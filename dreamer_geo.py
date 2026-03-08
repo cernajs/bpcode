@@ -1116,7 +1116,7 @@ def main():
     variants: List[VariantCfg] = [
         #VariantCfg(name="baseline", geo_variant="baseline"),
         #VariantCfg(name="geo_plan_only", geo_variant="plan_only", geo_plan_weight=0.15),
-        VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.05),
+        VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.4),
         #VariantCfg(name="geo_aux_backprop", geo_variant="aux_backprop", geo_aux_weight=0.05),
     ]
 
