@@ -555,6 +555,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             and geo_trained_once
         )
         # Use true env geodesic for replay shaping when available (avoids h_goal=zeros OOD)
+        """
         use_true_geodesic_shaping = shaping_active and hasattr(env, "goal_pos")
         if shaping_active:
             if use_true_geodesic_shaping and args.use_env_geodesic:
@@ -569,7 +570,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         d_prev_geo = torch.norm(g_init - g_goal_init, dim=-1).item()
                 else:
                     shaping_active = False
-
+        """
         while not done:
             encoder.eval()
             rssm.eval()
@@ -613,6 +614,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 act_t = torch.tensor(a_np, dtype=torch.float32, device=device).unsqueeze(0)
                 h, s, _, _ = rssm.observe_step(e, act_t, h, s, sample=False)
 
+            """
             if shaping_active:
                 if use_true_geodesic_shaping and args.use_env_geodesic:
                     d_now = geodesic.distance(env.agent_pos, env.goal_pos)
@@ -628,6 +630,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         shaping_active = False
                 replay.rews[write_idx] = total_reward + cfg.geo_shaping_alpha * (d_prev_geo - d_now)
                 d_prev_geo = d_now
+            """
 
             if is_maze and geo is not None:
                 traj_pos.append(np.asarray(env.agent_pos, dtype=np.float32).copy())
@@ -749,12 +752,6 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 p.grad.zero_()
 
                     if not wm_frozen:
-                        torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip_norm)
-                        model_optim.step()
-                    elif cfg.geo_variant == "shaping":
-                        for p in list(encoder.parameters()) + list(rssm.parameters()):
-                            if p.grad is not None:
-                                p.grad.zero_()
                         torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip_norm)
                         model_optim.step()
 
@@ -1119,7 +1116,7 @@ def main():
     variants: List[VariantCfg] = [
         #VariantCfg(name="baseline", geo_variant="baseline"),
         #VariantCfg(name="geo_plan_only", geo_variant="plan_only", geo_plan_weight=0.15),
-        VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.1),
+        VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.05),
         #VariantCfg(name="geo_aux_backprop", geo_variant="aux_backprop", geo_aux_weight=0.05),
     ]
 
