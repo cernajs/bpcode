@@ -746,6 +746,12 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     if not wm_frozen:
                         torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip_norm)
                         model_optim.step()
+                    elif cfg.geo_variant == "shaping":
+                        for p in list(encoder.parameters()) + list(rssm.parameters()):
+                            if p.grad is not None:
+                                p.grad.zero_()
+                        torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip_norm)
+                        model_optim.step()
 
                     if geo_optim is not None and geo_phase == "aux_backprop":
                         torch.nn.utils.clip_grad_norm_(geo.parameters(), args.grad_clip_norm)
@@ -1108,7 +1114,7 @@ def main():
     variants: List[VariantCfg] = [
         #VariantCfg(name="baseline", geo_variant="baseline"),
         #VariantCfg(name="geo_plan_only", geo_variant="plan_only", geo_plan_weight=0.15),
-        VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.05),
+        VariantCfg(name="geo_shaping", geo_variant="shaping", geo_shaping_alpha=0.4),
         #VariantCfg(name="geo_aux_backprop", geo_variant="aux_backprop", geo_aux_weight=0.05),
     ]
 
