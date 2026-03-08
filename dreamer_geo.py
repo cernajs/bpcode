@@ -614,13 +614,18 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 h, s, _, _ = rssm.observe_step(e, act_t, h, s, sample=False)
 
             if shaping_active:
-                if use_true_geodesic_shaping:
+                if use_true_geodesic_shaping and args.use_env_geodesic:
                     d_now = geodesic.distance(env.agent_pos, env.goal_pos)
                 else:
-                    with torch.no_grad():
-                        g_now = geo(h, s)
-                        g_goal_now = geo(h_goal_real, s_goal_real)
-                        d_now = torch.norm(g_now - g_goal_now, dim=-1).item()
+                    goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
+                    if goal_lat is not None:
+                        h_goal_real, s_goal_real = goal_lat
+                        with torch.no_grad():
+                            g_now = geo(h, s)
+                            g_goal_now = geo(h_goal_real, s_goal_real)
+                            d_now = torch.norm(g_now - g_goal_now, dim=-1).item()
+                    else:
+                        shaping_active = False
                 replay.rews[write_idx] = total_reward + cfg.geo_shaping_alpha * (d_prev_geo - d_now)
                 d_prev_geo = d_now
 
