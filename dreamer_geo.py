@@ -379,11 +379,34 @@ def get_shaping_reward_batch(
         return shaping.clamp(clip_range[0], clip_range[1])
 
 
+def is_shaping_active(
+    args,
+    cfg: "VariantCfg",
+    geo: Optional[GeoEncoder],
+    geo_target: Optional[GeoEncoder],
+    is_maze: bool,
+    geo_trained_once: bool,
+    geo_last_stress: float,
+) -> bool:
+    """Single source of truth for whether shaping is currently enabled."""
+    return (
+        cfg.geo_variant == "shaping"
+        and geo is not None
+        and geo_target is not None
+        and is_maze
+        and geo_trained_once
+        and geo_last_stress < getattr(args, "geo_shaping_stress_threshold", 0.05)
+    )
+
+
 def refresh_replay_shaping(
+    args,
+    cfg: "VariantCfg",
     replay: ReplayBuffer,
     replay_env_rews: np.ndarray,
     encoder: nn.Module,
     rssm: nn.Module,
+    geo: Optional[GeoEncoder],
     geo_target: GeoEncoder,
     env,
     device: torch.device,
@@ -393,13 +416,21 @@ def refresh_replay_shaping(
     alpha: float,
     clip_range: Tuple[float, float],
     num_batches: int,
+    is_maze: bool,
+    geo_trained_once: bool,
+    geo_last_stress: float,
 ) -> None:
     """Re-calculate shaped rewards for a portion of the replay buffer using geo_target.
     Use after geo refit so RewardModel sees rewards consistent with current geometry."""
-    goal_latent = get_goal_latent(env, encoder, rssm, device, bit_depth)
-    if goal_latent is None:
-        return
-    h_goal, s_goal = goal_latent
+    shaping_active = is_shaping_active(
+        args, cfg, geo, geo_target, is_maze, geo_trained_once, geo_last_stress
+    )
+    h_goal, s_goal = None, None
+    if shaping_active:
+        goal_latent = get_goal_latent(env, encoder, rssm, device, bit_depth)
+        if goal_latent is None:
+            return
+        h_goal, s_goal = goal_latent
     encoder.eval()
     rssm.eval()
     geo_target.eval()
@@ -429,20 +460,34 @@ def refresh_replay_shaping(
             s_prev = s_seq[:, :-1].reshape(-1, s_seq.size(-1))
             h_now = h_seq[:, 1:].reshape(-1, h_seq.size(-1))
             s_now = s_seq[:, 1:].reshape(-1, s_seq.size(-1))
-            n_trans = B * T
-            h_goal_exp = h_goal.expand(n_trans, -1)
-            s_goal_exp = s_goal.expand(n_trans, -1)
-            shaping = get_shaping_reward_batch(
-                geo_target, h_prev, s_prev, h_now, s_now, h_goal_exp, s_goal_exp, alpha, clip_range
-            )
-            shaping_np = shaping.cpu().numpy().reshape(B, T)
             for b in range(B):
                 for t in range(T):
                     buf_idx = int(seq_idx[b, t + 1])
-                    replay.rews[buf_idx] = replay_env_rews[buf_idx] + float(shaping_np[b, t])
+                    replay.rews[buf_idx] = replay_env_rews[buf_idx]
                     updated += 1
+            if shaping_active:
+                n_trans = B * T
+                h_goal_exp = h_goal.expand(n_trans, -1)
+                s_goal_exp = s_goal.expand(n_trans, -1)
+                shaping = get_shaping_reward_batch(
+                    geo_target,
+                    h_prev,
+                    s_prev,
+                    h_now,
+                    s_now,
+                    h_goal_exp,
+                    s_goal_exp,
+                    alpha,
+                    clip_range,
+                )
+                shaping_np = shaping.cpu().numpy().reshape(B, T)
+                for b in range(B):
+                    for t in range(T):
+                        buf_idx = int(seq_idx[b, t + 1])
+                        replay.rews[buf_idx] = replay_env_rews[buf_idx] + float(shaping_np[b, t])
     if updated > 0:
-        print(f"    Refreshed {updated} buffer rewards with geo_target shaping.")
+        mode = "shaped" if shaping_active else "env-only"
+        print(f"    Refreshed {updated} buffer rewards ({mode}).")
 
 
 # ===============================
@@ -675,25 +720,6 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
         d_prev_geo = 0.0
         h_goal_real, s_goal_real = None, None
-        stress_threshold = getattr(args, "geo_shaping_stress_threshold", 0.05)
-        shaping_active = (
-            cfg.geo_variant == "shaping"
-            and geo is not None
-            and geo_target is not None
-            and is_maze
-            and geo_trained_once
-            and geo_last_stress < stress_threshold
-        )
-        if shaping_active:
-            goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
-            if goal_lat is not None:
-                h_goal_real, s_goal_real = goal_lat
-                with torch.no_grad():
-                    g_init = geo_target(h, s)
-                    g_goal_init = geo_target(h_goal_real, s_goal_real)
-                    d_prev_geo = torch.norm(g_init - g_goal_init, dim=-1).item()
-            else:
-                shaping_active = False
         while not done:
             encoder.eval()
             rssm.eval()
@@ -728,6 +754,10 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             obs = next_obs
             total_steps += 1
 
+            shaping_active = is_shaping_active(
+                args, cfg, geo, geo_target, is_maze, geo_trained_once, geo_last_stress
+            )
+
             if (
                 cfg.geo_variant == "shaping"
                 and geo_target is not None
@@ -738,10 +768,13 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                 geo_target.load_state_dict(geo.state_dict())
                 if replay_env_rews is not None and replay.size > (args.seq_len + 2):
                     refresh_replay_shaping(
+                        args,
+                        cfg,
                         replay,
                         replay_env_rews,
                         encoder,
                         rssm,
+                        geo,
                         geo_target,
                         env,
                         device,
@@ -751,6 +784,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         cfg.geo_shaping_alpha,
                         shaping_clip,
                         getattr(args, "geo_refit_refresh_batches", 100),
+                        is_maze,
+                        geo_trained_once,
+                        geo_last_stress,
                     )
 
             obs_t = (
@@ -782,6 +818,26 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                     g_now = geo_target(h, s)
                     g_goal_now = geo_target(h_goal_real, s_goal_real)
                     d_prev_geo = torch.norm(g_now - g_goal_now, dim=-1).item()
+            elif shaping_active:
+                goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
+                if goal_lat is not None:
+                    h_goal_real, s_goal_real = goal_lat
+                    with torch.no_grad():
+                        g_prev = geo_target(h_prev, s_prev)
+                        g_goal_prev = geo_target(h_goal_real, s_goal_real)
+                        d_prev_geo = torch.norm(g_prev - g_goal_prev, dim=-1).item()
+                    shaping_val = get_shaping_reward(
+                        geo_target,
+                        h_prev,
+                        s_prev,
+                        h,
+                        s,
+                        h_goal_real,
+                        s_goal_real,
+                        cfg.geo_shaping_alpha,
+                        clip_range=shaping_clip,
+                    )
+                    replay.rews[write_idx] = total_reward + shaping_val
 
             if is_maze and geo is not None:
                 traj_pos.append(np.asarray(env.agent_pos, dtype=np.float32).copy())
@@ -1027,10 +1083,13 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 geo_target.load_state_dict(geo.state_dict())
                             if replay_env_rews is not None and geo_target is not None:
                                 refresh_replay_shaping(
+                                    args,
+                                    cfg,
                                     replay,
                                     replay_env_rews,
                                     encoder,
                                     rssm,
+                                    geo,
                                     geo_target,
                                     env,
                                     device,
@@ -1040,6 +1099,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                     cfg.geo_shaping_alpha,
                                     shaping_clip,
                                     getattr(args, "geo_refit_refresh_batches", 100),
+                                    is_maze,
+                                    geo_trained_once,
+                                    geo_last_stress,
                                 )
                             geo_phase = "aux_backprop"
                             geo_last_refit_step = total_steps
@@ -1095,7 +1157,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                             d_geo_t = d_geo[:, 1:]
                             if cfg.geo_variant == "plan_only":
                                 rewards_im = rewards_im - cfg.geo_plan_weight * d_geo_t
-                            elif cfg.geo_variant == "shaping":
+                            elif is_shaping_active(
+                                args, cfg, geo, geo_target, is_maze, geo_trained_once, geo_last_stress
+                            ):
                                 B_im, H_im = h_imag.size(0), h_imag.size(1) - 1
                                 n_trans = B_im * H_im
                                 h_goal_exp = h_goal.expand(n_trans, -1)
@@ -1112,6 +1176,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                     shaping_clip,
                                 )
                                 rewards_im = rewards_im + progress.reshape(B_im, H_im)
+                            elif cfg.geo_variant == "shaping":
+                                pass
                             else:
                                 rewards_im = rewards_im - cfg.geo_plan_weight * d_geo_t
 
@@ -1285,7 +1351,7 @@ def parse_args():
     p.add_argument("--geo_aux_refit_epochs", type=int, default=50)
     p.add_argument("--geo_aux_refit_min_points", type=int, default=1_024)
     p.add_argument("--geo_refit_refresh_batches", type=int, default=100, help="Batches of buffer to refresh with new shaping on geo refit")
-    p.add_argument("--geo_shaping_stress_threshold", type=float, default=0.05, help="Enable shaping only when GeoSup stress < this")
+    p.add_argument("--geo_shaping_stress_threshold", type=float, default=0.15, help="Enable shaping only when GeoSup stress < this")
     p.add_argument("--geo_target_update_interval", type=int, default=5_000, help="Steps between syncing geo_target from geo (shaping variant)")
     p.add_argument("--use_env_geodesic", action="store_true", default=False)
 
