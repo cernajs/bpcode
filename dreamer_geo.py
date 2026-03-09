@@ -96,8 +96,9 @@ def train_geo_encoder_geodesic(
     geo_sup_uniformity_t: float,
     device: torch.device,
     geodesic,
-) -> GeoEncoder:
-    """Train GeoEncoder so ||g_i - g_j|| matches geodesic distance (pairwise stress + uniformity)."""
+) -> Tuple[GeoEncoder, float]:
+    """Train GeoEncoder so ||g_i - g_j|| matches geodesic distance (pairwise stress + uniformity).
+    Returns (trained geo, final_stress) for stability gating."""
     geo = GeoEncoder(deter_dim, stoch_dim, geo_dim=geo_dim, hidden_dim=geo_hidden).to(device)
     scale = torch.nn.Parameter(torch.tensor(0.1, device=device))
     opt = torch.optim.Adam(list(geo.parameters()) + [scale], lr=geo_lr)
@@ -106,9 +107,10 @@ def train_geo_encoder_geodesic(
     h = data["h"]
     s = data["s"]
     N = len(pos)
+    final_stress = float("inf")
     if N < 512:
         geo.eval()
-        return geo
+        return geo, final_stress
 
     cell_idx = _positions_to_cell_indices(geodesic, pos)
     dist_mat = geodesic.dist_matrix
@@ -144,6 +146,7 @@ def train_geo_encoder_geodesic(
 
         scale_d_geo = scale.clamp(min=1e-4) * d_geo_t
         stress = (weight * (d_lat - scale_d_geo).pow(2)).mean()
+        final_stress = stress.item()
         loss_uni = _uniformity_loss_sphere(torch.stack([g_i, g_j], 1), t=geo_sup_uniformity_t)
         loss = geo_sup_stress_weight * stress + geo_sup_uniformity_weight * loss_uni
 
@@ -158,7 +161,7 @@ def train_geo_encoder_geodesic(
             )
 
     geo.eval()
-    return geo
+    return geo, final_stress
 
 
 def sample_sequences_with_indices(
@@ -328,6 +331,120 @@ def get_goal_latent(
     return h_goal, s_goal
 
 
+def get_shaping_reward(
+    geo_net: nn.Module,
+    h_prev: torch.Tensor,
+    s_prev: torch.Tensor,
+    h_now: torch.Tensor,
+    s_now: torch.Tensor,
+    h_goal: torch.Tensor,
+    s_goal: torch.Tensor,
+    alpha: float,
+    clip_range: Tuple[float, float] = (-1.0, 1.0),
+) -> float:
+    """PBRS shaping: alpha * (d_prev - d_now), clipped. Use geo_target for stability."""
+    with torch.no_grad():
+        g_prev = geo_net(h_prev, s_prev)
+        g_now = geo_net(h_now, s_now)
+        g_goal = geo_net(h_goal, s_goal)
+        d_prev = torch.norm(g_prev - g_goal, dim=-1)
+        d_now = torch.norm(g_now - g_goal, dim=-1)
+        shaping = alpha * (d_prev - d_now)
+        shaping = shaping.clamp(clip_range[0], clip_range[1])
+        return shaping.item()
+
+
+def get_shaping_reward_batch(
+    geo_net: nn.Module,
+    h_prev: torch.Tensor,
+    s_prev: torch.Tensor,
+    h_now: torch.Tensor,
+    s_now: torch.Tensor,
+    h_goal: torch.Tensor,
+    s_goal: torch.Tensor,
+    alpha: float,
+    clip_range: Tuple[float, float] = (-1.0, 1.0),
+) -> torch.Tensor:
+    """Batched PBRS shaping for imagination: alpha * (d_prev - d_now), clipped."""
+    with torch.no_grad():
+        g_prev = geo_net(h_prev, s_prev)
+        g_now = geo_net(h_now, s_now)
+        # h_goal, s_goal can be [1, D] or [B, D]
+        g_goal = geo_net(h_goal, s_goal)
+        if g_goal.dim() == 2 and g_prev.dim() == 3:
+            g_goal = g_goal.unsqueeze(1)
+        d_prev = torch.norm(g_prev - g_goal, dim=-1)
+        d_now = torch.norm(g_now - g_goal, dim=-1)
+        shaping = alpha * (d_prev - d_now)
+        return shaping.clamp(clip_range[0], clip_range[1])
+
+
+def refresh_replay_shaping(
+    replay: ReplayBuffer,
+    replay_env_rews: np.ndarray,
+    encoder: nn.Module,
+    rssm: nn.Module,
+    geo_target: GeoEncoder,
+    env,
+    device: torch.device,
+    bit_depth: int,
+    seq_len: int,
+    batch_size: int,
+    alpha: float,
+    clip_range: Tuple[float, float],
+    num_batches: int,
+) -> None:
+    """Re-calculate shaped rewards for a portion of the replay buffer using geo_target.
+    Use after geo refit so RewardModel sees rewards consistent with current geometry."""
+    goal_latent = get_goal_latent(env, encoder, rssm, device, bit_depth)
+    if goal_latent is None:
+        return
+    h_goal, s_goal = goal_latent
+    encoder.eval()
+    rssm.eval()
+    geo_target.eval()
+    updated = 0
+    for _ in range(num_batches):
+        batch, seq_idx = sample_sequences_with_indices(replay, batch_size, seq_len)
+        obs_seq = torch.as_tensor(batch.obs, device=device).float()
+        act_seq = torch.as_tensor(batch.actions, device=device)
+        B, T1 = obs_seq.shape[0], obs_seq.shape[1]
+        T = T1 - 1
+        x = obs_seq.permute(0, 1, 4, 2, 3).contiguous()
+        preprocess_img(x, depth=bit_depth)
+        with torch.no_grad():
+            e_t = bottle(encoder, x)
+            h_t, s_t = rssm.get_init_state(e_t[:, 0])
+            h_list, s_list = [h_t], [s_t]
+            for t in range(T):
+                h_t = rssm.deterministic_state_fwd(h_t, s_t, act_seq[:, t])
+                pri_m, pri_s = rssm.state_prior(h_t)
+                s_t = pri_m + torch.randn_like(pri_s) * pri_s
+                h_list.append(h_t)
+                s_list.append(s_t)
+            h_seq = torch.stack(h_list, dim=1)
+            s_seq = torch.stack(s_list, dim=1)
+            # Transitions t-1 -> t for t in 1..T
+            h_prev = h_seq[:, :-1].reshape(-1, h_seq.size(-1))
+            s_prev = s_seq[:, :-1].reshape(-1, s_seq.size(-1))
+            h_now = h_seq[:, 1:].reshape(-1, h_seq.size(-1))
+            s_now = s_seq[:, 1:].reshape(-1, s_seq.size(-1))
+            n_trans = B * T
+            h_goal_exp = h_goal.expand(n_trans, -1)
+            s_goal_exp = s_goal.expand(n_trans, -1)
+            shaping = get_shaping_reward_batch(
+                geo_target, h_prev, s_prev, h_now, s_now, h_goal_exp, s_goal_exp, alpha, clip_range
+            )
+            shaping_np = shaping.cpu().numpy().reshape(B, T)
+            for b in range(B):
+                for t in range(T):
+                    buf_idx = int(seq_idx[b, t + 1])
+                    replay.rews[buf_idx] = replay_env_rews[buf_idx] + float(shaping_np[b, t])
+                    updated += 1
+    if updated > 0:
+        print(f"    Refreshed {updated} buffer rewards with geo_target shaping.")
+
+
 # ===============================
 #  Evaluation
 # ===============================
@@ -446,6 +563,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     value_model = ValueModel(args.deter_dim, args.stoch_dim, args.value_hidden_dim).to(device)
 
     geo = None
+    geo_target = None
     if is_maze and cfg.geo_variant in ("plan_only", "shaping", "aux_backprop"):
         geo = GeoEncoder(
             args.deter_dim,
@@ -476,6 +594,11 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     geo_pos_replay = (
         np.full((args.replay_capacity, 2), np.nan, dtype=np.float32) if is_maze else None
     )
+    replay_env_rews = (
+        np.zeros(args.replay_capacity, dtype=np.float32)
+        if (is_maze and cfg.geo_variant == "shaping")
+        else None
+    )
     free_nats = torch.ones(1, device=device) * args.kl_free_nats
 
     # Geo data: (pos, h, s) for geodesic-supervised g_geo training (maze only)
@@ -492,8 +615,10 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     geo_phase = "warmup"
     wm_frozen = False
     geo_trained_once = False
+    geo_last_stress = float("inf")
     geo_last_refit_step = -1
     geo_refit_count = 0
+    shaping_clip = (-1.0, 1.0)
 
     # Seed buffer
     for _ in range(args.seed_episodes):
@@ -509,6 +634,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             next_obs, total_reward, term, trunc, _ = env.step(action, repeat=action_repeat)
             done = bool(term or trunc)
             write_idx = replay.idx
+            if replay_env_rews is not None:
+                replay_env_rews[write_idx] = total_reward
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=np.asarray(action, np.float32),
@@ -548,29 +675,25 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
 
         d_prev_geo = 0.0
         h_goal_real, s_goal_real = None, None
+        stress_threshold = getattr(args, "geo_shaping_stress_threshold", 0.05)
         shaping_active = (
             cfg.geo_variant == "shaping"
             and geo is not None
+            and geo_target is not None
             and is_maze
             and geo_trained_once
+            and geo_last_stress < stress_threshold
         )
-        # Use true env geodesic for replay shaping when available (avoids h_goal=zeros OOD)
-        """
-        use_true_geodesic_shaping = shaping_active and hasattr(env, "goal_pos")
         if shaping_active:
-            if use_true_geodesic_shaping and args.use_env_geodesic:
-                d_prev_geo = geodesic.distance(env.agent_pos, env.goal_pos)
+            goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
+            if goal_lat is not None:
+                h_goal_real, s_goal_real = goal_lat
+                with torch.no_grad():
+                    g_init = geo_target(h, s)
+                    g_goal_init = geo_target(h_goal_real, s_goal_real)
+                    d_prev_geo = torch.norm(g_init - g_goal_init, dim=-1).item()
             else:
-                goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
-                if goal_lat is not None:
-                    h_goal_real, s_goal_real = goal_lat
-                    with torch.no_grad():
-                        g_init = geo(h, s)
-                        g_goal_init = geo(h_goal_real, s_goal_real)
-                        d_prev_geo = torch.norm(g_init - g_goal_init, dim=-1).item()
-                else:
-                    shaping_active = False
-        """
+                shaping_active = False
         while not done:
             encoder.eval()
             rssm.eval()
@@ -591,6 +714,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             ep_return += float(total_reward)
             ep_steps += 1
             write_idx = replay.idx
+            if replay_env_rews is not None:
+                replay_env_rews[write_idx] = total_reward
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=a_np,
@@ -603,6 +728,31 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             obs = next_obs
             total_steps += 1
 
+            if (
+                cfg.geo_variant == "shaping"
+                and geo_target is not None
+                and geo_trained_once
+                and getattr(args, "geo_target_update_interval", 0) > 0
+                and total_steps % args.geo_target_update_interval == 0
+            ):
+                geo_target.load_state_dict(geo.state_dict())
+                if replay_env_rews is not None and replay.size > (args.seq_len + 2):
+                    refresh_replay_shaping(
+                        replay,
+                        replay_env_rews,
+                        encoder,
+                        rssm,
+                        geo_target,
+                        env,
+                        device,
+                        args.bit_depth,
+                        args.seq_len + 1,
+                        min(args.batch_size, 32),
+                        cfg.geo_shaping_alpha,
+                        shaping_clip,
+                        getattr(args, "geo_refit_refresh_batches", 100),
+                    )
+
             obs_t = (
                 torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device)
                 .permute(2, 0, 1)
@@ -610,27 +760,28 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             )
             preprocess_img(obs_t, depth=args.bit_depth)
             with torch.no_grad():
+                h_prev, s_prev = h.clone(), s.clone()
                 e = encoder(obs_t)
                 act_t = torch.tensor(a_np, dtype=torch.float32, device=device).unsqueeze(0)
                 h, s, _, _ = rssm.observe_step(e, act_t, h, s, sample=False)
 
-            """
-            if shaping_active:
-                if use_true_geodesic_shaping and args.use_env_geodesic:
-                    d_now = geodesic.distance(env.agent_pos, env.goal_pos)
-                else:
-                    goal_lat = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
-                    if goal_lat is not None:
-                        h_goal_real, s_goal_real = goal_lat
-                        with torch.no_grad():
-                            g_now = geo(h, s)
-                            g_goal_now = geo(h_goal_real, s_goal_real)
-                            d_now = torch.norm(g_now - g_goal_now, dim=-1).item()
-                    else:
-                        shaping_active = False
-                replay.rews[write_idx] = total_reward + cfg.geo_shaping_alpha * (d_prev_geo - d_now)
-                d_prev_geo = d_now
-            """
+            if shaping_active and h_goal_real is not None and s_goal_real is not None:
+                shaping_val = get_shaping_reward(
+                    geo_target,
+                    h_prev,
+                    s_prev,
+                    h,
+                    s,
+                    h_goal_real,
+                    s_goal_real,
+                    cfg.geo_shaping_alpha,
+                    clip_range=shaping_clip,
+                )
+                replay.rews[write_idx] = total_reward + shaping_val
+                with torch.no_grad():
+                    g_now = geo_target(h, s)
+                    g_goal_now = geo_target(h_goal_real, s_goal_real)
+                    d_prev_geo = torch.norm(g_now - g_goal_now, dim=-1).item()
 
             if is_maze and geo is not None:
                 traj_pos.append(np.asarray(env.agent_pos, dtype=np.float32).copy())
@@ -781,7 +932,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 all_h = all_h[idx]
                                 all_s = all_s[idx]
                             data = {"pos": all_pos, "h": all_h, "s": all_s}
-                            geo = train_geo_encoder_geodesic(
+                            geo, final_stress = train_geo_encoder_geodesic(
                                 data,
                                 args.deter_dim,
                                 args.stoch_dim,
@@ -797,7 +948,21 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 device,
                                 geodesic,
                             )
+                            geo_last_stress = final_stress
                             geo_trained_once = True
+                            if geo_target is None:
+                                geo_target = GeoEncoder(
+                                    args.deter_dim,
+                                    args.stoch_dim,
+                                    geo_dim=args.geo_dim,
+                                    hidden_dim=args.geom_hidden_dim,
+                                ).to(device)
+                                geo_target.load_state_dict(geo.state_dict())
+                                geo_target.eval()
+                                for p in geo_target.parameters():
+                                    p.requires_grad_(False)
+                                writer.add_scalar("geo/stress", final_stress, total_steps)
+                                print(f"    geo_target initialized (stress={final_stress:.4f}, threshold={getattr(args, 'geo_shaping_stress_threshold', 0.05)})")
                             if cfg.geo_variant == "aux_backprop":
                                 geo_phase = "aux_backprop"
                                 wm_frozen = False
@@ -840,7 +1005,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 f"    [{cfg.name} | seed {seed}] geo refit @ step {total_steps} "
                                 f"(pts={len(all_pos)}, epochs={refit_epochs})"
                             )
-                            geo = train_geo_encoder_geodesic(
+                            geo, refit_stress = train_geo_encoder_geodesic(
                                 data,
                                 args.deter_dim,
                                 args.stoch_dim,
@@ -856,6 +1021,26 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 device,
                                 geodesic,
                             )
+                            geo_last_stress = refit_stress
+                            writer.add_scalar("geo/stress", refit_stress, total_steps)
+                            if geo_target is not None:
+                                geo_target.load_state_dict(geo.state_dict())
+                            if replay_env_rews is not None and geo_target is not None:
+                                refresh_replay_shaping(
+                                    replay,
+                                    replay_env_rews,
+                                    encoder,
+                                    rssm,
+                                    geo_target,
+                                    env,
+                                    device,
+                                    args.bit_depth,
+                                    args.seq_len + 1,
+                                    min(args.batch_size, 32),
+                                    cfg.geo_shaping_alpha,
+                                    shaping_clip,
+                                    getattr(args, "geo_refit_refresh_batches", 100),
+                                )
                             geo_phase = "aux_backprop"
                             geo_last_refit_step = total_steps
                             geo_refit_count += 1
@@ -902,17 +1087,31 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         goal_latent = get_goal_latent(env, encoder, rssm, device, args.bit_depth)
                         if goal_latent is not None:
                             h_goal, s_goal = goal_latent
-                            with no_param_grads(geo):
-                                g_imag = bottle(geo, h_imag, s_imag)
-                                g_goal = geo(h_goal.expand(h_imag.size(0), -1), s_goal.expand(s_imag.size(0), -1))
+                            geo_net = geo_target if (cfg.geo_variant == "shaping" and geo_target is not None) else geo
+                            with no_param_grads(geo_net):
+                                g_imag = bottle(geo_net, h_imag, s_imag)
+                                g_goal = geo_net(h_goal.expand(h_imag.size(0), -1), s_goal.expand(s_imag.size(0), -1))
                             d_geo = torch.norm(g_imag - g_goal.unsqueeze(1), dim=-1)
                             d_geo_t = d_geo[:, 1:]
                             if cfg.geo_variant == "plan_only":
                                 rewards_im = rewards_im - cfg.geo_plan_weight * d_geo_t
                             elif cfg.geo_variant == "shaping":
-                                d_geo_prev = d_geo[:, :-1]
-                                progress = d_geo_prev - d_geo_t
-                                rewards_im = rewards_im + cfg.geo_shaping_alpha * progress
+                                B_im, H_im = h_imag.size(0), h_imag.size(1) - 1
+                                n_trans = B_im * H_im
+                                h_goal_exp = h_goal.expand(n_trans, -1)
+                                s_goal_exp = s_goal.expand(n_trans, -1)
+                                progress = get_shaping_reward_batch(
+                                    geo_net,
+                                    h_imag[:, :-1].reshape(n_trans, -1),
+                                    s_imag[:, :-1].reshape(n_trans, -1),
+                                    h_imag[:, 1:].reshape(n_trans, -1),
+                                    s_imag[:, 1:].reshape(n_trans, -1),
+                                    h_goal_exp,
+                                    s_goal_exp,
+                                    cfg.geo_shaping_alpha,
+                                    shaping_clip,
+                                )
+                                rewards_im = rewards_im + progress.reshape(B_im, H_im)
                             else:
                                 rewards_im = rewards_im - cfg.geo_plan_weight * d_geo_t
 
@@ -1085,6 +1284,9 @@ def parse_args():
     p.add_argument("--geo_aux_refit_interval", type=int, default=5_000)
     p.add_argument("--geo_aux_refit_epochs", type=int, default=50)
     p.add_argument("--geo_aux_refit_min_points", type=int, default=1_024)
+    p.add_argument("--geo_refit_refresh_batches", type=int, default=100, help="Batches of buffer to refresh with new shaping on geo refit")
+    p.add_argument("--geo_shaping_stress_threshold", type=float, default=0.05, help="Enable shaping only when GeoSup stress < this")
+    p.add_argument("--geo_target_update_interval", type=int, default=5_000, help="Steps between syncing geo_target from geo (shaping variant)")
     p.add_argument("--use_env_geodesic", action="store_true", default=False)
 
     p.add_argument("--expl_amount", type=float, default=0.3)
