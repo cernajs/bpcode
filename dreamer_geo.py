@@ -96,9 +96,11 @@ def train_geo_encoder_geodesic(
     geo_sup_uniformity_t: float,
     device: torch.device,
     geodesic,
+    geo_sup_l2_weight: float = 0.0,
 ) -> Tuple[GeoEncoder, float]:
     """Train GeoEncoder so ||g_i - g_j|| matches geodesic distance (pairwise stress + uniformity).
-    Returns (trained geo, final_stress) for stability gating."""
+    Returns (trained geo, final_stress) for stability gating.
+    geo_sup_l2_weight: L2 penalty on geo params for smoother distance manifold."""
     geo = GeoEncoder(deter_dim, stoch_dim, geo_dim=geo_dim, hidden_dim=geo_hidden).to(device)
     scale = torch.nn.Parameter(torch.tensor(0.1, device=device))
     opt = torch.optim.Adam(list(geo.parameters()) + [scale], lr=geo_lr)
@@ -148,7 +150,12 @@ def train_geo_encoder_geodesic(
         stress = (weight * (d_lat - scale_d_geo).pow(2)).mean()
         final_stress = stress.item()
         loss_uni = _uniformity_loss_sphere(torch.stack([g_i, g_j], 1), t=geo_sup_uniformity_t)
-        loss = geo_sup_stress_weight * stress + geo_sup_uniformity_weight * loss_uni
+        loss_l2 = sum(p.pow(2).sum() for p in geo.parameters())
+        loss = (
+            geo_sup_stress_weight * stress
+            + geo_sup_uniformity_weight * loss_uni
+            + geo_sup_l2_weight * loss_l2
+        )
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -664,6 +671,8 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
     geo_last_refit_step = -1
     geo_refit_count = 0
     shaping_clip = (-1.0, 1.0)
+    expl_reset_for_shaping_done = False
+    initial_shaping_refresh_done = False
 
     # Seed buffer
     for _ in range(args.seed_episodes):
@@ -757,6 +766,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
             shaping_active = is_shaping_active(
                 args, cfg, geo, geo_target, is_maze, geo_trained_once, geo_last_stress
             )
+            if shaping_active and not expl_reset_for_shaping_done:
+                expl = args.expl_amount
+                expl_reset_for_shaping_done = True
 
             if (
                 cfg.geo_variant == "shaping"
@@ -783,11 +795,47 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                         min(args.batch_size, 32),
                         cfg.geo_shaping_alpha,
                         shaping_clip,
-                        getattr(args, "geo_refit_refresh_batches", 100),
+                        getattr(args, "geo_refit_refresh_batches", 1000),
                         is_maze,
                         geo_trained_once,
                         geo_last_stress,
                     )
+            if (
+                shaping_active
+                and replay_env_rews is not None
+                and geo_target is not None
+                and not initial_shaping_refresh_done
+                and replay.size > (args.seq_len + 2)
+            ):
+                batch_sz = min(args.batch_size, 32)
+                seq_len_refresh = args.seq_len + 1
+                trans_per_batch = batch_sz * (seq_len_refresh - 1)
+                full_refresh_batches = min(
+                    2000,
+                    (replay.size + trans_per_batch - 1) // max(1, trans_per_batch),
+                )
+                refresh_replay_shaping(
+                    args,
+                    cfg,
+                    replay,
+                    replay_env_rews,
+                    encoder,
+                    rssm,
+                    geo,
+                    geo_target,
+                    env,
+                    device,
+                    args.bit_depth,
+                    seq_len_refresh,
+                    batch_sz,
+                    cfg.geo_shaping_alpha,
+                    shaping_clip,
+                    full_refresh_batches,
+                    is_maze,
+                    geo_trained_once,
+                    geo_last_stress,
+                )
+                initial_shaping_refresh_done = True
 
             obs_t = (
                 torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device)
@@ -1003,6 +1051,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 args.geo_sup_uniformity_t,
                                 device,
                                 geodesic,
+                                getattr(args, "geo_sup_l2_weight", 1e-4),
                             )
                             geo_last_stress = final_stress
                             geo_trained_once = True
@@ -1028,7 +1077,9 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 )
                             else:
                                 geo_phase = "active"
-                                wm_frozen = True
+                                wm_frozen = (
+                                    cfg.geo_variant != "shaping"
+                                )  # Never freeze WM for shaping so RewardModel can learn dense signal
                                 expl = args.expl_amount
                             geo_data.clear()
 
@@ -1076,6 +1127,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                 args.geo_sup_uniformity_t,
                                 device,
                                 geodesic,
+                                getattr(args, "geo_sup_l2_weight", 1e-4),
                             )
                             geo_last_stress = refit_stress
                             writer.add_scalar("geo/stress", refit_stress, total_steps)
@@ -1098,7 +1150,7 @@ def run_one_seed(args, cfg: VariantCfg, seed: int) -> Dict[str, float]:
                                     min(args.batch_size, 32),
                                     cfg.geo_shaping_alpha,
                                     shaping_clip,
-                                    getattr(args, "geo_refit_refresh_batches", 100),
+                                    getattr(args, "geo_refit_refresh_batches", 1000),
                                     is_maze,
                                     geo_trained_once,
                                     geo_last_stress,
@@ -1350,7 +1402,8 @@ def parse_args():
     p.add_argument("--geo_aux_refit_interval", type=int, default=5_000)
     p.add_argument("--geo_aux_refit_epochs", type=int, default=50)
     p.add_argument("--geo_aux_refit_min_points", type=int, default=1_024)
-    p.add_argument("--geo_refit_refresh_batches", type=int, default=100, help="Batches of buffer to refresh with new shaping on geo refit")
+    p.add_argument("--geo_refit_refresh_batches", type=int, default=1000, help="Batches of buffer to refresh with new shaping on geo refit")
+    p.add_argument("--geo_sup_l2_weight", type=float, default=1e-4, help="L2 penalty on GeoEncoder during GeoSup for smoother distance manifold")
     p.add_argument("--geo_shaping_stress_threshold", type=float, default=0.15, help="Enable shaping only when GeoSup stress < this")
     p.add_argument("--geo_target_update_interval", type=int, default=5_000, help="Steps between syncing geo_target from geo (shaping variant)")
     p.add_argument("--use_env_geodesic", action="store_true", default=False)
