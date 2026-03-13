@@ -208,6 +208,7 @@ class PointMazeRunCfg:
     output_dir: str = "pointmaze_gr_results"
     quick: bool = False
     geo_supervised: bool = False
+    wm_path: str = ""
 
 
 def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
@@ -377,6 +378,7 @@ def main():
         output_dir=args.output_dir,
         quick=bool(args.quick),
         geo_supervised=bool(args.geo_supervised),
+        wm_path=args.wm_path,
     )
     run_single_pointmaze(cfg_pm)
 
