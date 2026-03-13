@@ -252,13 +252,30 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         print(f"    Resuming from world model checkpoint at {cfg_pm.wm_path}")
         checkpoint = torch.load(cfg_pm.wm_path)
         act_dim = env.action_space.shape[0]
+        
+        encoder = ConvEncoder(cfg.embed_dim).to(device)
+        encoder.load_state_dict(checkpoint["encoder"]),
+
+        decoder = ConvDecoder(cfg.deter_dim, cfg.stoch_dim, embedding_size=cfg.embed_dim).to(device)
+        decoder.load_state_dict(checkpoint["decoder"])
+
+        rssm = RSSM(cfg.stoch_dim, cfg.deter_dim, act_dim, cfg.embed_dim, cfg.hidden_dim).to(device)
+        rssm.load_state_dict(checkpoint["rssm"])
+
+        reward_model = RewardModel(cfg.deter_dim, cfg.stoch_dim, cfg.hidden_dim).to(device)
+        reward_model.load_state_dict(checkpoint["reward_model"])
+
+        cont_model = ContinueModel(cfg.deter_dim, cfg.stoch_dim, cfg.hidden_dim).to(device)
+        cont_model.load_state_dict(checkpoint["cont_model"])
+
         models = {
-            "encoder": ConvEncoder(cfg.embed_dim).to(device).load_state_dict(checkpoint["encoder"]),
-            "decoder": ConvDecoder(cfg.deter_dim, cfg.stoch_dim, embedding_size=cfg.embed_dim).to(device).load_state_dict(checkpoint["decoder"]),
-            "rssm": RSSM(cfg.stoch_dim, cfg.deter_dim, act_dim, cfg.embed_dim, cfg.hidden_dim).to(device).load_state_dict(checkpoint["rssm"]),
-            "reward_model": RewardModel(cfg.deter_dim, cfg.stoch_dim, cfg.hidden_dim).to(device).load_state_dict(checkpoint["reward_model"]),
-            "cont_model": ContinueModel(cfg.deter_dim, cfg.stoch_dim, cfg.hidden_dim).to(device).load_state_dict(checkpoint["cont_model"]),
+            "encoder": encoder,
+            "decoder": decoder,
+            "rssm": rssm,
+            "reward_model": reward_model,
+            "cont_model": cont_model,
         }
+
         models["encoder"].eval()
         models["decoder"].eval()
         models["rssm"].eval()
