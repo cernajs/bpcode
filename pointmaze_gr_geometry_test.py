@@ -26,6 +26,7 @@ import cv2
 import gymnasium as gym
 import gymnasium_robotics  # type: ignore
 import numpy as np
+import torch
 
 from maze_env import GeodesicComputer
 from maze_geometry_test import (
@@ -240,6 +241,17 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
 
     print("\n  [1/5] Training Dreamer world model ...")
     models = train_world_model(env, cfg, device)
+
+    wm_path = os.path.join(out_dir, "world_model.pt")
+    checkpoint = {
+        "encoder": models["encoder"].state_dict(),
+        "decoder": models["decoder"].state_dict(),
+        "rssm": models["rssm"].state_dict(),
+        "reward_model": models["reward_model"].state_dict(),
+        "cont_model": models["cont_model"].state_dict(),
+    }
+    torch.save(checkpoint, wm_path)
+    print(f"    World model saved to {wm_path}")
 
     print("\n  [2/5] Collecting position-latent data ...")
     data = collect_data(env, models, cfg, device)
