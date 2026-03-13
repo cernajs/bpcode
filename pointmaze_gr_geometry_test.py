@@ -33,6 +33,7 @@ from maze_geometry_test import (
     train_world_model,
     collect_data,
     train_geo_encoder,
+    train_geo_encoder_geodesic,
     _build_feature_dict,
     run_probes,
     run_distance_analysis,
@@ -198,6 +199,7 @@ class PointMazeRunCfg:
     seed: int = 0
     output_dir: str = "pointmaze_gr_results"
     quick: bool = False
+    geo_supervised: bool = False
 
 
 def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
@@ -256,8 +258,12 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     print("\n  [3/5] Training GeoEncoder (post-hoc, temporal) ...")
     geo_temporal = train_geo_encoder(data, cfg, device, env.geodesic)
 
+    geo_geo = None
+    if cfg_pm.geo_supervised and cfg.geo_sup_epochs > 0:
+        print("    Training GeoEncoder (geodesic-supervised) ...")
+        geo_geo = train_geo_encoder_geodesic(data, cfg, device, env.geodesic)
+
     print("\n  [4/5] Running analyses ...")
-    geo_geo = None  # no geodesic-supervised variant by default here
     pos = data["pos"]
     episode_ids = data.get("episode_ids", None)
     feat_dict = _build_feature_dict(
@@ -314,12 +320,22 @@ def parse_args():
         action="store_true",
         help="Fast sanity-check run (reduced episodes/epochs)",
     )
+    p.add_argument(
+        "--geo_supervised",
+        action="store_true",
+        help="Also train a GeoEncoder supervised by ground-truth geodesic distances",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    cfg_pm = PointMazeRunCfg(seed=args.seed, output_dir=args.output_dir, quick=bool(args.quick))
+    cfg_pm = PointMazeRunCfg(
+        seed=args.seed,
+        output_dir=args.output_dir,
+        quick=bool(args.quick),
+        geo_supervised=bool(args.geo_supervised),
+    )
     run_single_pointmaze(cfg_pm)
 
 
