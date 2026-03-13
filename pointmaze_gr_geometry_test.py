@@ -44,6 +44,13 @@ from maze_geometry_test import (
     compute_sanity_metrics,
 )
 from utils import get_device, set_seed
+from models import (
+    RSSM,
+    ContinueModel,
+    ConvDecoder,
+    ConvEncoder,
+    RewardModel,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -240,18 +247,35 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     os.makedirs(out_dir, exist_ok=True)
 
     print("\n  [1/5] Training Dreamer world model ...")
-    models = train_world_model(env, cfg, device)
+    if cfg_pm.wm_path:
+        print(f"    Resuming from world model checkpoint at {cfg_pm.wm_path}")
+        checkpoint = torch.load(cfg_pm.wm_path)
+        act_dim = env.action_space.shape[0]
+        models = {
+            "encoder": ConvEncoder(cfg.embed_dim).to(device).load_state_dict(checkpoint["encoder"]),
+            "decoder": ConvDecoder(cfg.deter_dim, cfg.stoch_dim, embedding_size=cfg.embed_dim).to(device).load_state_dict(checkpoint["decoder"]),
+            "rssm": RSSM(cfg.stoch_dim, cfg.deter_dim, act_dim, cfg.embed_dim, cfg.hidden_dim).to(device).load_state_dict(checkpoint["rssm"]),
+            "reward_model": RewardModel(cfg.deter_dim, cfg.stoch_dim, cfg.hidden_dim).to(device).load_state_dict(checkpoint["reward_model"]),
+            "cont_model": ContinueModel(cfg.deter_dim, cfg.stoch_dim, cfg.hidden_dim).to(device).load_state_dict(checkpoint["cont_model"]),
+        }
+        models["encoder"].eval()
+        models["decoder"].eval()
+        models["rssm"].eval()
+        models["reward_model"].eval()
+        models["cont_model"].eval()
+    else:
+        models = train_world_model(env, cfg, device)
 
-    wm_path = os.path.join(out_dir, "world_model.pt")
-    checkpoint = {
-        "encoder": models["encoder"].state_dict(),
-        "decoder": models["decoder"].state_dict(),
-        "rssm": models["rssm"].state_dict(),
-        "reward_model": models["reward_model"].state_dict(),
-        "cont_model": models["cont_model"].state_dict(),
-    }
-    torch.save(checkpoint, wm_path)
-    print(f"    World model saved to {wm_path}")
+        wm_path = os.path.join(out_dir, "world_model.pt")
+        checkpoint = {
+            "encoder": models["encoder"].state_dict(),
+            "decoder": models["decoder"].state_dict(),
+            "rssm": models["rssm"].state_dict(),
+            "reward_model": models["reward_model"].state_dict(),
+            "cont_model": models["cont_model"].state_dict(),
+        }
+        torch.save(checkpoint, wm_path)
+        print(f"    World model saved to {wm_path}")
 
     print("\n  [2/5] Collecting position-latent data ...")
     data = collect_data(env, models, cfg, device)
@@ -336,6 +360,12 @@ def parse_args():
         "--geo_supervised",
         action="store_true",
         help="Also train a GeoEncoder supervised by ground-truth geodesic distances",
+    )
+    p.add_argument(
+        "--wm_path",
+        type=str,
+        default="",
+        help="Path to world model checkpoint to resume from",
     )
     return p.parse_args()
 
