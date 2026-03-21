@@ -354,7 +354,14 @@ class ReplayGeometryModule:
         phi_tp1 = phi[v_tp1]
         m_off = d_off[:, 1:]
 
-        r_geo = (phi_tp1 - phi_t) - self.lambda_off * m_off
+        margin = 0.5
+        m_off_penalty = np.maximum(m_off - margin, 0.0)
+        gamma = 0.99 
+        geo_scale = 0.02
+
+        r_geo_raw = (gamma * phi_tp1 - phi_t) - self.lambda_off * m_off_penalty
+        r_geo = r_geo_raw * geo_scale
+        
         return torch.tensor(r_geo, dtype=torch.float32, device=h_imag.device)
 
 
