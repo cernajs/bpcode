@@ -63,7 +63,7 @@ from utils import ReplayBuffer, bottle, get_device, preprocess_img, set_seed
 @dataclass
 class TrainCfg:
     seed_episodes: int = 5
-    max_episodes: int = 100
+    max_episodes: int = 60
     collect_interval: int = 50
     train_steps: int = 30
     batch_size: int = 32
@@ -93,14 +93,14 @@ class TrainCfg:
     geo_dim: int = 32
     geo_hidden: int = 256
     geo_lr: float = 3e-4
-    geo_epochs: int = 300
+    geo_epochs: int = 1000
     geo_batch: int = 64
     geo_window: int = 30
     geo_pos_k: int = 3
     geo_neg_k: int = 8
     geo_margin: float = 0.6
     # Optional: geodesic-supervised GeoEncoder variant
-    geo_sup_epochs: int = 200
+    geo_sup_epochs: int = 1000
     geo_sup_batch: int = 256
     geo_sup_candidates: int = 64
     geo_sup_margin: float = 0.2
