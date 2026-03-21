@@ -92,6 +92,18 @@ class ReplayGeometryModule:
         self._phi: np.ndarray | None = None
         self._visit_counts: np.ndarray | None = None
 
+        # TensorBoard diagnostics (updated each train phase when geometry is on)
+        self.tb_last_graph_n_nodes: int = 0
+        self.tb_last_dist_finite_frac: float | None = None
+        self.tb_last_geo_train_loss: float | None = None
+        self.tb_last_geo_train_steps: int = 0
+        self.tb_last_delta_mean: float | None = None
+        self.tb_last_phi_mean: float | None = None
+        self.tb_last_phi_std: float | None = None
+
+    def geo_intrinsic_ready(self) -> bool:
+        return self._g_nodes is not None and self._phi is not None
+
     def add_batch_trajectories(
         self,
         traj_h: List[np.ndarray],
@@ -123,6 +135,8 @@ class ReplayGeometryModule:
         n = len(self._h_nodes)
         if n < 4:
             self._dist_replay = None
+            self.tb_last_graph_n_nodes = n
+            self.tb_last_dist_finite_frac = None
             return
 
         local_feat = np.asarray(self._e_nodes, dtype=np.float32)
@@ -175,9 +189,13 @@ class ReplayGeometryModule:
                             adj[j, i] = 1.0
 
         self._dist_replay = shortest_path(csgraph=adj, directed=False, unweighted=False)
+        self.tb_last_graph_n_nodes = n
+        self.tb_last_dist_finite_frac = float(np.isfinite(self._dist_replay).mean())
 
     def train_geo_head(self, n_steps: int = 200, batch_pairs: int = 2048):
         """Train g(h,s) against cached Dijkstra distances from rebuild_graph_and_distances."""
+        self.tb_last_geo_train_loss = None
+        self.tb_last_geo_train_steps = 0
         if self._dist_replay is None:
             return
         h_np = np.asarray(self._h_nodes, dtype=np.float32)
@@ -190,6 +208,7 @@ class ReplayGeometryModule:
         s_t = torch.tensor(s_np, dtype=torch.float32, device=self.device)
         dist_mat = self._dist_replay
 
+        loss_accum: List[float] = []
         for _ in range(n_steps):
             ii = np.random.randint(0, N, size=batch_pairs)
             jj = np.random.randint(0, N, size=batch_pairs)
@@ -215,6 +234,12 @@ class ReplayGeometryModule:
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             self.opt.step()
+            loss_accum.append(float(loss.detach().item()))
+
+        self.tb_last_geo_train_steps = len(loss_accum)
+        self.tb_last_geo_train_loss = (
+            float(np.mean(loss_accum)) if loss_accum else None
+        )
 
         with torch.no_grad():
             self._g_nodes = self.geo_head(h_t, s_t).detach().cpu().numpy().astype(np.float32)
@@ -225,6 +250,9 @@ class ReplayGeometryModule:
 
     def build_potential(self):
         """Compute per-node potential φ(v) from distortion + frontier."""
+        self.tb_last_delta_mean = None
+        self.tb_last_phi_mean = None
+        self.tb_last_phi_std = None
         if self._g_nodes is None or self._dist_replay is None:
             return
         g = self._g_nodes
@@ -269,6 +297,9 @@ class ReplayGeometryModule:
 
         phi = self.lambda_dist * delta + self.lambda_front * front
         self._phi = phi.astype(np.float32)
+        self.tb_last_delta_mean = float(np.mean(delta))
+        self.tb_last_phi_mean = float(np.mean(self._phi))
+        self.tb_last_phi_std = float(np.std(self._phi))
 
     # ------------------------------------------------------------------ #
     #  Intrinsic reward for imagination
@@ -406,6 +437,58 @@ def build_parser():
     return p
 
 
+def log_training_phase_tensorboard(
+    writer: SummaryWriter,
+    global_step: int,
+    *,
+    replay_size: int,
+    expl_amount: float,
+    baseline: bool,
+    geo_mod: ReplayGeometryModule | None,
+    wm: dict[str, float],
+    grad: dict[str, float],
+    imag: dict[str, float],
+    policy: dict[str, float],
+) -> None:
+    """One summary point per env interaction step when a training phase runs."""
+    writer.add_scalar("replay/size", replay_size, global_step)
+    writer.add_scalar("train/exploration_noise", expl_amount, global_step)
+
+    for k, v in wm.items():
+        writer.add_scalar(f"wm/{k}", v, global_step)
+    for k, v in grad.items():
+        writer.add_scalar(f"grad/{k}", v, global_step)
+    for k, v in imag.items():
+        writer.add_scalar(f"imag/{k}", v, global_step)
+    for k, v in policy.items():
+        writer.add_scalar(f"policy/{k}", v, global_step)
+
+    if baseline:
+        writer.add_scalar("geo/disabled", 1.0, global_step)
+        return
+
+    assert geo_mod is not None
+    writer.add_scalar("geo/disabled", 0.0, global_step)
+    writer.add_scalar("geo/n_nodes", float(geo_mod.tb_last_graph_n_nodes), global_step)
+    if geo_mod.tb_last_dist_finite_frac is not None:
+        writer.add_scalar(
+            "geo/dist_matrix_finite_frac", geo_mod.tb_last_dist_finite_frac, global_step
+        )
+    if geo_mod.tb_last_geo_train_loss is not None:
+        writer.add_scalar("geo/head_train_loss", geo_mod.tb_last_geo_train_loss, global_step)
+    writer.add_scalar(
+        "geo/head_train_opt_steps", float(geo_mod.tb_last_geo_train_steps), global_step
+    )
+    if geo_mod.tb_last_phi_mean is not None:
+        writer.add_scalar("geo/phi_mean", geo_mod.tb_last_phi_mean, global_step)
+        writer.add_scalar("geo/phi_std", float(geo_mod.tb_last_phi_std or 0.0), global_step)
+    if geo_mod.tb_last_delta_mean is not None:
+        writer.add_scalar("geo/delta_mean", geo_mod.tb_last_delta_mean, global_step)
+    writer.add_scalar(
+        "geo/intrinsic_ready", 1.0 if geo_mod.geo_intrinsic_ready() else 0.0, global_step
+    )
+
+
 def main(args):
     set_seed(args.seed)
     device = get_device()
@@ -507,6 +590,7 @@ def main(args):
 
     writer = SummaryWriter(f"{args.log_dir}/{args.run_name}_seed{args.seed}")
     writer.add_text("hyperparameters", str(vars(args)), 0)
+    writer.add_scalar("config/baseline_mode", 1.0 if args.baseline else 0.0, 0)
 
     total_steps = 0
     expl_amount = args.expl_amount
@@ -597,6 +681,19 @@ def main(args):
                 actor.train()
                 value_model.train()
 
+                sum_rec = sum_kld = sum_rew = sum_cont = sum_model = 0.0
+                sum_actor = sum_value = 0.0
+                sum_weighted_ret = 0.0
+                gn_model: list[float] = []
+                gn_actor: list[float] = []
+                gn_value: list[float] = []
+                imag_r_mean: list[float] = []
+                imag_r_std: list[float] = []
+                imag_geo_mean: list[float] = []
+                imag_geo_std: list[float] = []
+                imag_geo_abs_mean: list[float] = []
+                imag_geo_ratio: list[float] = []
+
                 for _ in range(args.train_steps):
                     batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
                     obs_seq = torch.tensor(batch.obs, dtype=torch.float32, device=device)
@@ -658,7 +755,8 @@ def main(args):
 
                     model_opt.zero_grad(set_to_none=True)
                     model_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip)
+                    gn_m = torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip)
+                    gn_model.append(float(gn_m))
                     model_opt.step()
 
                     # ------------- Geometry module update (offline) -------------
@@ -738,7 +836,8 @@ def main(args):
                     value_loss = ((values_pred[:, :-1] - lambda_ret) ** 2 * w_val).mean()
                     value_opt.zero_grad(set_to_none=True)
                     value_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip)
+                    gn_v = torch.nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip)
+                    gn_value.append(float(gn_v))
                     value_opt.step()
 
                     # Actor loss: maximize geometry-augmented returns
@@ -751,8 +850,53 @@ def main(args):
                     actor_loss = -(w_actor * lambda_actor).mean()
                     actor_opt.zero_grad(set_to_none=True)
                     actor_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip)
+                    gn_a = torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip)
+                    gn_actor.append(float(gn_a))
                     actor_opt.step()
+
+                    sum_rec += float(rec_loss.item())
+                    sum_kld += float(kld.item())
+                    sum_rew += float(rew_loss.item())
+                    sum_cont += float(cont_loss.item())
+                    sum_model += float(model_loss.item())
+                    sum_actor += float(actor_loss.item())
+                    sum_value += float(value_loss.item())
+                    sum_weighted_ret += float((w_actor * lambda_actor).mean().item())
+                    imag_r_mean.append(float(rewards_imag.mean().item()))
+                    imag_r_std.append(float(rewards_imag.std().item()))
+                    imag_geo_mean.append(float(r_geo.mean().item()))
+                    imag_geo_std.append(float(r_geo.std().item()))
+                    imag_geo_abs_mean.append(float(r_geo.abs().mean().item()))
+                    denom = float(rewards_imag.abs().mean().item()) + 1e-8
+                    imag_geo_ratio.append(float(r_geo.abs().mean().item()) / denom)
+
+                n_ts = float(args.train_steps)
+                wm_avg = {
+                    "reconstruction": sum_rec / n_ts,
+                    "kl": sum_kld / n_ts,
+                    "reward_pred": sum_rew / n_ts,
+                    "continue": sum_cont / n_ts,
+                    "total": sum_model / n_ts,
+                    "kl_weighted": args.kl_weight * sum_kld / n_ts,
+                }
+                grad_avg = {
+                    "world_model": float(np.mean(gn_model)) if gn_model else 0.0,
+                    "actor": float(np.mean(gn_actor)) if gn_actor else 0.0,
+                    "value": float(np.mean(gn_value)) if gn_value else 0.0,
+                }
+                imag_avg = {
+                    "reward_mean": float(np.mean(imag_r_mean)),
+                    "reward_std": float(np.mean(imag_r_std)),
+                    "r_geo_mean": float(np.mean(imag_geo_mean)),
+                    "r_geo_std": float(np.mean(imag_geo_std)),
+                    "r_geo_abs_mean": float(np.mean(imag_geo_abs_mean)),
+                    "r_geo_over_abs_extrinsic": float(np.mean(imag_geo_ratio)),
+                }
+                policy_avg = {
+                    "actor_loss": sum_actor / n_ts,
+                    "value_loss": sum_value / n_ts,
+                    "mean_weighted_return": sum_weighted_ret / n_ts,
+                }
 
                 if geo_mod is not None:
                     geo_mod.rebuild_graph_and_distances(
@@ -761,12 +905,27 @@ def main(args):
                     geo_mod.train_geo_head(n_steps=20, batch_pairs=1024)
                     geo_mod.build_potential()
 
+                log_training_phase_tensorboard(
+                    writer,
+                    total_steps,
+                    replay_size=replay.size,
+                    expl_amount=expl_amount,
+                    baseline=args.baseline,
+                    geo_mod=geo_mod,
+                    wm=wm_avg,
+                    grad=grad_avg,
+                    imag=imag_avg,
+                    policy=policy_avg,
+                )
+
         # end of episode
         if args.expl_decay > 0:
             expl_amount = max(args.expl_min, expl_amount - args.expl_decay)
 
         writer.add_scalar("train/episode_return", ep_ret, episode)
+        writer.add_scalar("episode/return_env_step", ep_ret, total_steps)
         writer.add_scalar("train/episode_steps", ep_steps, episode)
+        writer.add_scalar("episode/length_env_step", ep_steps, total_steps)
         writer.add_scalar("train/total_steps", total_steps, episode)
         print(
             f"Episode {episode+1}/{args.max_episodes}  return={ep_ret:.2f}  steps={ep_steps}  total_steps={total_steps}"
