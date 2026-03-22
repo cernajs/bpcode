@@ -21,7 +21,7 @@ import argparse
 import os
 from dataclasses import dataclass
 from collections import deque
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cv2
 import gymnasium as gym
@@ -52,6 +52,7 @@ from maze_geometry_test import (
 from utils import get_device, set_seed
 from models import (
     RSSM,
+    Actor,
     ContinueModel,
     ConvDecoder,
     ConvEncoder,
@@ -232,6 +233,15 @@ class PointMazeRunCfg:
     replay_graph_max_nodes: int = 2500
     replay_graph_knn: int = 4
     replay_graph_quantile: float = 0.10
+    # Imagination-validated kNN (replaces encoder-only kNN / cycle filter)
+    replay_graph_imagination_max_steps: int = 20
+    replay_graph_imagination_h_thresh: float = 0.0  # 0 => auto from temporal ||Δh||
+    replay_imagination_pair_batch: int = 512
+    # Iterative bootstrapping: round 0 = temporal edges only; round k adds kNN in g_{k-1} + imagination filter
+    replay_bootstrap_rounds: int = 3
+    # Optional: geodesic correlation logging each round (uses maze layout — evaluation only)
+    replay_bootstrap_log_geodesic_corr: bool = True
+    replay_bootstrap_geo_pairs: int = 8000
 
 
 def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
@@ -255,6 +265,9 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         cfg.geo_sup_epochs = 80
         cfg.geo_sup_batch = 192
         cfg.geo_sup_candidates = 48
+        cfg_pm.replay_bootstrap_rounds = min(2, int(cfg_pm.replay_bootstrap_rounds))
+        cfg_pm.replay_graph_imagination_max_steps = min(12, int(cfg_pm.replay_graph_imagination_max_steps))
+        cfg_pm.replay_geo_epochs = min(80, int(cfg_pm.replay_geo_epochs))
 
     maze_name = "PointMaze_Medium_Diverse_GR-v3"
     print(f"Device: {device}")
@@ -318,6 +331,20 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         torch.save(checkpoint, wm_path)
         print(f"    World model saved to {wm_path}")
 
+    # Imagination rollouts for graph validation use Dreamer-style Actor (mean action if deterministic).
+    # maze_geometry_test does not train an actor; checkpoints may omit "actor" → randomly initialized.
+    act_dim = env.action_space.shape[0]
+    actor = Actor(
+        cfg.deter_dim,
+        cfg.stoch_dim,
+        act_dim,
+        cfg.hidden_dim,
+    ).to(device)
+    if "actor" in checkpoint:
+        actor.load_state_dict(checkpoint["actor"])
+    actor.eval()
+    models["actor"] = actor
+
     print("\n  [2/5] Collecting position-latent data ...")
     data = collect_data(env, models, cfg, device)
 
@@ -350,7 +377,14 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         else:
             print("    Training GeoEncoder (replay-graph, held-out episodes; oracle-free) ...")
             geo_replay, g_replay_all, replay_meta = train_geo_encoder_replay_graph(
-                data, cfg_pm, device, seed=int(cfg_pm.seed)
+                data,
+                cfg_pm,
+                device,
+                seed=int(cfg_pm.seed),
+                models=models,
+                cfg=cfg,
+                geodesic=env.geodesic,
+                pos=data["pos"],
             )
 
     print("\n  [4/5] Running analyses ...")
@@ -384,6 +418,10 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     if geo_replay is not None:
         replay_graph_eval = run_replay_graph_eval(feat_dict, replay_meta, seed=int(cfg_pm.seed))
 
+    topology_recovery_res = run_topology_recovery_eval(
+        env.geodesic, data["pos"], feat_dict, cfg, seed=int(cfg_pm.seed)
+    )
+
     print("\n  [5/5] Generating plots ...")
     generate_plots(
         maze_name,
@@ -411,6 +449,7 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         "latent_communities": community_res,
         "metric_class_mismatch": metric_mismatch_res,
         "replay_graph_eval": replay_graph_eval,
+        "topology_recovery": topology_recovery_res,
     }
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         import json
@@ -445,6 +484,18 @@ def parse_args():
         default="",
         help="Path to world model checkpoint to resume from",
     )
+    p.add_argument(
+        "--replay_bootstrap_rounds",
+        type=int,
+        default=3,
+        help="Iterative replay-graph rounds (0th = temporal only; later add imagination kNN in g)",
+    )
+    p.add_argument(
+        "--replay_imagination_max_steps",
+        type=int,
+        default=20,
+        help="RSSM imagination horizon for validating kNN edges",
+    )
     return p.parse_args()
 
 
@@ -456,6 +507,8 @@ def main():
         quick=bool(args.quick),
         geo_supervised=bool(args.geo_supervised),
         wm_path=args.wm_path,
+        replay_bootstrap_rounds=int(args.replay_bootstrap_rounds),
+        replay_graph_imagination_max_steps=int(args.replay_imagination_max_steps),
     )
     run_single_pointmaze(cfg_pm)
 
@@ -535,70 +588,174 @@ def _build_replay_node_graph(
 
     return [sorted(list(x)) for x in adj]
 
-from scipy.sparse import lil_matrix
+from scipy.sparse import csr_matrix, lil_matrix
 from scipy.sparse.csgraph import shortest_path
+
+
+def _auto_imagination_h_threshold(h_nodes: np.ndarray, ep_ids: np.ndarray) -> float:
+    """Scale-free closeness in h-space from typical one-step temporal moves."""
+    d_temp = []
+    for i in range(len(h_nodes) - 1):
+        if int(ep_ids[i]) == int(ep_ids[i + 1]):
+            d_temp.append(float(np.linalg.norm(h_nodes[i] - h_nodes[i + 1])))
+    if not d_temp:
+        return 1.0
+    med = float(np.median(d_temp))
+    return float(max(med * 2.0, 1e-6))
+
+
+@torch.no_grad()
+def _batched_imagination_reach_steps(
+    rssm: RSSM,
+    actor: Actor,
+    h_src: torch.Tensor,
+    s_src: torch.Tensor,
+    h_tgt: torch.Tensor,
+    max_steps: int,
+    h_close_thresh: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Minimum steps until ||h_rollout - h_tgt|| < thresh (per row). Unreachable -> max_steps + 1."""
+    B = int(h_src.shape[0])
+    h = h_src.clone()
+    s = s_src.clone()
+    done = torch.zeros(B, dtype=torch.bool, device=device)
+    out = torch.full((B,), float(max_steps + 1), device=device, dtype=torch.float32)
+    thr = torch.as_tensor(h_close_thresh, device=device, dtype=h.dtype)
+    for t in range(int(max_steps)):
+        #a, _ = actor.get_action(h, s, deterministic=True)
+        a = torch.empty(h.size(0), rssm.act_dim, device=device).uniform_(-1.0, 1.0)
+        h = rssm.deterministic_state_fwd(h, s, a)
+        m, _ = rssm.state_prior(h_src, sample=False)
+        s = m
+        h = h_src.clone()
+        dist = torch.norm(h - h_tgt, dim=-1)
+        newly = (~done) & (dist < thr)
+        out = torch.where(newly, torch.full_like(out, float(t + 1)), out)
+        done = done | newly
+        if bool(done.all().item()):
+            break
+    return out
+
+
+def _adj_list_to_csr(adj, n: int) -> csr_matrix:
+    rows, cols = [], []
+    for i, js in enumerate(adj):
+        for j in js:
+            rows.append(i)
+            cols.append(int(j))
+    if not rows:
+        return csr_matrix((n, n), dtype=np.int8)
+    data = np.ones(len(rows), dtype=np.int8)
+    return csr_matrix((data, (rows, cols)), shape=(n, n))
+
 
 def _build_and_solve_replay_graph(
     local_feat: np.ndarray,
     ep_ids: np.ndarray,
     orig_idx: np.ndarray,
     knn_k: int = 4,
-    cross_quantile: float = 0.05,  # lowered to 5% to be safer
+    cross_quantile: float = 0.05,
+    *,
+    include_chart_knn: bool = True,
+    h_nodes: Optional[np.ndarray] = None,
+    s_nodes: Optional[np.ndarray] = None,
+    rssm: Optional[RSSM] = None,
+    actor: Optional[Actor] = None,
+    device: Optional[torch.device] = None,
+    imagination_max_steps: int = 20,
+    imagination_h_thresh: float = 0.0,
+    imagination_pair_batch: int = 512,
+    graph_tag: str = "",
 ):
     """
-    Builds a weighted replay graph and returns the all-pairs shortest path matrix.
-    Fixes subsampling time-warps by weighting temporal edges by actual timestep deltas.
-    Fixes visual wormholes by checking sequential cycle-consistency.
+    Weighted replay graph + all-pairs shortest paths.
+
+    Temporal edges use real timestep gaps (handles subsampling).
+
+    If include_chart_knn: mutual kNN in ``local_feat`` (chart), then keep an edge only
+    if the world model can imagine from i to j (or j to i) within ``imagination_max_steps``
+    with ||h_rollout - h_j|| below a threshold (oracle-free dynamics check).
+
+    Round 0 (bootstrap): set include_chart_knn=False for temporal-only graph.
     """
     n = len(orig_idx)
     adj = lil_matrix((n, n), dtype=np.float32)
 
-    # 1. Temporal Edges (Weighted by true timestep gap)
     for i in range(n - 1):
         if ep_ids[i] == ep_ids[i + 1]:
-            # True timestep distance between subsampled nodes
             dt = float(orig_idx[i + 1] - orig_idx[i])
             adj[i, i + 1] = dt
             adj[i + 1, i] = dt
 
-    # 2. Cycle-Consistent Mutual kNN Cross-Edges
-    if n > 2:
-        d = _pairwise_l2(local_feat)
-        np.fill_diagonal(d, np.inf)
+    n_img_edges = 0
+    if include_chart_knn and n > 2 and int(knn_k) > 0:
+        if rssm is None or actor is None or device is None:
+            raise ValueError("RSSM, actor, and device required when include_chart_knn=True")
+        if h_nodes is None or s_nodes is None:
+            raise ValueError("h_nodes and s_nodes required when include_chart_knn=True")
 
+        h_nodes = np.asarray(h_nodes, dtype=np.float32)
+        s_nodes = np.asarray(s_nodes, dtype=np.float32)
+        thr_h = float(imagination_h_thresh) if float(imagination_h_thresh) > 0 else _auto_imagination_h_threshold(
+            h_nodes, ep_ids
+        )
+
+        d = _pairwise_l2(np.asarray(local_feat, dtype=np.float32))
+        np.fill_diagonal(d, np.inf)
         finite_vals = d[np.isfinite(d)]
         gate = float(np.quantile(finite_vals, float(cross_quantile))) if len(finite_vals) else float("inf")
 
-        k_use = int(min(max(1, knn_k), n - 1))
+        k_use = int(min(max(1, int(knn_k)), n - 1))
         nn_idx = np.argsort(d, axis=1)[:, :k_use]
         nn_sets = [set(map(int, row)) for row in nn_idx]
 
+        candidates = []
         for i in range(n):
             for j in nn_idx[i]:
                 j = int(j)
-                # Check 1: Distance is below quantile
-                if d[i, j] > gate:
+                if j <= i or float(d[i, j]) > gate:
                     continue
-                # Check 2: Mutual kNN
                 if i not in nn_sets[j]:
                     continue
-                
-                # Check 3: Sequential Consistency (Wormhole Filter)
-                # If i and j are the same spatial location, then i+1 and j+1 
-                # (or j-1) should also be visually similar.
-                if i < n - 1 and j < n - 1 and ep_ids[i] == ep_ids[i+1] and ep_ids[j] == ep_ids[j+1]:
-                    d_next = d[i+1, j+1]
-                    d_prev = d[i+1, j-1] if j > 0 and ep_ids[j] == ep_ids[j-1] else float('inf')
-                    
-                    if d_next <= gate or d_prev <= gate:
-                        # Verified intersection. Add edge with weight equivalent to 1 step.
-                        adj[i, j] = 1.0
-                        adj[j, i] = 1.0
+                candidates.append((i, j))
 
-    # 3. Solve all-pairs shortest paths using Dijkstra (weighted)
-    print("      Solving weighted shortest paths via Dijkstra...")
+        if candidates:
+            rssm.eval()
+            actor.eval()
+            h_t = torch.tensor(h_nodes, dtype=torch.float32, device=device)
+            s_t = torch.tensor(s_nodes, dtype=torch.float32, device=device)
+            bs = int(max(32, imagination_pair_batch))
+            tag = f" ({graph_tag})" if graph_tag else ""
+            print(f"      Imagination-validating {len(candidates)} candidate kNN pairs{tag} ...")
+
+            for start in range(0, len(candidates), bs):
+                chunk = candidates[start : start + bs]
+                i_idx = torch.tensor([c[0] for c in chunk], device=device, dtype=torch.long)
+                j_idx = torch.tensor([c[1] for c in chunk], device=device, dtype=torch.long)
+                hi, si = h_t[i_idx], s_t[i_idx]
+                hj, sj = h_t[j_idx], s_t[j_idx]
+                d_ij = _batched_imagination_reach_steps(
+                    rssm, actor, hi, si, hj, imagination_max_steps, thr_h, device
+                )
+                d_ji = _batched_imagination_reach_steps(
+                    rssm, actor, hj, sj, hi, imagination_max_steps, thr_h, device
+                )
+                w = torch.minimum(d_ij, d_ji)
+                valid = w <= float(imagination_max_steps)
+                w_np = w.detach().cpu().numpy()
+                v_np = valid.detach().cpu().numpy()
+                for k in range(len(chunk)):
+                    if bool(v_np[k]):
+                        ii, jj = chunk[k]
+                        wt = float(w_np[k])
+                        adj[ii, jj] = wt
+                        adj[jj, ii] = wt
+                        n_img_edges += 1
+
+    msg_tag = f" [{graph_tag}]" if graph_tag else ""
+    print(f"      Solving weighted shortest paths via Dijkstra{msg_tag} (imagination_edges={n_img_edges})...")
     dist_mat = shortest_path(csgraph=adj, directed=False, unweighted=False)
-    
     return dist_mat
 
 
@@ -619,20 +776,75 @@ def _all_pairs_shortest_paths(adj):
     return dist
 
 
+def _replay_geo_corr_vs_geodesic(
+    geo: GeoEncoder,
+    h_t: torch.Tensor,
+    s_t: torch.Tensor,
+    pos: np.ndarray,
+    train_idx: np.ndarray,
+    geodesic: GeodesicComputer,
+    n_pairs: int,
+    seed: int,
+    device: torch.device,
+):
+    """Pearson/Spearman between ||g_i-g_j|| and geodesic(cell_i, cell_j) on train nodes (eval / logging)."""
+    from scipy import stats as sp_stats
+
+    rng = np.random.default_rng(int(seed))
+    n = int(len(train_idx))
+    if n < 4:
+        return {"pearson": float("nan"), "spearman": float("nan"), "n_pairs": 0}
+    cells_all = _positions_to_cell_indices(geodesic, pos)
+    cells = cells_all[train_idx.astype(np.int64)]
+    ii = rng.integers(0, n, size=int(n_pairs))
+    jj = rng.integers(0, n, size=int(n_pairs))
+    same = ii == jj
+    if np.any(same):
+        jj[same] = (jj[same] + 1) % n
+    d_geo = np.array(
+        [float(geodesic.dist_matrix[int(cells[i]), int(cells[j])]) for i, j in zip(ii, jj)],
+        dtype=np.float32,
+    )
+    valid = np.isfinite(d_geo) & (d_geo > 0)
+    if int(valid.sum()) < 32:
+        return {"pearson": float("nan"), "spearman": float("nan"), "n_pairs": int(valid.sum())}
+    ii = ii[valid]
+    jj = jj[valid]
+    d_geo = d_geo[valid]
+    geo.eval()
+    with torch.no_grad():
+        gi = geo(h_t[ii], s_t[ii])
+        gj = geo(h_t[jj], s_t[jj])
+        d_lat = torch.norm(gi - gj, dim=-1).cpu().numpy().astype(np.float32)
+    if len(d_lat) < 8:
+        return {"pearson": float("nan"), "spearman": float("nan"), "n_pairs": len(d_lat)}
+    pr = float(np.corrcoef(d_lat, d_geo)[0, 1])
+    sr = float(sp_stats.spearmanr(d_lat, d_geo).correlation)
+    return {"pearson": pr, "spearman": sr, "n_pairs": int(len(d_lat))}
+
+
 def train_geo_encoder_replay_graph(
     data: dict,
     cfg_pm: PointMazeRunCfg,
     device: torch.device,
     seed: int,
+    models: dict,
+    cfg: TrainCfg,
+    geodesic: GeodesicComputer,
+    pos: np.ndarray,
 ):
     """
-    Train g_replay(h,s) on TRAIN episodes only.
-    Teacher distances come from oracle-free replay-node shortest paths.
+    Train g_replay(h,s) on TRAIN episodes only with iterative bootstrapping.
+
+    Round 0: temporal edges only → Dijkstra teacher.
+    Later rounds: temporal + mutual kNN in g_{k-1} chart, imagination-validated.
     """
+    rssm: RSSM = models["rssm"]
+    actor: Actor = models["actor"]
+
     h = np.asarray(data["h"], dtype=np.float32)
     s = np.asarray(data["s"], dtype=np.float32)
     ep_ids = np.asarray(data["episode_ids"], dtype=np.int64)
-    local_feat_all = np.asarray(data["encoder_emb"], dtype=np.float32)
 
     train_mask, test_mask, train_eps, test_eps = _episode_split_ids(ep_ids, seed=int(seed), train_frac=0.8)
     train_idx = _subsample_indices(train_mask, int(cfg_pm.replay_graph_max_nodes))
@@ -640,38 +852,11 @@ def train_geo_encoder_replay_graph(
 
     h_train = h[train_idx]
     s_train = s[train_idx]
-    e_train = local_feat_all[train_idx]
     ep_train = ep_ids[train_idx]
 
     h_test = h[test_idx]
     s_test = s[test_idx]
-    e_test = local_feat_all[test_idx]
     ep_test = ep_ids[test_idx]
-
-    """
-    train_adj = _build_replay_node_graph(
-        e_train,
-        ep_train,
-        train_idx,
-        knn_k=int(cfg_pm.replay_graph_knn),
-        cross_quantile=float(cfg_pm.replay_graph_quantile),
-    )
-    test_adj = _build_replay_node_graph(
-        e_test,
-        ep_test,
-        test_idx,
-        knn_k=int(cfg_pm.replay_graph_knn),
-        cross_quantile=float(cfg_pm.replay_graph_quantile),
-    )
-    """
-
-    train_dist = _build_and_solve_replay_graph(e_train, ep_train, train_idx, knn_k=int(cfg_pm.replay_graph_knn), cross_quantile=float(cfg_pm.replay_graph_quantile))
-    test_dist = _build_and_solve_replay_graph(e_test, ep_test, test_idx, knn_k=int(cfg_pm.replay_graph_knn), cross_quantile=float(cfg_pm.replay_graph_quantile))
-
-    """
-    train_dist = _all_pairs_shortest_paths(train_adj)
-    test_dist = _all_pairs_shortest_paths(test_adj)
-    """
 
     geo = GeoEncoder(
         int(h.shape[1]),
@@ -683,49 +868,127 @@ def train_geo_encoder_replay_graph(
 
     h_t = torch.tensor(h_train, dtype=torch.float32, device=device)
     s_t = torch.tensor(s_train, dtype=torch.float32, device=device)
+    h_test_t = torch.tensor(h_test, dtype=torch.float32, device=device)
+    s_test_t = torch.tensor(s_test, dtype=torch.float32, device=device)
 
     n = int(len(h_train))
     rng = np.random.default_rng(int(seed))
+    n_rounds = max(1, int(cfg_pm.replay_bootstrap_rounds))
+    epochs_per_round = max(1, int(np.ceil(float(cfg_pm.replay_geo_epochs) / float(n_rounds))))
 
-    for epoch in range(int(cfg_pm.replay_geo_epochs)):
-        if n < 4:
-            break
-        ii = rng.integers(0, n, size=int(cfg_pm.replay_geo_batch_pairs))
-        jj = rng.integers(0, n, size=int(cfg_pm.replay_geo_batch_pairs))
-        same = ii == jj
-        if np.any(same):
-            jj[same] = (jj[same] + 1) % n
+    bootstrap_round_stats = []
+    g_chart_train: Optional[np.ndarray] = None
 
-        d_teacher = train_dist[ii, jj]
-        valid = np.isfinite(d_teacher) & (d_teacher > 0)
-        if int(valid.sum()) < 64:
-            continue
+    for br in range(n_rounds):
+        include_knn = br > 0
+        chart_train = g_chart_train if include_knn else np.zeros((n, 1), dtype=np.float32)
 
-        ii = ii[valid]
-        jj = jj[valid]
-        d_teacher = d_teacher[valid].astype(np.float32)
+        train_dist = _build_and_solve_replay_graph(
+            chart_train,
+            ep_train,
+            train_idx,
+            knn_k=int(cfg_pm.replay_graph_knn),
+            cross_quantile=float(cfg_pm.replay_graph_quantile),
+            include_chart_knn=include_knn,
+            h_nodes=h_train,
+            s_nodes=s_train,
+            rssm=rssm,
+            actor=actor,
+            device=device,
+            imagination_max_steps=int(cfg_pm.replay_graph_imagination_max_steps),
+            imagination_h_thresh=float(cfg_pm.replay_graph_imagination_h_thresh),
+            imagination_pair_batch=int(cfg_pm.replay_imagination_pair_batch),
+            graph_tag=f"train_r{br}",
+        )
 
-        gi = geo(h_t[ii], s_t[ii])
-        gj = geo(h_t[jj], s_t[jj])
-        d_lat = torch.norm(gi - gj, dim=-1)
+        print(
+            f"    Bootstrap round {br + 1}/{n_rounds}: "
+            f"{'temporal + imagination kNN in g' if include_knn else 'temporal only'}"
+        )
 
-        d_teacher_t = torch.tensor(d_teacher, dtype=torch.float32, device=device)
-        w = 1.0 / torch.sqrt(d_teacher_t + 1.0)
-        scale = d_teacher_t.mean().clamp_min(1e-3)
-        loss = (w * (d_lat - d_teacher_t / scale) ** 2).mean()
+        for epoch in range(epochs_per_round):
+            if n < 4:
+                break
+            ii = rng.integers(0, n, size=int(cfg_pm.replay_geo_batch_pairs))
+            jj = rng.integers(0, n, size=int(cfg_pm.replay_geo_batch_pairs))
+            same = ii == jj
+            if np.any(same):
+                jj[same] = (jj[same] + 1) % n
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+            d_teacher = train_dist[ii, jj]
+            valid = np.isfinite(d_teacher) & (d_teacher > 0)
+            if int(valid.sum()) < 64:
+                continue
 
-        if (epoch + 1) % max(1, int(cfg_pm.replay_geo_epochs) // 3) == 0:
-            print(
-                f"    g_replay epoch {epoch+1}/{int(cfg_pm.replay_geo_epochs)}  "
-                f"loss={loss.item():.4f}  "
-                f"train_nodes={len(train_idx)} test_nodes={len(test_idx)}"
+            ii_v = ii[valid]
+            jj_v = jj[valid]
+            d_teacher_v = d_teacher[valid].astype(np.float32)
+
+            gi = geo(h_t[ii_v], s_t[ii_v])
+            gj = geo(h_t[jj_v], s_t[jj_v])
+            d_lat = torch.norm(gi - gj, dim=-1)
+
+            d_teacher_t = torch.tensor(d_teacher_v, dtype=torch.float32, device=device)
+            w = 1.0 / torch.sqrt(d_teacher_t + 1.0)
+            scale = d_teacher_t.mean().clamp_min(1e-3)
+            loss = (w * (d_lat - d_teacher_t / scale) ** 2).mean()
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            global_e = br * epochs_per_round + epoch + 1
+            total_e = n_rounds * epochs_per_round
+            if global_e % max(1, total_e // 6) == 0:
+                print(
+                    f"    g_replay round {br + 1} epoch {epoch + 1}/{epochs_per_round}  "
+                    f"loss={loss.item():.4f}  train_nodes={n} test_nodes={len(test_idx)}"
+                )
+
+        geo.eval()
+        with torch.no_grad():
+            g_chart_train = geo(h_t, s_t).cpu().numpy().astype(np.float32)
+
+        rd = {
+            "round": int(br),
+            "include_knn": bool(include_knn),
+        }
+        if bool(cfg_pm.replay_bootstrap_log_geodesic_corr):
+            rd["g_vs_geodesic"] = _replay_geo_corr_vs_geodesic(
+                geo,
+                h_t,
+                s_t,
+                pos,
+                train_idx,
+                geodesic,
+                int(cfg_pm.replay_bootstrap_geo_pairs),
+                seed=int(seed) + br * 10007,
+                device=device,
             )
+        bootstrap_round_stats.append(rd)
 
     geo.eval()
+    with torch.no_grad():
+        g_chart_test = geo(h_test_t, s_test_t).cpu().numpy().astype(np.float32)
+
+    test_dist = _build_and_solve_replay_graph(
+        g_chart_test,
+        ep_test,
+        test_idx,
+        knn_k=int(cfg_pm.replay_graph_knn),
+        cross_quantile=float(cfg_pm.replay_graph_quantile),
+        include_chart_knn=bool(n_rounds > 1),
+        h_nodes=h_test,
+        s_nodes=s_test,
+        rssm=rssm,
+        actor=actor,
+        device=device,
+        imagination_max_steps=int(cfg_pm.replay_graph_imagination_max_steps),
+        imagination_h_thresh=float(cfg_pm.replay_graph_imagination_h_thresh),
+        imagination_pair_batch=int(cfg_pm.replay_imagination_pair_batch),
+        graph_tag="test_final",
+    )
+
     with torch.no_grad():
         g_all = geo(
             torch.tensor(h, dtype=torch.float32, device=device),
@@ -739,6 +1002,8 @@ def train_geo_encoder_replay_graph(
         "test_dist": test_dist,
         "train_eps": sorted(list(train_eps)),
         "test_eps": sorted(list(test_eps)),
+        "bootstrap_round_stats": bootstrap_round_stats,
+        "replay_bootstrap_rounds": int(n_rounds),
     }
     return geo, g_all, meta
 
@@ -1052,6 +1317,128 @@ def run_latent_room_discovery(
         if stats is not None:
             results[name] = stats
     return results
+
+
+def run_topology_recovery_eval(
+    geodesic: GeodesicComputer,
+    pos: np.ndarray,
+    features: dict,
+    cfg: TrainCfg,
+    seed: int = 0,
+):
+    """Threshold graphs in latent space vs oracle room/bridge structure (evaluation).
+
+    For each representation, aggregate embeddings per free cell, sweep distance thresholds,
+    build graphs { (i,j) : d(i,j) < τ }, and compare connected components to oracle rooms
+    and bridge counts from the geodesic graph.
+    """
+    from scipy.sparse.csgraph import connected_components
+
+    cell_idx_all = _positions_to_cell_indices(geodesic, pos)
+    n_free = geodesic.n_free
+    dist_mat = geodesic.dist_matrix
+    adj_oracle = _adj_from_distmat(dist_mat)
+    bridges_oracle = _find_bridges(adj_oracle)
+    comp_oracle, n_rooms_oracle = _components_without_bridges(adj_oracle, bridges_oracle)
+    n_bridges_o = int(len(bridges_oracle))
+
+    def _aggregate(feat_arr: np.ndarray):
+        D = int(feat_arr.shape[1])
+        cell_feats = np.zeros((n_free, D), dtype=np.float32)
+        counts = np.zeros(n_free, dtype=np.int64)
+        for f, c in zip(feat_arr, cell_idx_all):
+            ci = int(c)
+            cell_feats[ci] += f
+            counts[ci] += 1
+        valid = counts > 0
+        if not np.any(valid):
+            return None
+        vis = np.where(valid)[0]
+        fv = cell_feats[vis] / counts[vis, None]
+        return vis, fv
+
+    out_all = {}
+    for name, feat in features.items():
+        f = np.asarray(feat, dtype=np.float32)
+        ag = _aggregate(f)
+        if ag is None:
+            continue
+        vis, fv = ag
+        nv = int(len(vis))
+        if nv < 4:
+            continue
+        dm = np.linalg.norm(fv[:, None, :] - fv[None, :, :], axis=-1)
+        triu_i, triu_j = np.triu_indices(nv, k=1)
+        flat = dm[triu_i, triu_j]
+        flat = flat[np.isfinite(flat)]
+        if len(flat) < 16:
+            continue
+
+        sweep = []
+        best_bridge = None
+        best_room = None
+        for q in np.linspace(0.02, 0.48, 24):
+            thresh = float(np.quantile(flat, float(q)))
+            adj_lat = [[] for _ in range(nv)]
+            for i in range(nv):
+                for j in range(i + 1, nv):
+                    if dm[i, j] < thresh:
+                        adj_lat[i].append(j)
+                        adj_lat[j].append(i)
+            bridges_l = _find_bridges(adj_lat)
+            n_bl = int(len(bridges_l))
+            n_comp, labels = connected_components(_adj_list_to_csr(adj_lat, nv), directed=False)
+
+            agree = 0
+            tot = 0
+            for a in range(nv):
+                for b in range(a + 1, nv):
+                    ga, gb = int(vis[a]), int(vis[b])
+                    same_o = comp_oracle[ga] == comp_oracle[gb]
+                    same_l = labels[a] == labels[b]
+                    if same_l == same_o:
+                        agree += 1
+                    tot += 1
+            p_agree = float(agree / max(tot, 1))
+
+            rec = {
+                "quantile": float(q),
+                "thresh": thresh,
+                "n_bridges_latent": n_bl,
+                "n_components": int(n_comp),
+                "room_pair_agreement": p_agree,
+            }
+            sweep.append(rec)
+            err_b = abs(n_bl - n_bridges_o)
+            if best_bridge is None or err_b < best_bridge["bridge_count_abs_error"]:
+                best_bridge = {
+                    "quantile": float(q),
+                    "thresh": thresh,
+                    "n_bridges_latent": n_bl,
+                    "n_components": int(n_comp),
+                    "room_pair_agreement": p_agree,
+                    "bridge_count_abs_error": int(err_b),
+                }
+            if best_room is None or p_agree > best_room["room_pair_agreement"]:
+                best_room = {
+                    "quantile": float(q),
+                    "thresh": thresh,
+                    "n_bridges_latent": n_bl,
+                    "n_components": int(n_comp),
+                    "room_pair_agreement": p_agree,
+                    "bridge_count_abs_error": int(err_b),
+                }
+
+        out_all[name] = {
+            "n_bridges_oracle": n_bridges_o,
+            "n_rooms_oracle": int(n_rooms_oracle),
+            "best_by_bridge_match": best_bridge,
+            "best_by_room_agreement": best_room,
+            "threshold_sweep_head": sweep[:6],
+            "threshold_sweep_tail": sweep[-4:],
+            "seed": int(seed),
+        }
+    return out_all
 
 
 def run_metric_class_mismatch(
