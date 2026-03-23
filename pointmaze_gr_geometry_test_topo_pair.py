@@ -3,7 +3,7 @@
 import argparse
 import os
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Dict, Optional
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -228,6 +228,10 @@ class PointMazeRunCfg:
     replay_topology_cut_weight: float = 0.25
     replay_topology_spec_weight: float = 0.75
     replay_topology_margin_weight: float = 0.25
+    replay_topology_train_frac: float = 0.70
+    replay_topology_val_frac: float = 0.15
+    replay_topology_test_frac: float = 0.15
+    replay_topology_eval_repeats: int = 24
 
 
 def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
@@ -449,6 +453,10 @@ def parse_args():
         action="store_true",
         help="Disable the oracle-free replay-topology head",
     )
+    p.add_argument("--replay_topology_train_frac", type=float, default=0.70, help="Episode fraction for replay-topology training split")
+    p.add_argument("--replay_topology_val_frac", type=float, default=0.15, help="Episode fraction for replay-topology validation split")
+    p.add_argument("--replay_topology_test_frac", type=float, default=0.15, help="Episode fraction for replay-topology test split")
+    p.add_argument("--replay_topology_eval_repeats", type=int, default=24, help="Number of repeated pair-eval batches per split")
     return p.parse_args()
 
 
@@ -461,6 +469,10 @@ def main():
         geo_supervised=bool(args.geo_supervised),
         wm_path=args.wm_path,
         replay_topology=not bool(args.no_replay_topology),
+        replay_topology_train_frac=float(args.replay_topology_train_frac),
+        replay_topology_val_frac=float(args.replay_topology_val_frac),
+        replay_topology_test_frac=float(args.replay_topology_test_frac),
+        replay_topology_eval_repeats=int(args.replay_topology_eval_repeats),
     )
     run_single_pointmaze(cfg_pm)
 
@@ -740,6 +752,82 @@ def _balanced_bce_from_logits(pos_logits: torch.Tensor, neg_logits: torch.Tensor
     return F.binary_cross_entropy_with_logits(logits, targets)
 
 
+def _shortest_path_matrix_from_adj(adj):
+    n = int(len(adj))
+    dist = np.full((n, n), np.inf, dtype=np.float32)
+    for src in range(n):
+        dist[src, src] = 0.0
+        q = [int(src)]
+        qi = 0
+        while qi < len(q):
+            u = q[qi]
+            qi += 1
+            du = dist[src, u]
+            for v in adj[u]:
+                v = int(v)
+                if dist[src, v] == np.inf:
+                    dist[src, v] = du + 1.0
+                    q.append(v)
+    return dist
+
+
+def _binary_auc_roc(y_true: np.ndarray, y_score: np.ndarray):
+    y_true = np.asarray(y_true, dtype=np.int32)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    n_pos = int((y_true == 1).sum())
+    n_neg = int((y_true == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return None
+    order = np.argsort(y_score)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
+    pos_ranks = ranks[y_true == 1].sum()
+    auc = (pos_ranks - (n_pos * (n_pos + 1) / 2.0)) / float(max(1, n_pos * n_neg))
+    return float(auc)
+
+
+def _binary_average_precision(y_true: np.ndarray, y_score: np.ndarray):
+    y_true = np.asarray(y_true, dtype=np.int32)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    n_pos = int((y_true == 1).sum())
+    if n_pos == 0:
+        return None
+    order = np.argsort(-y_score)
+    y_sorted = y_true[order]
+    tp = 0
+    fp = 0
+    precisions = []
+    recalls = []
+    for y in y_sorted:
+        if y == 1:
+            tp += 1
+        else:
+            fp += 1
+        precisions.append(tp / float(max(1, tp + fp)))
+        recalls.append(tp / float(n_pos))
+    ap = 0.0
+    prev_recall = 0.0
+    for p, r in zip(precisions, recalls):
+        ap += p * max(0.0, r - prev_recall)
+        prev_recall = r
+    return float(ap)
+
+
+def _summary_stats(values):
+    vals = [float(v) for v in values if v is not None and np.isfinite(v)]
+    if not vals:
+        return {"mean": None, "std": None, "ci95": None, "n": 0}
+    arr = np.asarray(vals, dtype=np.float64)
+    std = float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+    ci95 = float(1.96 * std / max(1.0, np.sqrt(len(arr))))
+    return {
+        "mean": float(arr.mean()),
+        "std": std,
+        "ci95": ci95,
+        "n": int(len(arr)),
+    }
+
+
 def train_replay_topology_head(
     data: dict,
     cfg_pm: PointMazeRunCfg,
@@ -757,29 +845,47 @@ def train_replay_topology_head(
     ep_sub = ep_ids[keep_idx]
     enc_sub = enc[keep_idx]
 
-    teacher = _build_replay_topology_teacher(
-        local_feat=enc_sub,
-        ep_ids=ep_sub,
-        orig_idx=keep_idx,
-        knn_k=int(cfg_pm.replay_graph_knn),
-        cross_quantile=float(cfg_pm.replay_graph_quantile),
-        spec_dim=int(cfg_pm.replay_topology_spec_dim),
-    )
-
     n = int(len(keep_idx))
     if n < 8:
         return None, None, None
 
     rng = np.random.default_rng(int(seed))
-    perm = rng.permutation(n)
-    n_val = min(max(32, int(round(0.1 * n))), n - 1)
-    val_idx = np.sort(perm[:n_val]).astype(np.int64)
-    train_idx = np.sort(perm[n_val:]).astype(np.int64)
+    uniq_eps = np.unique(ep_sub)
+    rng.shuffle(uniq_eps)
+    n_eps = int(len(uniq_eps))
+    frac_sum = max(
+        1e-6,
+        float(cfg_pm.replay_topology_train_frac)
+        + float(cfg_pm.replay_topology_val_frac)
+        + float(cfg_pm.replay_topology_test_frac),
+    )
+    f_train = float(cfg_pm.replay_topology_train_frac) / frac_sum
+    f_val = float(cfg_pm.replay_topology_val_frac) / frac_sum
+    f_test = float(cfg_pm.replay_topology_test_frac) / frac_sum
+    n_train_eps = max(1, int(round(f_train * n_eps)))
+    n_val_eps = max(1, int(round(f_val * n_eps)))
+    n_test_eps = max(1, int(round(f_test * n_eps)))
+    if n_train_eps + n_val_eps + n_test_eps > n_eps:
+        overflow = n_train_eps + n_val_eps + n_test_eps - n_eps
+        n_train_eps = max(1, n_train_eps - overflow)
+    if n_train_eps + n_val_eps >= n_eps:
+        n_val_eps = max(1, n_eps - n_train_eps - 1)
+    n_test_eps = max(1, n_eps - n_train_eps - n_val_eps)
 
-    train_mask = np.zeros(n, dtype=bool)
-    train_mask[train_idx] = True
-    val_mask = np.zeros(n, dtype=bool)
-    val_mask[val_idx] = True
+    eps_train = set(map(int, uniq_eps[:n_train_eps].tolist()))
+    eps_val = set(map(int, uniq_eps[n_train_eps : n_train_eps + n_val_eps].tolist()))
+    eps_test = set(map(int, uniq_eps[n_train_eps + n_val_eps :].tolist()))
+    if not eps_test:
+        eps_test = set(map(int, uniq_eps[-1:].tolist()))
+        eps_val = set(map(int, uniq_eps[n_train_eps : -1].tolist()))
+
+    split_global = {
+        "train": np.where(np.array([int(e) in eps_train for e in ep_sub], dtype=bool))[0].astype(np.int64),
+        "val": np.where(np.array([int(e) in eps_val for e in ep_sub], dtype=bool))[0].astype(np.int64),
+        "test": np.where(np.array([int(e) in eps_test for e in ep_sub], dtype=bool))[0].astype(np.int64),
+    }
+    if min(len(split_global["train"]), len(split_global["val"]), len(split_global["test"])) < 8:
+        return None, None, None
 
     model = ReplayTopologyHead(
         deter_dim=int(h.shape[1]),
@@ -792,44 +898,57 @@ def train_replay_topology_head(
 
     h_t = torch.tensor(h_sub, dtype=torch.float32, device=device)
     s_t = torch.tensor(s_sub, dtype=torch.float32, device=device)
-    bridge_t = torch.tensor(teacher["bridge_score"], dtype=torch.float32, device=device)
-    spec_t = torch.tensor(teacher["spec"], dtype=torch.float32, device=device)
-    val_idx_t = torch.tensor(val_idx, dtype=torch.long, device=device)
 
-    room_ids = np.asarray(teacher["room_ids"], dtype=np.int64)
-    cut_side = np.asarray(teacher["cut_side"], dtype=np.int64)
-    adj_sets = [set(map(int, js)) for js in teacher["adj"]]
-    edges = np.asarray(teacher["edges"], dtype=np.int64)
-    edge_bridge_mask = np.asarray(teacher["edge_bridge_mask"], dtype=np.float32)
+    split_ctx: Dict[str, dict] = {}
+    for split_name, g_idx in split_global.items():
+        feat_split = enc_sub[g_idx]
+        ep_split = ep_sub[g_idx]
+        teacher = _build_replay_topology_teacher(
+            local_feat=feat_split,
+            ep_ids=ep_split,
+            orig_idx=keep_idx[g_idx],
+            knn_k=int(cfg_pm.replay_graph_knn),
+            cross_quantile=float(cfg_pm.replay_graph_quantile),
+            spec_dim=int(cfg_pm.replay_topology_spec_dim),
+        )
+        room_ids = np.asarray(teacher["room_ids"], dtype=np.int64)
+        cut_side = np.asarray(teacher["cut_side"], dtype=np.int64)
+        adj = teacher["adj"]
+        adj_sets = [set(map(int, js)) for js in adj]
+        edges = np.asarray(teacher["edges"], dtype=np.int64)
+        edge_bridge_mask = np.asarray(teacher["edge_bridge_mask"], dtype=np.float32)
+        bridge_edges = edges[edge_bridge_mask > 0.5]
+        non_bridge_edges = edges[edge_bridge_mask <= 0.5]
+        bridge_score = np.asarray(teacher["bridge_score"], dtype=np.float32)
+        spec = np.asarray(teacher["spec"], dtype=np.float32)
 
-    def _filter_edges(mask_nodes: np.ndarray):
-        if len(edges) == 0:
-            return np.zeros((0, 2), dtype=np.int64), np.zeros((0,), dtype=np.float32)
-        keep_e = mask_nodes[edges[:, 0]] & mask_nodes[edges[:, 1]]
-        return edges[keep_e], edge_bridge_mask[keep_e]
-
-    edges_train, edge_bridge_train = _filter_edges(train_mask)
-    edges_val, edge_bridge_val = _filter_edges(val_mask)
-    bridge_edges_train = edges_train[edge_bridge_train > 0.5]
-    non_bridge_edges_train = edges_train[edge_bridge_train <= 0.5]
-    bridge_edges_val = edges_val[edge_bridge_val > 0.5]
-    non_bridge_edges_val = edges_val[edge_bridge_val <= 0.5]
-
-    def _room_groups(mask_nodes: np.ndarray):
         groups = {}
-        for idx_local in np.flatnonzero(mask_nodes):
-            rid = int(room_ids[idx_local])
-            groups.setdefault(rid, []).append(int(idx_local))
+        for i_local, rid in enumerate(room_ids.tolist()):
+            groups.setdefault(int(rid), []).append(int(i_local))
         groups = {rid: np.asarray(nodes, dtype=np.int64) for rid, nodes in groups.items()}
-        nontrivial = {rid: nodes for rid, nodes in groups.items() if len(nodes) >= 2}
-        return groups, nontrivial
+        groups_nt = {rid: nodes for rid, nodes in groups.items() if len(nodes) >= 2}
+        sp_dist = _shortest_path_matrix_from_adj(adj)
 
-    room_groups_train, room_groups_train_nt = _room_groups(train_mask)
-    room_groups_val, room_groups_val_nt = _room_groups(val_mask)
+        split_ctx[split_name] = {
+            "global_idx": g_idx.astype(np.int64),
+            "teacher": teacher,
+            "room_ids": room_ids,
+            "cut_side": cut_side,
+            "adj_sets": adj_sets,
+            "bridge_edges": bridge_edges.astype(np.int64),
+            "non_bridge_edges": non_bridge_edges.astype(np.int64),
+            "bridge_score": bridge_score,
+            "spec": spec,
+            "groups_nt": groups_nt,
+            "sp_dist": sp_dist,
+            "bridge_t": torch.tensor(bridge_score, dtype=torch.float32, device=device),
+            "spec_t": torch.tensor(spec, dtype=torch.float32, device=device),
+        }
 
     def _sample_same_region_pairs(batch_size: int, split: str):
-        allowed = train_idx if split == "train" else val_idx
-        groups = room_groups_train_nt if split == "train" else room_groups_val_nt
+        ctx = split_ctx[split]
+        allowed = np.arange(len(ctx["global_idx"]), dtype=np.int64)
+        groups = ctx["groups_nt"]
 
         pos_i, pos_j = [], []
         if groups:
@@ -845,8 +964,14 @@ def train_replay_topology_head(
         pos_i = np.asarray(pos_i, dtype=np.int64)
         pos_j = np.asarray(pos_j, dtype=np.int64)
 
+        room_ids = ctx["room_ids"]
+        sp_dist = ctx["sp_dist"]
+
         def _valid_neg(a, b):
-            return room_ids[int(a)] != room_ids[int(b)]
+            if room_ids[int(a)] == room_ids[int(b)]:
+                return False
+            d = float(sp_dist[int(a), int(b)])
+            return np.isfinite(d) and d <= 4.0
 
         neg_i, neg_j = _sample_distinct_random_pairs(
             rng=rng,
@@ -857,8 +982,9 @@ def train_replay_topology_head(
         return pos_i, pos_j, neg_i, neg_j
 
     def _sample_neighbor_pairs(batch_size: int, split: str):
-        allowed = train_idx if split == "train" else val_idx
-        edge_split = edges_train if split == "train" else edges_val
+        ctx = split_ctx[split]
+        allowed = np.arange(len(ctx["global_idx"]), dtype=np.int64)
+        edge_split = ctx["bridge_edges"] if len(ctx["bridge_edges"]) else np.asarray(ctx["teacher"]["edges"], dtype=np.int64)
         m = min(int(batch_size), len(edge_split))
         if m > 0:
             take = rng.choice(len(edge_split), size=m, replace=False)
@@ -868,8 +994,14 @@ def train_replay_topology_head(
             pos_i = np.zeros((0,), dtype=np.int64)
             pos_j = np.zeros((0,), dtype=np.int64)
 
+        adj_sets = ctx["adj_sets"]
+        sp_dist = ctx["sp_dist"]
+
         def _valid_neg(a, b):
-            return int(b) not in adj_sets[int(a)]
+            if int(b) in adj_sets[int(a)]:
+                return False
+            d = float(sp_dist[int(a), int(b)])
+            return np.isfinite(d) and abs(d - 2.0) < 1e-6
 
         neg_i, neg_j = _sample_distinct_random_pairs(
             rng=rng,
@@ -880,8 +1012,9 @@ def train_replay_topology_head(
         return pos_i, pos_j, neg_i, neg_j
 
     def _sample_bridge_edge_pairs(batch_size: int, split: str):
-        pos_edges = bridge_edges_train if split == "train" else bridge_edges_val
-        neg_edges = non_bridge_edges_train if split == "train" else non_bridge_edges_val
+        ctx = split_ctx[split]
+        pos_edges = ctx["bridge_edges"]
+        neg_edges = ctx["non_bridge_edges"]
         m = min(int(batch_size), len(pos_edges), max(1, len(neg_edges)))
         if m <= 0:
             return (
@@ -899,9 +1032,10 @@ def train_replay_topology_head(
         return pos_i, pos_j, neg_i, neg_j
 
     def _sample_cut_pairs(batch_size: int, split: str):
-        allowed = train_idx if split == "train" else val_idx
-        left = allowed[cut_side[allowed] == 0]
-        right = allowed[cut_side[allowed] == 1]
+        ctx = split_ctx[split]
+        allowed = np.arange(len(ctx["global_idx"]), dtype=np.int64)
+        left = allowed[ctx["cut_side"][allowed] == 0]
+        right = allowed[ctx["cut_side"][allowed] == 1]
         if len(left) == 0 or len(right) == 0:
             return (
                 np.zeros((0,), dtype=np.int64),
@@ -926,10 +1060,11 @@ def train_replay_topology_head(
         opp_j = right[rng.integers(0, len(right), size=max(1, len(same_i)))]
         return same_i, same_j, opp_i.astype(np.int64), opp_j.astype(np.int64)
 
-    def _gather_pair_logits(z_all: torch.Tensor, ii: np.ndarray, jj: np.ndarray, key: str):
+    def _gather_pair_logits(z_all: torch.Tensor, split: str, ii: np.ndarray, jj: np.ndarray, key: str):
         if len(ii) == 0 or len(jj) == 0:
             return torch.zeros((0,), dtype=torch.float32, device=device)
-        out = model.pair_outputs_from_z(z_all[ii], z_all[jj])
+        gidx = split_ctx[split]["global_idx"]
+        out = model.pair_outputs_from_z(z_all[gidx[ii]], z_all[gidx[jj]])
         return out[key]
 
     def _compute_pair_task_losses(z_all: torch.Tensor, split: str, pair_batch: int):
@@ -939,25 +1074,39 @@ def train_replay_topology_head(
         pos_i_ct, pos_j_ct, neg_i_ct, neg_j_ct = _sample_cut_pairs(pair_batch, split)
 
         losses = {}
-        logits_pos = _gather_pair_logits(z_all, pos_i_sr, pos_j_sr, "same_region_logit")
-        logits_neg = _gather_pair_logits(z_all, neg_i_sr, neg_j_sr, "same_region_logit")
+        logits_pos = _gather_pair_logits(z_all, split, pos_i_sr, pos_j_sr, "same_region_logit")
+        logits_neg = _gather_pair_logits(z_all, split, neg_i_sr, neg_j_sr, "same_region_logit")
         losses["same_region"] = _balanced_bce_from_logits(logits_pos, logits_neg) if len(logits_pos) and len(logits_neg) else torch.tensor(0.0, device=device)
 
-        logits_pos = _gather_pair_logits(z_all, pos_i_nb, pos_j_nb, "neighbor_logit")
-        logits_neg = _gather_pair_logits(z_all, neg_i_nb, neg_j_nb, "neighbor_logit")
+        logits_pos = _gather_pair_logits(z_all, split, pos_i_nb, pos_j_nb, "neighbor_logit")
+        logits_neg = _gather_pair_logits(z_all, split, neg_i_nb, neg_j_nb, "neighbor_logit")
         losses["neighbor"] = _balanced_bce_from_logits(logits_pos, logits_neg) if len(logits_pos) and len(logits_neg) else torch.tensor(0.0, device=device)
 
-        logits_pos = _gather_pair_logits(z_all, pos_i_be, pos_j_be, "bridge_edge_logit")
-        logits_neg = _gather_pair_logits(z_all, neg_i_be, neg_j_be, "bridge_edge_logit")
+        logits_pos = _gather_pair_logits(z_all, split, pos_i_be, pos_j_be, "bridge_edge_logit")
+        logits_neg = _gather_pair_logits(z_all, split, neg_i_be, neg_j_be, "bridge_edge_logit")
         losses["bridge_edge"] = _balanced_bce_from_logits(logits_pos, logits_neg) if len(logits_pos) and len(logits_neg) else torch.tensor(0.0, device=device)
 
-        logits_pos = _gather_pair_logits(z_all, pos_i_ct, pos_j_ct, "cut_logit")
-        logits_neg = _gather_pair_logits(z_all, neg_i_ct, neg_j_ct, "cut_logit")
+        logits_pos = _gather_pair_logits(z_all, split, pos_i_ct, pos_j_ct, "cut_logit")
+        logits_neg = _gather_pair_logits(z_all, split, neg_i_ct, neg_j_ct, "cut_logit")
         losses["cut"] = _balanced_bce_from_logits(logits_pos, logits_neg) if len(logits_pos) and len(logits_neg) else torch.tensor(0.0, device=device)
 
         if len(pos_i_nb) and len(neg_i_nb):
-            d_pos = torch.norm(z_all[pos_i_nb] - z_all[pos_j_nb], dim=-1)
-            d_neg = torch.norm(z_all[neg_i_nb] - z_all[neg_j_nb], dim=-1)
+            gidx = split_ctx[split]["global_idx"]
+            m = int(min(len(pos_i_nb), len(neg_i_nb)))
+            if m <= 0:
+                losses["margin"] = torch.tensor(0.0, device=device)
+                return losses
+            # Hard-negative filters can yield imbalanced counts; align pair counts.
+            pos_take = np.arange(m, dtype=np.int64)
+            neg_take = np.arange(m, dtype=np.int64)
+            d_pos = torch.norm(
+                z_all[gidx[pos_i_nb[pos_take]]] - z_all[gidx[pos_j_nb[pos_take]]],
+                dim=-1,
+            )
+            d_neg = torch.norm(
+                z_all[gidx[neg_i_nb[neg_take]]] - z_all[gidx[neg_j_nb[neg_take]]],
+                dim=-1,
+            )
             losses["margin"] = F.relu(d_pos + 0.25 - d_neg).mean()
         else:
             losses["margin"] = torch.tensor(0.0, device=device)
@@ -966,17 +1115,23 @@ def train_replay_topology_head(
 
     best_val = float("inf")
     best_state = None
-    batch_nodes = int(min(cfg_pm.replay_topology_batch_nodes, len(train_idx)))
-    pair_batch = int(min(max(128, batch_nodes // 2), max(32, len(train_idx))))
+    train_n = len(split_ctx["train"]["global_idx"])
+    val_n = len(split_ctx["val"]["global_idx"])
+    batch_nodes = int(min(cfg_pm.replay_topology_batch_nodes, train_n))
+    pair_batch = int(min(max(128, batch_nodes // 2), max(32, train_n)))
 
     for epoch in range(int(cfg_pm.replay_topology_epochs)):
         model.train()
-        node_batch = rng.choice(train_idx, size=batch_nodes, replace=False) if batch_nodes < len(train_idx) else train_idx
+        train_g = split_ctx["train"]["global_idx"]
+        node_batch_local = rng.choice(train_n, size=batch_nodes, replace=False) if batch_nodes < train_n else np.arange(train_n, dtype=np.int64)
+        node_batch = train_g[node_batch_local]
         node_batch_t = torch.tensor(node_batch, dtype=torch.long, device=device)
         out = model(h_t[node_batch_t], s_t[node_batch_t])
 
-        loss_bridge_node = F.binary_cross_entropy_with_logits(out["bridge_logit"], bridge_t[node_batch_t])
-        loss_spec = F.mse_loss(out["spec_pred"], spec_t[node_batch_t])
+        train_bridge_t = split_ctx["train"]["bridge_t"][torch.tensor(node_batch_local, dtype=torch.long, device=device)]
+        train_spec_t = split_ctx["train"]["spec_t"][torch.tensor(node_batch_local, dtype=torch.long, device=device)]
+        loss_bridge_node = F.binary_cross_entropy_with_logits(out["bridge_logit"], train_bridge_t)
+        loss_spec = F.mse_loss(out["spec_pred"], train_spec_t)
 
         z_all = model.encode(h_t, s_t)
         pair_losses = _compute_pair_task_losses(z_all, split="train", pair_batch=pair_batch)
@@ -997,12 +1152,14 @@ def train_replay_topology_head(
 
         with torch.no_grad():
             model.eval()
+            val_g = split_ctx["val"]["global_idx"]
+            val_idx_t = torch.tensor(val_g, dtype=torch.long, device=device)
             val_out = model(h_t[val_idx_t], s_t[val_idx_t])
-            val_bridge_node = F.binary_cross_entropy_with_logits(val_out["bridge_logit"], bridge_t[val_idx_t])
-            val_spec = F.mse_loss(val_out["spec_pred"], spec_t[val_idx_t])
+            val_bridge_node = F.binary_cross_entropy_with_logits(val_out["bridge_logit"], split_ctx["val"]["bridge_t"])
+            val_spec = F.mse_loss(val_out["spec_pred"], split_ctx["val"]["spec_t"])
 
             z_all_val = model.encode(h_t, s_t)
-            val_pair_losses = _compute_pair_task_losses(z_all_val, split="val", pair_batch=min(pair_batch, max(16, len(val_idx))))
+            val_pair_losses = _compute_pair_task_losses(z_all_val, split="val", pair_batch=min(pair_batch, max(16, val_n)))
             val_loss = (
                 float(cfg_pm.replay_topology_same_region_weight) * val_pair_losses["same_region"]
                 + float(cfg_pm.replay_topology_bridge_node_weight) * val_bridge_node
@@ -1046,63 +1203,108 @@ def train_replay_topology_head(
         z_all = out_all["z"].cpu().numpy().astype(np.float32)
         bridge_prob_all = torch.sigmoid(out_all["bridge_logit"]).cpu().numpy().astype(np.float32)
 
-    from scipy import stats as sp_stats
+    def _pair_task_eval(split: str, key: str, sampler):
+        repeats = int(max(4, cfg_pm.replay_topology_eval_repeats))
+        bal_accs, aucs, aps = [], [], []
+        for _ in range(repeats):
+            pair_eval = max(64, min(512, len(split_ctx[split]["global_idx"])))
+            pos_i, pos_j, neg_i, neg_j = sampler(pair_eval, split)
+            if len(pos_i) == 0 or len(neg_i) == 0:
+                continue
+            gidx = split_ctx[split]["global_idx"]
+            with torch.no_grad():
+                z_t = torch.tensor(z_sub, dtype=torch.float32, device=device)
+                logits_pos = model.pair_outputs_from_z(z_t[gidx[pos_i]], z_t[gidx[pos_j]])[key]
+                logits_neg = model.pair_outputs_from_z(z_t[gidx[neg_i]], z_t[gidx[neg_j]])[key]
+                prob_pos = torch.sigmoid(logits_pos).cpu().numpy()
+                prob_neg = torch.sigmoid(logits_neg).cpu().numpy()
+            pred_pos = (prob_pos >= 0.5).astype(np.float32)
+            pred_neg = (prob_neg >= 0.5).astype(np.float32)
+            bal_acc = 0.5 * (float((pred_pos == 1.0).mean()) + float((pred_neg == 0.0).mean()))
+            y_true = np.concatenate([np.ones_like(prob_pos, dtype=np.int32), np.zeros_like(prob_neg, dtype=np.int32)], axis=0)
+            y_score = np.concatenate([prob_pos, prob_neg], axis=0)
+            bal_accs.append(bal_acc)
+            aucs.append(_binary_auc_roc(y_true, y_score))
+            aps.append(_binary_average_precision(y_true, y_score))
+        return {
+            "bal_acc": _summary_stats(bal_accs),
+            "auroc": _summary_stats(aucs),
+            "auprc": _summary_stats(aps),
+        }
 
-    def _balanced_pair_acc(split: str, key: str, sampler):
-        pair_eval = max(64, min(512, len(train_idx if split == "train" else val_idx)))
-        pos_i, pos_j, neg_i, neg_j = sampler(pair_eval, split)
-        if len(pos_i) == 0 or len(neg_i) == 0:
-            return None
-        z_all_t = torch.tensor(z_sub, dtype=torch.float32, device=device)
+    def _bridge_node_eval(split: str):
+        ctx = split_ctx[split]
+        gidx = ctx["global_idx"]
+        prob = bridge_prob_sub[gidx]
+        true_cont = ctx["bridge_score"]
+        y_true = (true_cont > 0.0).astype(np.int32)
+        pred = (prob >= 0.5).astype(np.int32)
+        pos_mask = y_true == 1
+        neg_mask = y_true == 0
+        if pos_mask.any() and neg_mask.any():
+            bal_acc = 0.5 * (
+                float((pred[pos_mask] == 1).mean()) +
+                float((pred[neg_mask] == 0).mean())
+            )
+        else:
+            bal_acc = None
+        thresholds = np.linspace(0.05, 0.95, 19, dtype=np.float32)
+        sweep = []
+        for thr in thresholds:
+            p = (prob >= float(thr)).astype(np.int32)
+            if pos_mask.any() and neg_mask.any():
+                ba = 0.5 * (float((p[pos_mask] == 1).mean()) + float((p[neg_mask] == 0).mean()))
+            else:
+                ba = None
+            sweep.append({"thr": float(thr), "bal_acc": ba})
+        return {
+            "bal_acc@0.5": bal_acc,
+            "auroc": _binary_auc_roc(y_true, prob),
+            "auprc": _binary_average_precision(y_true, prob),
+            "threshold_sweep": sweep,
+            "n_pos": int(pos_mask.sum()),
+            "n_neg": int(neg_mask.sum()),
+        }
+
+    pair_eval = {
+        "same_region": {s: _pair_task_eval(s, "same_region_logit", _sample_same_region_pairs) for s in ("train", "val", "test")},
+        "neighbor": {s: _pair_task_eval(s, "neighbor_logit", _sample_neighbor_pairs) for s in ("train", "val", "test")},
+        "bridge_edge": {s: _pair_task_eval(s, "bridge_edge_logit", _sample_bridge_edge_pairs) for s in ("train", "val", "test")},
+        "cut": {s: _pair_task_eval(s, "cut_logit", _sample_cut_pairs) for s in ("train", "val", "test")},
+    }
+    bridge_eval = {s: _bridge_node_eval(s) for s in ("train", "val", "test")}
+
+    # Sanity: label permutation and latent ablation (val split, same-region task).
+    val_sr = _pair_task_eval("val", "same_region_logit", _sample_same_region_pairs)
+    perm_acc = None
+    z_perm = z_sub.copy()
+    rng.shuffle(z_perm, axis=0)
+    pos_i, pos_j, neg_i, neg_j = _sample_same_region_pairs(256, "val")
+    if len(pos_i) and len(neg_i):
+        gidx = split_ctx["val"]["global_idx"]
         with torch.no_grad():
-            logits_pos = model.pair_outputs_from_z(z_all_t[pos_i], z_all_t[pos_j])[key]
-            logits_neg = model.pair_outputs_from_z(z_all_t[neg_i], z_all_t[neg_j])[key]
-            pred_pos = (torch.sigmoid(logits_pos) >= 0.5).float().cpu().numpy()
-            pred_neg = (torch.sigmoid(logits_neg) >= 0.5).float().cpu().numpy()
-        acc = 0.5 * (
-            float((pred_pos == 1.0).mean()) +
-            float((pred_neg == 0.0).mean())
-        )
-        return float(acc)
-
-    bridge_true = (teacher["bridge_score"] > 0.0).astype(np.float32)
-    bridge_pred = (bridge_prob_sub >= 0.5).astype(np.float32)
-    bridge_acc = float((bridge_pred == bridge_true).mean())
-    try:
-        bridge_spearman = float(sp_stats.spearmanr(bridge_prob_sub, teacher["bridge_score"]).correlation)
-    except Exception:
-        bridge_spearman = None
-
-    same_region_acc_train = _balanced_pair_acc("train", "same_region_logit", _sample_same_region_pairs)
-    same_region_acc_val = _balanced_pair_acc("val", "same_region_logit", _sample_same_region_pairs)
-    neighbor_acc_train = _balanced_pair_acc("train", "neighbor_logit", _sample_neighbor_pairs)
-    neighbor_acc_val = _balanced_pair_acc("val", "neighbor_logit", _sample_neighbor_pairs)
-    bridge_edge_acc_train = _balanced_pair_acc("train", "bridge_edge_logit", _sample_bridge_edge_pairs)
-    bridge_edge_acc_val = _balanced_pair_acc("val", "bridge_edge_logit", _sample_bridge_edge_pairs)
-    cut_acc_train = _balanced_pair_acc("train", "cut_logit", _sample_cut_pairs)
-    cut_acc_val = _balanced_pair_acc("val", "cut_logit", _sample_cut_pairs)
+            z_t = torch.tensor(z_perm, dtype=torch.float32, device=device)
+            lp = model.pair_outputs_from_z(z_t[gidx[pos_i]], z_t[gidx[pos_j]])["same_region_logit"]
+            ln = model.pair_outputs_from_z(z_t[gidx[neg_i]], z_t[gidx[neg_j]])["same_region_logit"]
+            pp = (torch.sigmoid(lp) >= 0.5).float().cpu().numpy()
+            pn = (torch.sigmoid(ln) >= 0.5).float().cpu().numpy()
+        perm_acc = 0.5 * (float((pp == 1.0).mean()) + float((pn == 0.0).mean()))
 
     meta = {
         "subset_idx": keep_idx.astype(np.int64),
-        "teacher_room_ids": teacher["room_ids"].astype(np.int64),
-        "teacher_bridge_score": teacher["bridge_score"].astype(np.float32),
-        "teacher_spec": teacher["spec"].astype(np.float32),
         "z_subset": z_sub,
         "bridge_prob_subset": bridge_prob_sub,
         "bridge_prob_all": bridge_prob_all,
         "spec_pred_subset": spec_pred_sub,
-        "n_rooms": int(teacher["n_rooms"]),
-        "n_bridges": int(len(teacher["bridges"])),
-        "bridge_node_acc_subset": bridge_acc,
-        "bridge_node_spearman_subset": bridge_spearman,
-        "same_region_bal_acc_train": same_region_acc_train,
-        "same_region_bal_acc_val": same_region_acc_val,
-        "neighbor_bal_acc_train": neighbor_acc_train,
-        "neighbor_bal_acc_val": neighbor_acc_val,
-        "bridge_edge_bal_acc_train": bridge_edge_acc_train,
-        "bridge_edge_bal_acc_val": bridge_edge_acc_val,
-        "cut_bal_acc_train": cut_acc_train,
-        "cut_bal_acc_val": cut_acc_val,
+        "split_sizes": {k: int(len(v["global_idx"])) for k, v in split_ctx.items()},
+        "teacher_rooms_by_split": {k: int(v["teacher"]["n_rooms"]) for k, v in split_ctx.items()},
+        "teacher_bridges_by_split": {k: int(len(v["teacher"]["bridges"])) for k, v in split_ctx.items()},
+        "bridge_node_eval": bridge_eval,
+        "pair_eval": pair_eval,
+        "sanity_checks": {
+            "val_same_region_bal_acc": val_sr["bal_acc"]["mean"] if val_sr["bal_acc"]["n"] > 0 else None,
+            "val_same_region_bal_acc_permuted_latent": perm_acc,
+        },
         "best_val_loss": float(best_val),
     }
     return model, z_all, meta
@@ -1112,18 +1314,12 @@ def run_replay_topology_eval(topo_meta: dict):
     if topo_meta is None:
         return None
     return {
-        "n_rooms_teacher": int(topo_meta["n_rooms"]),
-        "n_bridges_teacher": int(topo_meta["n_bridges"]),
-        "bridge_node_acc_subset": float(topo_meta["bridge_node_acc_subset"]),
-        "bridge_node_spearman_subset": None if topo_meta["bridge_node_spearman_subset"] is None else float(topo_meta["bridge_node_spearman_subset"]),
-        "same_region_bal_acc_train": None if topo_meta["same_region_bal_acc_train"] is None else float(topo_meta["same_region_bal_acc_train"]),
-        "same_region_bal_acc_val": None if topo_meta["same_region_bal_acc_val"] is None else float(topo_meta["same_region_bal_acc_val"]),
-        "neighbor_bal_acc_train": None if topo_meta["neighbor_bal_acc_train"] is None else float(topo_meta["neighbor_bal_acc_train"]),
-        "neighbor_bal_acc_val": None if topo_meta["neighbor_bal_acc_val"] is None else float(topo_meta["neighbor_bal_acc_val"]),
-        "bridge_edge_bal_acc_train": None if topo_meta["bridge_edge_bal_acc_train"] is None else float(topo_meta["bridge_edge_bal_acc_train"]),
-        "bridge_edge_bal_acc_val": None if topo_meta["bridge_edge_bal_acc_val"] is None else float(topo_meta["bridge_edge_bal_acc_val"]),
-        "cut_bal_acc_train": None if topo_meta["cut_bal_acc_train"] is None else float(topo_meta["cut_bal_acc_train"]),
-        "cut_bal_acc_val": None if topo_meta["cut_bal_acc_val"] is None else float(topo_meta["cut_bal_acc_val"]),
+        "split_sizes": topo_meta["split_sizes"],
+        "teacher_rooms_by_split": topo_meta["teacher_rooms_by_split"],
+        "teacher_bridges_by_split": topo_meta["teacher_bridges_by_split"],
+        "bridge_node_eval": topo_meta["bridge_node_eval"],
+        "pair_eval": topo_meta["pair_eval"],
+        "sanity_checks": topo_meta["sanity_checks"],
         "best_val_loss": float(topo_meta["best_val_loss"]),
     }
 
