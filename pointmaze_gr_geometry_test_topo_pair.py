@@ -232,6 +232,7 @@ class PointMazeRunCfg:
     replay_topology_val_frac: float = 0.15
     replay_topology_test_frac: float = 0.15
     replay_topology_eval_repeats: int = 24
+    replay_topology_stage_a_frac: float = 0.30
 
 
 def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
@@ -457,6 +458,7 @@ def parse_args():
     p.add_argument("--replay_topology_val_frac", type=float, default=0.15, help="Episode fraction for replay-topology validation split")
     p.add_argument("--replay_topology_test_frac", type=float, default=0.15, help="Episode fraction for replay-topology test split")
     p.add_argument("--replay_topology_eval_repeats", type=int, default=24, help="Number of repeated pair-eval batches per split")
+    p.add_argument("--replay_topology_stage_a_frac", type=float, default=0.30, help="Fraction of replay-topology epochs to run Stage A curriculum")
     return p.parse_args()
 
 
@@ -473,6 +475,7 @@ def main():
         replay_topology_val_frac=float(args.replay_topology_val_frac),
         replay_topology_test_frac=float(args.replay_topology_test_frac),
         replay_topology_eval_repeats=int(args.replay_topology_eval_repeats),
+        replay_topology_stage_a_frac=float(args.replay_topology_stage_a_frac),
     )
     run_single_pointmaze(cfg_pm)
 
@@ -945,7 +948,7 @@ def train_replay_topology_head(
             "spec_t": torch.tensor(spec, dtype=torch.float32, device=device),
         }
 
-    def _sample_same_region_pairs(batch_size: int, split: str):
+    def _sample_same_region_pairs(batch_size: int, split: str, hard_neg: bool = True):
         ctx = split_ctx[split]
         allowed = np.arange(len(ctx["global_idx"]), dtype=np.int64)
         groups = ctx["groups_nt"]
@@ -970,6 +973,8 @@ def train_replay_topology_head(
         def _valid_neg(a, b):
             if room_ids[int(a)] == room_ids[int(b)]:
                 return False
+            if not bool(hard_neg):
+                return True
             d = float(sp_dist[int(a), int(b)])
             return np.isfinite(d) and d <= 4.0
 
@@ -981,7 +986,7 @@ def train_replay_topology_head(
         )
         return pos_i, pos_j, neg_i, neg_j
 
-    def _sample_neighbor_pairs(batch_size: int, split: str):
+    def _sample_neighbor_pairs(batch_size: int, split: str, hard_neg: bool = True):
         ctx = split_ctx[split]
         allowed = np.arange(len(ctx["global_idx"]), dtype=np.int64)
         edge_split = ctx["bridge_edges"] if len(ctx["bridge_edges"]) else np.asarray(ctx["teacher"]["edges"], dtype=np.int64)
@@ -1000,6 +1005,8 @@ def train_replay_topology_head(
         def _valid_neg(a, b):
             if int(b) in adj_sets[int(a)]:
                 return False
+            if not bool(hard_neg):
+                return True
             d = float(sp_dist[int(a), int(b)])
             return np.isfinite(d) and abs(d - 2.0) < 1e-6
 
@@ -1067,9 +1074,14 @@ def train_replay_topology_head(
         out = model.pair_outputs_from_z(z_all[gidx[ii]], z_all[gidx[jj]])
         return out[key]
 
-    def _compute_pair_task_losses(z_all: torch.Tensor, split: str, pair_batch: int):
-        pos_i_sr, pos_j_sr, neg_i_sr, neg_j_sr = _sample_same_region_pairs(pair_batch, split)
-        pos_i_nb, pos_j_nb, neg_i_nb, neg_j_nb = _sample_neighbor_pairs(pair_batch, split)
+    def _compute_pair_task_losses(
+        z_all: torch.Tensor,
+        split: str,
+        pair_batch: int,
+        hard_neg: bool = True,
+    ):
+        pos_i_sr, pos_j_sr, neg_i_sr, neg_j_sr = _sample_same_region_pairs(pair_batch, split, hard_neg=hard_neg)
+        pos_i_nb, pos_j_nb, neg_i_nb, neg_j_nb = _sample_neighbor_pairs(pair_batch, split, hard_neg=hard_neg)
         pos_i_be, pos_j_be, neg_i_be, neg_j_be = _sample_bridge_edge_pairs(pair_batch, split)
         pos_i_ct, pos_j_ct, neg_i_ct, neg_j_ct = _sample_cut_pairs(pair_batch, split)
 
@@ -1119,8 +1131,11 @@ def train_replay_topology_head(
     val_n = len(split_ctx["val"]["global_idx"])
     batch_nodes = int(min(cfg_pm.replay_topology_batch_nodes, train_n))
     pair_batch = int(min(max(128, batch_nodes // 2), max(32, train_n)))
+    stage_a_epochs = int(round(float(cfg_pm.replay_topology_stage_a_frac) * int(cfg_pm.replay_topology_epochs)))
+    stage_a_epochs = max(0, min(int(cfg_pm.replay_topology_epochs), stage_a_epochs))
 
     for epoch in range(int(cfg_pm.replay_topology_epochs)):
+        in_stage_a = epoch < stage_a_epochs
         model.train()
         train_g = split_ctx["train"]["global_idx"]
         node_batch_local = rng.choice(train_n, size=batch_nodes, replace=False) if batch_nodes < train_n else np.arange(train_n, dtype=np.int64)
@@ -1134,16 +1149,38 @@ def train_replay_topology_head(
         loss_spec = F.mse_loss(out["spec_pred"], train_spec_t)
 
         z_all = model.encode(h_t, s_t)
-        pair_losses = _compute_pair_task_losses(z_all, split="train", pair_batch=pair_batch)
+        pair_losses = _compute_pair_task_losses(
+            z_all,
+            split="train",
+            pair_batch=pair_batch,
+            hard_neg=(not in_stage_a),
+        )
+
+        if in_stage_a:
+            w_same = float(cfg_pm.replay_topology_same_region_weight)
+            w_bridge_node = float(cfg_pm.replay_topology_bridge_node_weight)
+            w_neighbor = float(cfg_pm.replay_topology_neighbor_weight)
+            w_bridge_edge = 0.0
+            w_cut = 0.0
+            w_spec = float(cfg_pm.replay_topology_spec_weight)
+            w_margin = 0.0
+        else:
+            w_same = float(cfg_pm.replay_topology_same_region_weight)
+            w_bridge_node = float(cfg_pm.replay_topology_bridge_node_weight)
+            w_neighbor = float(cfg_pm.replay_topology_neighbor_weight)
+            w_bridge_edge = float(cfg_pm.replay_topology_bridge_edge_weight)
+            w_cut = float(cfg_pm.replay_topology_cut_weight)
+            w_spec = float(cfg_pm.replay_topology_spec_weight)
+            w_margin = float(cfg_pm.replay_topology_margin_weight)
 
         loss = (
-            float(cfg_pm.replay_topology_same_region_weight) * pair_losses["same_region"]
-            + float(cfg_pm.replay_topology_bridge_node_weight) * loss_bridge_node
-            + float(cfg_pm.replay_topology_neighbor_weight) * pair_losses["neighbor"]
-            + float(cfg_pm.replay_topology_bridge_edge_weight) * pair_losses["bridge_edge"]
-            + float(cfg_pm.replay_topology_cut_weight) * pair_losses["cut"]
-            + float(cfg_pm.replay_topology_spec_weight) * loss_spec
-            + float(cfg_pm.replay_topology_margin_weight) * pair_losses["margin"]
+            w_same * pair_losses["same_region"]
+            + w_bridge_node * loss_bridge_node
+            + w_neighbor * pair_losses["neighbor"]
+            + w_bridge_edge * pair_losses["bridge_edge"]
+            + w_cut * pair_losses["cut"]
+            + w_spec * loss_spec
+            + w_margin * pair_losses["margin"]
         )
 
         opt.zero_grad(set_to_none=True)
@@ -1159,15 +1196,20 @@ def train_replay_topology_head(
             val_spec = F.mse_loss(val_out["spec_pred"], split_ctx["val"]["spec_t"])
 
             z_all_val = model.encode(h_t, s_t)
-            val_pair_losses = _compute_pair_task_losses(z_all_val, split="val", pair_batch=min(pair_batch, max(16, val_n)))
+            val_pair_losses = _compute_pair_task_losses(
+                z_all_val,
+                split="val",
+                pair_batch=min(pair_batch, max(16, val_n)),
+                hard_neg=(not in_stage_a),
+            )
             val_loss = (
-                float(cfg_pm.replay_topology_same_region_weight) * val_pair_losses["same_region"]
-                + float(cfg_pm.replay_topology_bridge_node_weight) * val_bridge_node
-                + float(cfg_pm.replay_topology_neighbor_weight) * val_pair_losses["neighbor"]
-                + float(cfg_pm.replay_topology_bridge_edge_weight) * val_pair_losses["bridge_edge"]
-                + float(cfg_pm.replay_topology_cut_weight) * val_pair_losses["cut"]
-                + float(cfg_pm.replay_topology_spec_weight) * val_spec
-                + float(cfg_pm.replay_topology_margin_weight) * val_pair_losses["margin"]
+                w_same * val_pair_losses["same_region"]
+                + w_bridge_node * val_bridge_node
+                + w_neighbor * val_pair_losses["neighbor"]
+                + w_bridge_edge * val_pair_losses["bridge_edge"]
+                + w_cut * val_pair_losses["cut"]
+                + w_spec * val_spec
+                + w_margin * val_pair_losses["margin"]
             )
             if float(val_loss.item()) < best_val:
                 best_val = float(val_loss.item())
@@ -1182,7 +1224,7 @@ def train_replay_topology_head(
                 f"bridge_edge={pair_losses['bridge_edge'].item():.4f}  "
                 f"cut={pair_losses['cut'].item():.4f}  "
                 f"spec={loss_spec.item():.4f}  margin={pair_losses['margin'].item():.4f}  "
-                f"val={float(val_loss.item()):.4f}"
+                f"val={float(val_loss.item()):.4f}  stage={'A' if in_stage_a else 'B'}"
             )
 
     if best_state is not None:
@@ -1305,6 +1347,11 @@ def train_replay_topology_head(
             "val_same_region_bal_acc": val_sr["bal_acc"]["mean"] if val_sr["bal_acc"]["n"] > 0 else None,
             "val_same_region_bal_acc_permuted_latent": perm_acc,
         },
+        "curriculum": {
+            "stage_a_epochs": int(stage_a_epochs),
+            "total_epochs": int(cfg_pm.replay_topology_epochs),
+            "stage_a_frac": float(cfg_pm.replay_topology_stage_a_frac),
+        },
         "best_val_loss": float(best_val),
     }
     return model, z_all, meta
@@ -1320,6 +1367,7 @@ def run_replay_topology_eval(topo_meta: dict):
         "bridge_node_eval": topo_meta["bridge_node_eval"],
         "pair_eval": topo_meta["pair_eval"],
         "sanity_checks": topo_meta["sanity_checks"],
+        "curriculum": topo_meta.get("curriculum", None),
         "best_val_loss": float(topo_meta["best_val_loss"]),
     }
 
