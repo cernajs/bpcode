@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -11,108 +11,162 @@ from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 from models import RSSM, Actor, ContinueModel, ConvDecoder, ConvEncoder, RewardModel, ValueModel
-from geom_head import GeoEncoder
 from utils import ReplayBuffer, bottle, get_device, preprocess_img, set_seed
 from pointmaze_gr_geometry_test import PointMazeMediumDiverseGRWrapper
-from scipy.sparse import lil_matrix
-from scipy.sparse.csgraph import shortest_path
 
 
 # =============================================================================
-#  Geometry-aware Dreamer for PointMaze
+#  PointMaze Dreamer + temporal-distance ensemble intrinsic reward
 # =============================================================================
 #
-# This variant implements the "geometry-mismatch frontier" idea:
-#   - Latents know local state (good decoding), but Euclidean distance does not
-#     match maze geodesics.
-#   - Replay graph shortest paths are a good, oracle-free geometry teacher.
-#   - Imagination drifts away from replay geometry, so geometric exploration
-#     should be driven by replay geometry but gated by on-manifold proximity.
+# Train an ensemble of temporal-distance heads on oracle-free replay step
+# distances (same-episode forward chain). During imagination,
+#   r_int ∝ Var_k T_k(h_t, s_t, h_ref, s_ref)
+# over random replay references (metric mismatch / bottlenecks → higher disagreement).
 #
-# Concretely, we:
-#   1) Train a geometry head g_replay(h,s) on replay so ||g(v)-g(u)|| matches
-#      replay-graph shortest-path distance between timesteps v,u.
-#   2) Maintain per-node distortion scores δ(v): mismatch between latent metric
-#      and replay-graph distances to a small landmark set.
-#   3) Define a potential φ(v) that combines distortion, novelty (1/sqrt(N+1)),
-#      and optionally a simple bottleneck proxy.
-#   4) During imagination, map imagined states z_t to nearest replay nodes v_t
-#      in g-space and define intrinsic reward
-#          r_geo_t = φ(v_{t+1}) - φ(v_t) - λ_off * m(z_{t+1}),
-#      where m penalizes off-replay-manifold distance in g-space.
-#
-# This file is intentionally self-contained and PointMaze-specific.
-#
+# With --baseline, the world model + actor run without this module.
+# =============================================================================
 
 
-def _pairwise_l2(a: np.ndarray) -> np.ndarray:
-    a = np.asarray(a, dtype=np.float32)
-    aa = (a * a).sum(axis=1, keepdims=True)
-    d2 = np.maximum(aa + aa.T - 2.0 * (a @ a.T), 0.0)
-    return np.sqrt(d2, dtype=np.float32)
+def _oracle_free_replay_step_distances(
+    episode_ids: np.ndarray,
+    n_pairs_target: int = 4000,
+    max_sources: int = 64,
+    rng: Optional[np.random.Generator] = None,
+):
+    """Same-episode forward chain i→i+1; shortest path along chain gives step counts."""
+    rng = rng or np.random.default_rng(0)
+    ep = np.asarray(episode_ids, dtype=np.int64)
+    Np = len(ep)
+    if Np < 4:
+        return None
+
+    nxt = np.full(Np, -1, dtype=np.int64)
+    same = ep[:-1] == ep[1:]
+    nxt[:-1][same] = np.arange(1, Np, dtype=np.int64)[same]
+
+    sources = rng.choice(Np, size=min(max_sources, Np), replace=False)
+    ii_list, jj_list, dd_list = [], [], []
+
+    for src in sources:
+        dist = {}
+        cur = int(src)
+        d = 0
+        while cur != -1 and cur not in dist:
+            dist[cur] = d
+            cur = int(nxt[cur])
+            d += 1
+            if d > 10_000:
+                break
+
+        if len(dist) < 2:
+            continue
+
+        nodes = np.array(list(dist.keys()), dtype=np.int64)
+        nodes = nodes[nodes != src]
+        if len(nodes) <= 0:
+            continue
+        m = min(
+            len(nodes),
+            max(4, n_pairs_target // max(1, len(sources))),
+        )
+        tgt = rng.choice(nodes, size=m, replace=False)
+
+        ii_list.append(np.full(m, src, dtype=np.int64))
+        jj_list.append(tgt)
+        dd_list.append(np.array([dist[int(t)] for t in tgt], dtype=np.float32))
+
+        if sum(len(x) for x in dd_list) >= n_pairs_target:
+            break
+
+    if not dd_list:
+        return None
+
+    ii = np.concatenate(ii_list, axis=0)
+    jj = np.concatenate(jj_list, axis=0)
+    dd = np.concatenate(dd_list, axis=0)
+    keep = dd > 0
+    if int(np.sum(keep)) < 1:
+        return None
+    return ii[keep], jj[keep], dd[keep]
 
 
-class ReplayGeometryModule:
-    """Maintain replay graph geometry + distortion / frontier scores."""
+class TemporalDistHead(nn.Module):
+    """Predicts replay step distance from concat(h_i, s_i, h_j, s_j) (matches pointmaze_gr_geometry_test_topo)."""
+
+    def __init__(self, deter_dim: int, stoch_dim: int, hidden_dim: int):
+        super().__init__()
+        in_dim = 2 * (int(deter_dim) + int(stoch_dim))
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, h_i: torch.Tensor, s_i: torch.Tensor, h_j: torch.Tensor, s_j: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([h_i, s_i, h_j, s_j], dim=-1)
+        return self.net(x).squeeze(-1)
+
+
+class TemporalDistEnsemble(nn.Module):
+    """K independent distance heads; intrinsic signal = Var(pred_1,...,pred_K)."""
+
+    def __init__(self, deter_dim: int, stoch_dim: int, hidden_dim: int, n_heads: int):
+        super().__init__()
+        self.n_heads = int(max(1, n_heads))
+        self.heads = nn.ModuleList(
+            [TemporalDistHead(deter_dim, stoch_dim, hidden_dim) for _ in range(self.n_heads)]
+        )
+
+    def forward_all(self, h_i: torch.Tensor, s_i: torch.Tensor, h_j: torch.Tensor, s_j: torch.Tensor) -> torch.Tensor:
+        """Returns [K, B] predictions."""
+        return torch.stack([head(h_i, s_i, h_j, s_j) for head in self.heads], dim=0)
+
+
+class TemporalIntrinsicModule:
+    """FIFO (h,s) replay buffer + temporal-distance ensemble; intrinsic reward = Var_k predictions."""
 
     def __init__(
         self,
         deter_dim: int,
         stoch_dim: int,
-        geo_dim: int = 32,
-        geo_hidden: int = 256,
         device: torch.device | None = None,
-        lambda_dist: float = 1.0,
-        lambda_front: float = 0.5,
-        lambda_off: float = 1.0,
-        n_landmarks: int = 16,
         max_nodes: int = 2500,
+        temporal_hidden: int = 256,
+        n_temporal_heads: int = 5,
+        n_temporal_ref: int = 8,
     ):
         self.device = device or torch.device("cpu")
-        self.geo_head = GeoEncoder(deter_dim, stoch_dim, geo_dim=geo_dim, hidden_dim=geo_hidden).to(
-            self.device
-        )
-        self.opt = torch.optim.Adam(self.geo_head.parameters(), lr=3e-4)
-
-        self.lambda_dist = float(lambda_dist)
-        self.lambda_front = float(lambda_front)
-        self.lambda_off = float(lambda_off)
-        self.n_landmarks = int(n_landmarks)
         self.max_nodes = int(max_nodes)
+
+        self.temporal_hidden = int(temporal_hidden)
+        self.n_temporal_heads = int(max(1, n_temporal_heads))
+        self.temporal_ensemble = TemporalDistEnsemble(
+            deter_dim, stoch_dim, self.temporal_hidden, self.n_temporal_heads
+        ).to(self.device)
+        self.temporal_opt = torch.optim.Adam(self.temporal_ensemble.parameters(), lr=3e-4)
+        self.n_temporal_ref = int(max(1, n_temporal_ref))
+        self._temporal_trained_once = False
+        self.tb_last_temporal_loss: float | None = None
+        self.tb_last_temporal_train_steps: int = 0
 
         self._h_nodes: List[np.ndarray] = []
         self._s_nodes: List[np.ndarray] = []
-        self._e_nodes: List[np.ndarray] = []
         self._episode_ids: List[int] = []
-        self._step_indices: List[float] = []
-        self._current_step: int = 0
 
-        self._g_nodes: np.ndarray | None = None
-        self._dist_replay: np.ndarray | None = None
-        self._phi: np.ndarray | None = None
-        self._visit_counts: np.ndarray | None = None
-
-        # TensorBoard diagnostics (updated each train phase when geometry is on)
-        self.tb_last_graph_n_nodes: int = 0
-        self.tb_last_dist_finite_frac: float | None = None
-        self.tb_last_geo_train_loss: float | None = None
-        self.tb_last_geo_train_steps: int = 0
-        self.tb_last_delta_mean: float | None = None
-        self.tb_last_phi_mean: float | None = None
-        self.tb_last_phi_std: float | None = None
-
-    def geo_intrinsic_ready(self) -> bool:
-        return self._g_nodes is not None and self._phi is not None
+    def temporal_intrinsic_ready(self) -> bool:
+        return self._temporal_trained_once and len(self._h_nodes) >= 8
 
     def add_batch_trajectories(
         self,
         traj_h: List[np.ndarray],
         traj_s: List[np.ndarray],
-        traj_e: List[np.ndarray],
         traj_ep_ids: List[int],
     ):
         """Append trajectory steps; FIFO-evict oldest rows when over max_nodes."""
-        for ep_h, ep_s, ep_e, ep_id in zip(traj_h, traj_s, traj_e, traj_ep_ids):
+        for ep_h, ep_s, ep_id in zip(traj_h, traj_s, traj_ep_ids):
             T = len(ep_h)
             if T < 2:
                 continue
@@ -120,258 +174,145 @@ class ReplayGeometryModule:
                 if len(self._h_nodes) >= self.max_nodes:
                     self._h_nodes.pop(0)
                     self._s_nodes.pop(0)
-                    self._e_nodes.pop(0)
                     self._episode_ids.pop(0)
-                    self._step_indices.pop(0)
                 self._h_nodes.append(ep_h[t])
                 self._s_nodes.append(ep_s[t])
-                self._e_nodes.append(ep_e[t])
                 self._episode_ids.append(ep_id)
-                self._step_indices.append(float(self._current_step))
-                self._current_step += 1
 
-    def rebuild_graph_and_distances(self, knn_k: int = 4, cross_quantile: float = 0.05):
-        """Cycle-consistent mutual-kNN + weighted temporal edges; cache all-pairs shortest paths."""
-        n = len(self._h_nodes)
-        if n < 4:
-            self._dist_replay = None
-            self.tb_last_graph_n_nodes = n
-            self.tb_last_dist_finite_frac = None
+    def train_temporal_ensemble(
+        self,
+        n_steps: int = 40,
+        batch_pairs: int = 512,
+        pair_pool: int = 6000,
+        seed: int = 0,
+    ):
+        """Supervised training: each head predicts oracle-free replay step distance."""
+        self.tb_last_temporal_loss = None
+        self.tb_last_temporal_train_steps = 0
+        ep = np.asarray(self._episode_ids, dtype=np.int64)
+        if len(ep) < 8:
             return
 
-        local_feat = np.asarray(self._e_nodes, dtype=np.float32)
-        ep_ids = np.asarray(self._episode_ids, dtype=np.int64)
-        orig_idx = np.asarray(self._step_indices, dtype=np.float64)
-
-        adj = lil_matrix((n, n), dtype=np.float32)
-
-        for i in range(n - 1):
-            if ep_ids[i] == ep_ids[i + 1]:
-                dt = float(orig_idx[i + 1] - orig_idx[i])
-                adj[i, i + 1] = dt
-                adj[i + 1, i] = dt
-
-        if n > 2:
-            d = _pairwise_l2(local_feat)
-            np.fill_diagonal(d, np.inf)
-
-            finite_vals = d[np.isfinite(d)]
-            gate = (
-                float(np.quantile(finite_vals, float(cross_quantile)))
-                if len(finite_vals)
-                else float("inf")
-            )
-            k_use = int(min(max(1, int(knn_k)), n - 1))
-            nn_idx = np.argsort(d, axis=1)[:, :k_use]
-            nn_sets = [set(map(int, row)) for row in nn_idx]
-
-            for i in range(n):
-                for j in nn_idx[i]:
-                    j = int(j)
-                    if float(d[i, j]) > gate:
-                        continue
-                    if i not in nn_sets[j]:
-                        continue
-                    if (
-                        i < n - 1
-                        and j < n - 1
-                        and ep_ids[i] == ep_ids[i + 1]
-                        and ep_ids[j] == ep_ids[j + 1]
-                    ):
-                        d_next = float(d[i + 1, j + 1])
-                        d_prev = (
-                            float(d[i + 1, j - 1])
-                            if j > 0 and ep_ids[j] == ep_ids[j - 1]
-                            else float("inf")
-                        )
-                        if d_next <= gate or d_prev <= gate:
-                            adj[i, j] = 1.0
-                            adj[j, i] = 1.0
-
-        self._dist_replay = shortest_path(csgraph=adj, directed=False, unweighted=False)
-        self.tb_last_graph_n_nodes = n
-        self.tb_last_dist_finite_frac = float(np.isfinite(self._dist_replay).mean())
-
-    def train_geo_head(self, n_steps: int = 200, batch_pairs: int = 2048):
-        """Train g(h,s) against cached Dijkstra distances from rebuild_graph_and_distances."""
-        self.tb_last_geo_train_loss = None
-        self.tb_last_geo_train_steps = 0
-        if self._dist_replay is None:
+        rng = np.random.default_rng(int(seed))
+        pool = _oracle_free_replay_step_distances(
+            ep,
+            n_pairs_target=int(pair_pool),
+            max_sources=96,
+            rng=rng,
+        )
+        if pool is None:
             return
+        ii, jj, dd = pool
+        n_pairs = len(ii)
+        if n_pairs < 16:
+            return
+
+        perm = rng.permutation(n_pairs)
+        n_val = max(1, int(round(0.12 * n_pairs)))
+        train_mask = np.ones(n_pairs, dtype=bool)
+        train_mask[perm[:n_val]] = False
+        tr_i, tr_j, tr_d = ii[train_mask], jj[train_mask], dd[train_mask]
+        va_i, va_j, va_d = ii[~train_mask], jj[~train_mask], dd[~train_mask]
+
         h_np = np.asarray(self._h_nodes, dtype=np.float32)
         s_np = np.asarray(self._s_nodes, dtype=np.float32)
-        N = h_np.shape[0]
-        if N < 4:
-            return
-
         h_t = torch.tensor(h_np, dtype=torch.float32, device=self.device)
         s_t = torch.tensor(s_np, dtype=torch.float32, device=self.device)
-        dist_mat = self._dist_replay
 
-        loss_accum: List[float] = []
-        for _ in range(n_steps):
-            ii = np.random.randint(0, N, size=batch_pairs)
-            jj = np.random.randint(0, N, size=batch_pairs)
-            same = ii == jj
-            jj[same] = (jj[same] + 1) % max(N, 1)
-            d_np = dist_mat[ii, jj]
-            valid = np.isfinite(d_np) & (d_np > 0)
-            if valid.sum() < 32:
-                continue
-            ii = ii[valid]
-            jj = jj[valid]
-            d_np = d_np[valid].astype(np.float32)
+        n_tr = len(tr_i)
+        batch_pairs = min(int(batch_pairs), max(1, n_tr))
+        losses: List[float] = []
+        best_val = float("inf")
+        best_state = None
 
-            gi = self.geo_head(h_t[ii], s_t[ii])
-            gj = self.geo_head(h_t[jj], s_t[jj])
-            d_lat = torch.norm(gi - gj, dim=-1)
+        self.temporal_ensemble.train()
+        for step in range(n_steps):
+            idx = rng.integers(0, n_tr, size=batch_pairs)
+            hi = h_t[tr_i[idx]]
+            si = s_t[tr_i[idx]]
+            hj = h_t[tr_j[idx]]
+            sj = s_t[tr_j[idx]]
+            target = torch.tensor(tr_d[idx], dtype=torch.float32, device=self.device)
 
-            d_teacher = torch.tensor(d_np, device=self.device)
-            w = 1.0 / torch.sqrt(d_teacher + 1.0)
-            scale = (d_teacher.detach().mean().clamp_min(1e-3)).item()
-            loss = (w * (d_lat - (d_teacher / scale)) ** 2).mean()
+            preds = self.temporal_ensemble.forward_all(hi, si, hj, sj)
+            loss = F.mse_loss(preds, target.unsqueeze(0).expand_as(preds))
 
-            self.opt.zero_grad(set_to_none=True)
+            self.temporal_opt.zero_grad(set_to_none=True)
             loss.backward()
-            self.opt.step()
-            loss_accum.append(float(loss.detach().item()))
+            self.temporal_opt.step()
+            losses.append(float(loss.item()))
 
-        self.tb_last_geo_train_steps = len(loss_accum)
-        self.tb_last_geo_train_loss = (
-            float(np.mean(loss_accum)) if loss_accum else None
-        )
+            with torch.no_grad():
+                pv = self.temporal_ensemble.forward_all(
+                    h_t[va_i], s_t[va_i], h_t[va_j], s_t[va_j]
+                )
+                tv = torch.tensor(va_d, dtype=torch.float32, device=self.device)
+                val_loss = F.mse_loss(pv, tv.unsqueeze(0).expand_as(pv))
+                if float(val_loss.item()) < best_val:
+                    best_val = float(val_loss.item())
+                    best_state = {k: v.detach().cpu() for k, v in self.temporal_ensemble.state_dict().items()}
 
-        with torch.no_grad():
-            self._g_nodes = self.geo_head(h_t, s_t).detach().cpu().numpy().astype(np.float32)
+        if best_state is not None:
+            self.temporal_ensemble.load_state_dict(best_state)
+        self.temporal_ensemble.eval()
+        self._temporal_trained_once = True
+        self.tb_last_temporal_train_steps = n_steps
+        self.tb_last_temporal_loss = float(np.mean(losses)) if losses else None
 
-    # ------------------------------------------------------------------ #
-    #  Distortion / frontier potential
-    # ------------------------------------------------------------------ #
-
-    def build_potential(self):
-        """Compute per-node potential φ(v) from distortion + frontier."""
-        self.tb_last_delta_mean = None
-        self.tb_last_phi_mean = None
-        self.tb_last_phi_std = None
-        if self._g_nodes is None or self._dist_replay is None:
-            return
-        g = self._g_nodes
-        N = g.shape[0]
-        if N < 4:
-            return
-
-        # Landmarks: spread across graph via simple farthest-point heuristic
-        rng = np.random.default_rng(0)
-        landmarks = [rng.integers(0, N)]
-        while len(landmarks) < min(self.n_landmarks, N):
-            # pick node with largest min-distance to existing landmarks in graph metric
-            d_min = np.min(self._dist_replay[:, landmarks], axis=1)
-            cand = int(np.argmax(d_min))
-            if cand in landmarks:
-                break
-            landmarks.append(cand)
-        landmarks = np.asarray(landmarks, dtype=np.int64)
-
-        # Distortion δ(v): average absolute error between ||g(v)-g(ℓ)|| and scaled d_replay(v,ℓ)
-        d_geo = np.asarray(self._dist_replay[:, landmarks], dtype=np.float64)  # [N, L]
-        with torch.no_grad():
-            gv = torch.tensor(g, device=self.device)
-            gl = torch.tensor(g[landmarks], device=self.device)
-            d_lat = torch.cdist(gv, gl).cpu().numpy()
-
-        # Finite scale only (graph distances can be inf / disconnected; mean can be inf → inf/inf in divide)
-        finite_mask = np.isfinite(d_geo) & (d_geo > 0)
-        if finite_mask.any():
-            scale = max(float(np.mean(d_geo[finite_mask])), 1e-3)
-        else:
-            scale = 1.0
-        d_geo_scaled = np.full_like(d_geo, np.nan, dtype=np.float64)
-        np.divide(d_geo, scale, out=d_geo_scaled, where=finite_mask)
-        delta = np.nanmean(np.abs(d_lat - d_geo_scaled), axis=1)
-        delta = np.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Frontier term: unvisited nodes should have higher weight
-        #if self._visit_counts is None or len(self._visit_counts) != N:
-        self._visit_counts = np.zeros(N, dtype=np.int64)
-        front = 1.0 / np.sqrt(self._visit_counts.astype(np.float32) + 1.0)
-
-        phi = self.lambda_dist * delta + self.lambda_front * front
-        self._phi = phi.astype(np.float32)
-        self.tb_last_delta_mean = float(np.mean(delta))
-        self.tb_last_phi_mean = float(np.mean(self._phi))
-        self.tb_last_phi_std = float(np.std(self._phi))
-
-    # ------------------------------------------------------------------ #
-    #  Intrinsic reward for imagination
-    # ------------------------------------------------------------------ #
-
-    def intrinsic_reward_for_imagination(
+    def temporal_intrinsic_reward(
         self,
         h_imag: torch.Tensor,
         s_imag: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute r_geo over imagined rollout.
+        """r_int[b,t] = mean_r Var_k T_k(h_t,s_t,h_ref,s_ref): ensemble disagreement (no true d at imagine time)."""
+        if not self.temporal_intrinsic_ready():
+            return torch.zeros(
+                (h_imag.size(0), h_imag.size(1) - 1),
+                device=h_imag.device,
+                dtype=torch.float32,
+            )
 
-        h_imag, s_imag: [B_imag, H+1, D]
-        Returns: r_geo [B_imag, H] to be added to imagined rewards.
-        """
-        if self._g_nodes is None or self._phi is None:
-            return torch.zeros((h_imag.size(0), h_imag.size(1) - 1), device=h_imag.device)
-
-        B, H1, _ = h_imag.shape
+        B, H1, Dh = h_imag.shape
+        Ds = s_imag.size(-1)
         H = H1 - 1
+        device = h_imag.device
+
+        h_buf = torch.tensor(
+            np.asarray(self._h_nodes, dtype=np.float32), device=device, dtype=torch.float32
+        )
+        s_buf = torch.tensor(
+            np.asarray(self._s_nodes, dtype=np.float32), device=device, dtype=torch.float32
+        )
+        N = h_buf.size(0)
+        R = self.n_temporal_ref
+
+        hb = h_imag[:, :-1].reshape(-1, Dh)
+        sb = s_imag[:, :-1].reshape(-1, Ds)
+        BH = hb.size(0)
 
         with torch.no_grad():
-            g_im = self.geo_head(
-                h_imag.reshape(-1, h_imag.size(-1)),
-                s_imag.reshape(-1, s_imag.size(-1)),
-            )  # [B*H1, G]
-            g_im_np = g_im.cpu().numpy().astype(np.float32)
-
-        g_nodes = self._g_nodes  # [N, G]
-        phi = self._phi  # [N]
-
-        # kNN in g-space: nearest replay node for each imagined state
-        # (we flatten [B,H1] then reshape back)
-        N = g_nodes.shape[0]
-        # For moderate N, dense cdist is fine
-        dm = np.linalg.norm(g_im_np[:, None, :] - g_nodes[None, :, :], axis=-1)  # [B*H1, N]
-        nn_idx = np.argmin(dm, axis=1).astype(np.int64)  # [B*H1]
-        nn_dist = dm[np.arange(dm.shape[0]), nn_idx]  # off-manifold distance
-
-        v_idx = nn_idx.reshape(B, H1)  # nearest replay node index per (b,t)
-        d_off = nn_dist.reshape(B, H1)
-
-        # Update visit counts lightly (only for on-policy states at t=0)
-        if self._visit_counts is not None:
-            for b in range(B):
-                self._visit_counts[v_idx[b, 0]] += 1
-
-        # r_geo_t = φ(v_{t+1}) - φ(v_t) - λ_off * m(z_{t+1})
-        v_t = v_idx[:, :-1]
-        v_tp1 = v_idx[:, 1:]
-        phi_t = phi[v_t]
-        phi_tp1 = phi[v_tp1]
-        m_off = d_off[:, 1:]
-
-        margin = 0.5
-        m_off_penalty = np.maximum(m_off - margin, 0.0)
-        gamma = 0.99 
-        geo_scale = 0.02
-
-        r_geo_raw = (gamma * phi_tp1 - phi_t) - self.lambda_off * m_off_penalty
-        r_geo = r_geo_raw * geo_scale
-        
-        return torch.tensor(r_geo, dtype=torch.float32, device=h_imag.device)
+            self.temporal_ensemble.eval()
+            idx = torch.randint(0, N, (BH, R), device=device)
+            hi = hb.unsqueeze(1).expand(-1, R, -1).reshape(BH * R, Dh)
+            si = sb.unsqueeze(1).expand(-1, R, -1).reshape(BH * R, Ds)
+            hj = h_buf[idx].reshape(BH * R, Dh)
+            sj = s_buf[idx].reshape(BH * R, Ds)
+            preds = self.temporal_ensemble.forward_all(hi, si, hj, sj)
+            preds = preds.view(self.n_temporal_heads, BH, R)
+            var_r = preds.var(dim=0, unbiased=False)
+            r_flat = var_r.mean(dim=1)
+        return r_flat.view(B, H)
 
 
 # =============================================================================
-#  PointMaze Dreamer with Geometry-Mismatch Intrinsic Reward
+#  CLI, logging, training loop
 # =============================================================================
 
 
 def build_parser():
-    p = argparse.ArgumentParser(description="Dreamer for PointMaze with geometry-mismatch exploration")
+    p = argparse.ArgumentParser(
+        description="Dreamer for PointMaze with temporal-distance ensemble intrinsic reward"
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--img_size", type=int, default=64)
     p.add_argument("--bit_depth", type=int, default=5)
@@ -415,18 +356,33 @@ def build_parser():
     p.add_argument("--expl_decay", type=float, default=0.0)
     p.add_argument("--expl_min", type=float, default=0.0)
 
-    # Geometry intrinsic reward weights
-    p.add_argument("--geo_lambda_dist", type=float, default=1.0)
-    p.add_argument("--geo_lambda_front", type=float, default=0.5)
-    p.add_argument("--geo_lambda_off", type=float, default=1.0)
-    p.add_argument("--geo_max_nodes", type=int, default=2500)
-    p.add_argument("--geo_knn_k", type=int, default=4)
-    p.add_argument("--geo_cross_quantile", type=float, default=0.05)
+    p.add_argument(
+        "--temporal_buffer_max",
+        type=int,
+        default=2500,
+        help="Max (h,s) points stored for temporal pair training and reference sampling.",
+    )
+    p.add_argument(
+        "--temporal_scale",
+        type=float,
+        default=0.05,
+        help="Scale for Var_k T_k intrinsic reward during imagination.",
+    )
+    p.add_argument("--temporal_heads", type=int, default=5)
+    p.add_argument(
+        "--temporal_ref",
+        type=int,
+        default=8,
+        help="Replay references per imagined state when computing ensemble variance.",
+    )
+    p.add_argument("--temporal_train_steps", type=int, default=40)
+    p.add_argument("--temporal_batch_pairs", type=int, default=512)
+    p.add_argument("--temporal_pair_pool", type=int, default=6000)
 
     p.add_argument(
         "--baseline",
         action="store_true",
-        help="Standard Dreamer: no replay-graph geometry, geo head, or intrinsic r_geo (saves compute vs default).",
+        help="Train world model + actor without temporal ensemble intrinsic reward.",
     )
 
     # Logging / output
@@ -437,7 +393,7 @@ def build_parser():
         help="Optional path to world_model.pt (encoder/decoder/rssm/reward/cont); actor/critic still random init",
     )
     p.add_argument("--log_dir", type=str, default="runs")
-    p.add_argument("--run_name", type=str, default="pointmaze_geo")
+    p.add_argument("--run_name", type=str, default="pointmaze_temporal")
     p.add_argument("--eval_episodes", type=int, default=5)
     p.add_argument("--eval_interval", type=int, default=20)
 
@@ -451,7 +407,7 @@ def log_training_phase_tensorboard(
     replay_size: int,
     expl_amount: float,
     baseline: bool,
-    geo_mod: ReplayGeometryModule | None,
+    temporal_mod: TemporalIntrinsicModule | None,
     wm: dict[str, float],
     grad: dict[str, float],
     imag: dict[str, float],
@@ -471,28 +427,23 @@ def log_training_phase_tensorboard(
         writer.add_scalar(f"policy/{k}", v, global_step)
 
     if baseline:
-        writer.add_scalar("geo/disabled", 1.0, global_step)
+        writer.add_scalar("temporal/disabled", 1.0, global_step)
         return
 
-    assert geo_mod is not None
-    writer.add_scalar("geo/disabled", 0.0, global_step)
-    writer.add_scalar("geo/n_nodes", float(geo_mod.tb_last_graph_n_nodes), global_step)
-    if geo_mod.tb_last_dist_finite_frac is not None:
-        writer.add_scalar(
-            "geo/dist_matrix_finite_frac", geo_mod.tb_last_dist_finite_frac, global_step
-        )
-    if geo_mod.tb_last_geo_train_loss is not None:
-        writer.add_scalar("geo/head_train_loss", geo_mod.tb_last_geo_train_loss, global_step)
+    assert temporal_mod is not None
+    writer.add_scalar("temporal/disabled", 0.0, global_step)
+    writer.add_scalar("temporal/buffer_size", float(len(temporal_mod._h_nodes)), global_step)
     writer.add_scalar(
-        "geo/head_train_opt_steps", float(geo_mod.tb_last_geo_train_steps), global_step
+        "temporal/intrinsic_ready",
+        1.0 if temporal_mod.temporal_intrinsic_ready() else 0.0,
+        global_step,
     )
-    if geo_mod.tb_last_phi_mean is not None:
-        writer.add_scalar("geo/phi_mean", geo_mod.tb_last_phi_mean, global_step)
-        writer.add_scalar("geo/phi_std", float(geo_mod.tb_last_phi_std or 0.0), global_step)
-    if geo_mod.tb_last_delta_mean is not None:
-        writer.add_scalar("geo/delta_mean", geo_mod.tb_last_delta_mean, global_step)
+    if temporal_mod.tb_last_temporal_loss is not None:
+        writer.add_scalar(
+            "temporal/train_loss", float(temporal_mod.tb_last_temporal_loss), global_step
+        )
     writer.add_scalar(
-        "geo/intrinsic_ready", 1.0 if geo_mod.geo_intrinsic_ready() else 0.0, global_step
+        "temporal/train_steps", float(temporal_mod.tb_last_temporal_train_steps), global_step
     )
 
 
@@ -512,7 +463,7 @@ def main(args):
         f"Maze: PointMaze_Medium_Diverse_GR-v3  img={H}x{W}  act_dim={act_dim}  gamma_eff={effective_gamma:.6f}"
     )
     if args.baseline:
-        print("Mode: baseline Dreamer (geometry module disabled)")
+        print("Mode: baseline Dreamer (no temporal intrinsic reward)")
 
     # Models
     encoder = ConvEncoder(embedding_size=args.embed_dim, in_channels=C).to(device)
@@ -581,18 +532,16 @@ def main(args):
     replay = ReplayBuffer(args.replay_capacity, obs_shape=(H, W, C), act_dim=act_dim)
     free_nats = torch.ones(1, device=device) * args.kl_free_nats
 
-    geo_mod = None
+    temporal_mod = None
     if not args.baseline:
-        geo_mod = ReplayGeometryModule(
+        temporal_mod = TemporalIntrinsicModule(
             deter_dim=args.deter_dim,
             stoch_dim=args.stoch_dim,
-            geo_dim=32,
-            geo_hidden=256,
             device=device,
-            lambda_dist=args.geo_lambda_dist,
-            lambda_front=args.geo_lambda_front,
-            lambda_off=args.geo_lambda_off,
-            max_nodes=args.geo_max_nodes,
+            max_nodes=args.temporal_buffer_max,
+            temporal_hidden=256,
+            n_temporal_heads=args.temporal_heads,
+            n_temporal_ref=args.temporal_ref,
         )
 
     writer = SummaryWriter(f"{args.log_dir}/{args.run_name}_seed{args.seed}")
@@ -696,10 +645,10 @@ def main(args):
                 gn_value: list[float] = []
                 imag_r_mean: list[float] = []
                 imag_r_std: list[float] = []
-                imag_geo_mean: list[float] = []
-                imag_geo_std: list[float] = []
-                imag_geo_abs_mean: list[float] = []
-                imag_geo_ratio: list[float] = []
+                imag_r_int_mean: list[float] = []
+                imag_r_int_std: list[float] = []
+                imag_r_int_abs_mean: list[float] = []
+                imag_r_int_ratio: list[float] = []
 
                 for _ in range(args.train_steps):
                     batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
@@ -766,17 +715,14 @@ def main(args):
                     gn_model.append(float(gn_m))
                     model_opt.step()
 
-                    # ------------- Geometry module update (offline) -------------
-                    # Posterior (h,s) + encoder embeddings e for cycle-consistent graph
-                    if geo_mod is not None and np.random.rand() < 0.1:
+                    # ------------- FIFO (h,s) buffer for temporal pair training -------------
+                    if temporal_mod is not None and np.random.rand() < 0.1:
                         h_np = h_seq.detach().cpu().numpy()
                         s_np = s_seq.detach().cpu().numpy()
-                        e_np = e_t[:, 1 : T + 1].detach().cpu().numpy()
                         traj_h = [h_np[b] for b in range(B)]
                         traj_s = [s_np[b] for b in range(B)]
-                        traj_e = [e_np[b] for b in range(B)]
                         traj_ids = [episode * B + b for b in range(B)]
-                        geo_mod.add_batch_trajectories(traj_h, traj_s, traj_e, traj_ids)
+                        temporal_mod.add_batch_trajectories(traj_h, traj_s, traj_ids)
 
                     # ------------- Imagination for actor/critic -------------
                     # Start imagination from posterior states
@@ -822,12 +768,13 @@ def main(args):
                     pcont_imag = torch.sigmoid(cont_logits_imag).clamp(0.0, 1.0)
                     discounts_imag = effective_gamma * pcont_imag
 
-                    # Intrinsic geometry reward (skipped in --baseline)
-                    if geo_mod is None:
-                        r_geo = torch.zeros_like(rewards_imag)
+                    if temporal_mod is None:
+                        r_int = torch.zeros_like(rewards_imag)
                     else:
-                        r_geo = geo_mod.intrinsic_reward_for_imagination(h_imag, s_imag)
-                    rewards_total = rewards_imag + r_geo
+                        r_int = temporal_mod.temporal_intrinsic_reward(h_imag, s_imag) * float(
+                            args.temporal_scale
+                        )
+                    rewards_total = rewards_imag + r_int
 
                     # Critic target (λ-returns) with detached targets
                     with torch.no_grad():
@@ -847,7 +794,7 @@ def main(args):
                     gn_value.append(float(gn_v))
                     value_opt.step()
 
-                    # Actor loss: maximize geometry-augmented returns
+                    # Actor loss: maximize reward-augmented returns
                     with torch.no_grad():
                         v_det = bottle(value_model, h_imag, s_imag)
                     lambda_actor = compute_lambda_returns(
@@ -871,11 +818,11 @@ def main(args):
                     sum_weighted_ret += float((w_actor * lambda_actor).mean().item())
                     imag_r_mean.append(float(rewards_imag.mean().item()))
                     imag_r_std.append(float(rewards_imag.std().item()))
-                    imag_geo_mean.append(float(r_geo.mean().item()))
-                    imag_geo_std.append(float(r_geo.std().item()))
-                    imag_geo_abs_mean.append(float(r_geo.abs().mean().item()))
+                    imag_r_int_mean.append(float(r_int.mean().item()))
+                    imag_r_int_std.append(float(r_int.std().item()))
+                    imag_r_int_abs_mean.append(float(r_int.abs().mean().item()))
                     denom = float(rewards_imag.abs().mean().item()) + 1e-8
-                    imag_geo_ratio.append(float(r_geo.abs().mean().item()) / denom)
+                    imag_r_int_ratio.append(float(r_int.abs().mean().item()) / denom)
 
                 n_ts = float(args.train_steps)
                 wm_avg = {
@@ -894,10 +841,10 @@ def main(args):
                 imag_avg = {
                     "reward_mean": float(np.mean(imag_r_mean)),
                     "reward_std": float(np.mean(imag_r_std)),
-                    "r_geo_mean": float(np.mean(imag_geo_mean)),
-                    "r_geo_std": float(np.mean(imag_geo_std)),
-                    "r_geo_abs_mean": float(np.mean(imag_geo_abs_mean)),
-                    "r_geo_over_abs_extrinsic": float(np.mean(imag_geo_ratio)),
+                    "r_int_mean": float(np.mean(imag_r_int_mean)),
+                    "r_int_std": float(np.mean(imag_r_int_std)),
+                    "r_int_abs_mean": float(np.mean(imag_r_int_abs_mean)),
+                    "r_int_over_abs_extrinsic": float(np.mean(imag_r_int_ratio)),
                 }
                 policy_avg = {
                     "actor_loss": sum_actor / n_ts,
@@ -905,12 +852,13 @@ def main(args):
                     "mean_weighted_return": sum_weighted_ret / n_ts,
                 }
 
-                if geo_mod is not None:
-                    geo_mod.rebuild_graph_and_distances(
-                        knn_k=args.geo_knn_k, cross_quantile=args.geo_cross_quantile
+                if temporal_mod is not None:
+                    temporal_mod.train_temporal_ensemble(
+                        n_steps=int(args.temporal_train_steps),
+                        batch_pairs=int(args.temporal_batch_pairs),
+                        pair_pool=int(args.temporal_pair_pool),
+                        seed=int(args.seed),
                     )
-                    geo_mod.train_geo_head(n_steps=20, batch_pairs=1024)
-                    geo_mod.build_potential()
 
                 log_training_phase_tensorboard(
                     writer,
@@ -918,7 +866,7 @@ def main(args):
                     replay_size=replay.size,
                     expl_amount=expl_amount,
                     baseline=args.baseline,
-                    geo_mod=geo_mod,
+                    temporal_mod=temporal_mod,
                     wm=wm_avg,
                     grad=grad_avg,
                     imag=imag_avg,
