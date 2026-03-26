@@ -232,15 +232,17 @@ class PointMazeRunCfg:
     geo_supervised: bool = False
     wm_path: str = ""
     replay_topology: bool = True
-    replay_topology_dim: int = 16
+    replay_topology_dim: int = 2
     replay_topology_hidden: int = 256
     replay_topology_epochs: int = 1000
     replay_topology_batch_pairs: int = 512
     replay_topology_pair_pool: int = 8000
     replay_topology_val_frac: float = 0.15
-    # Phase 1: train trunk + z_head + first temporal head; phase 2: freeze trunk+z_head, train all K heads.
-    replay_topology_z_head_epochs: int = 500
     replay_topology_n_ensemble: int = 5
+    replay_laplacian: bool = True
+    replay_laplacian_dim: int = 3
+    replay_laplacian_graph_max: int = 1800
+    replay_laplacian_knn_k: int = 10
     replay_cont: bool = True
     replay_cont_dim: int = 16
     replay_cont_hidden: int = 256
@@ -274,9 +276,9 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         cfg.geo_sup_batch = 192
         cfg.geo_sup_candidates = 48
         cfg_pm.replay_topology_epochs = min(80, int(cfg_pm.replay_topology_epochs))
-        cfg_pm.replay_topology_z_head_epochs = min(40, int(cfg_pm.replay_topology_z_head_epochs))
         cfg_pm.replay_cont_epochs = min(80, int(cfg_pm.replay_cont_epochs))
         cfg_pm.replay_cont_batch = min(256, int(cfg_pm.replay_cont_batch))
+        cfg_pm.replay_laplacian_graph_max = min(1200, int(cfg_pm.replay_laplacian_graph_max))
 
     maze_name = "PointMaze_Medium_Diverse_GR-v3"
     print(f"Device: {device}")
@@ -365,6 +367,8 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     topo_head = None
     z_topo_all = None
     topo_meta = None
+    z_lap_all = None
+    lap_meta = None
     cont_head = None
     z_cont_all = None
     cont_meta = None
@@ -375,7 +379,7 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
             print("    Skipping replay-topology head: encoder_emb missing from replay data.")
         else:
             print(
-                "    Training g_topo(e) with triplet ranking + frozen-z temporal_dist ensemble ..."
+                "    Training g_topo(e) with step-count regression (MSE) and strict low-dim bottleneck ..."
             )
             topo_head, z_topo_all, topo_meta = train_replay_topology_head(
                 data=data,
@@ -400,6 +404,14 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
                 device=device,
                 seed=int(cfg_pm.seed),
             )
+    if bool(cfg_pm.replay_laplacian):
+        if data.get("episode_ids", None) is None:
+            print("    Skipping replay-laplacian embedding: episode_ids missing from replay data.")
+        elif data.get("encoder_emb", None) is None:
+            print("    Skipping replay-laplacian embedding: encoder_emb missing from replay data.")
+        else:
+            print("    Computing replay-mixed-graph Laplacian eigenvector embedding (post-hoc) ...")
+            z_lap_all, lap_meta = compute_replay_laplacian_embedding(data, cfg_pm)
 
     print("\n  [4/5] Running analyses ...")
     pos = data["pos"]
@@ -411,6 +423,8 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         feat_dict["g_topo(e)"] = z_topo_all
     if z_cont_all is not None:
         feat_dict["g_cont(e)"] = z_cont_all
+    if z_lap_all is not None:
+        feat_dict["g_lap(e)"] = z_lap_all
 
     probe_res = run_probes(pos, feat_dict, cfg, device, episode_ids=episode_ids)
     dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg)
@@ -460,6 +474,7 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         "metric_class_mismatch": metric_mismatch_res,
         "replay_topology_eval": run_replay_topology_eval(topo_meta),
         "replay_contrastive_eval": run_replay_contrastive_eval(cont_meta),
+        "replay_laplacian_eval": run_replay_laplacian_eval(lap_meta),
     }
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         import json
@@ -504,6 +519,11 @@ def parse_args():
         action="store_true",
         help="Disable the replay-contrastive spectral head",
     )
+    p.add_argument(
+        "--no_replay_laplacian",
+        action="store_true",
+        help="Disable post-hoc replay-graph Laplacian embedding",
+    )
     return p.parse_args()
 
 
@@ -517,6 +537,7 @@ def main():
         wm_path=args.wm_path,
         replay_topology=not bool(args.no_replay_topology),
         replay_cont=not bool(args.no_replay_cont),
+        replay_laplacian=not bool(args.no_replay_laplacian),
     )
     run_single_pointmaze(cfg_pm)
 
@@ -1085,6 +1106,73 @@ def _build_mixed_replay_graph(
     return idx_global, g2l, adj_list
 
 
+def compute_replay_laplacian_embedding(
+    data: dict,
+    cfg_pm: PointMazeRunCfg,
+) -> tuple[Optional[np.ndarray], Optional[dict]]:
+    """Post-hoc spectral embedding from normalized replay mixed-graph Laplacian."""
+    ep_ids = np.asarray(data.get("episode_ids", None), dtype=np.int64)
+    enc = np.asarray(data.get("encoder_emb", None), dtype=np.float32)
+    if enc.ndim != 2 or len(ep_ids) != int(enc.shape[0]):
+        return None, None
+
+    idx_global, _, adj_list = _build_mixed_replay_graph(
+        enc,
+        ep_ids,
+        n_graph_max=int(cfg_pm.replay_laplacian_graph_max),
+        k_knn=int(cfg_pm.replay_laplacian_knn_k),
+    )
+    m = int(len(idx_global))
+    if m < 8:
+        return None, None
+
+    # Build unweighted symmetric adjacency.
+    a = np.zeros((m, m), dtype=np.float64)
+    for i, nei in enumerate(adj_list):
+        for j in nei:
+            jj = int(j)
+            if jj == i:
+                continue
+            a[i, jj] = 1.0
+            a[jj, i] = 1.0
+
+    deg = np.sum(a, axis=1)
+    if np.all(deg <= 0):
+        return None, None
+
+    inv_sqrt = np.zeros(m, dtype=np.float64)
+    nz = deg > 1e-12
+    inv_sqrt[nz] = 1.0 / np.sqrt(deg[nz])
+    d_inv = np.diag(inv_sqrt)
+    l = np.eye(m, dtype=np.float64) - d_inv @ a @ d_inv
+
+    evals, evecs = np.linalg.eigh(l)
+    dim = int(min(max(2, int(cfg_pm.replay_laplacian_dim)), 3))
+    # Skip the first trivial eigenvector.
+    start = 1
+    end = min(m, start + dim)
+    if end - start < 1:
+        return None, None
+    emb_local = evecs[:, start:end].astype(np.float32)
+    if emb_local.shape[1] < dim:
+        pad = np.zeros((m, dim - emb_local.shape[1]), dtype=np.float32)
+        emb_local = np.concatenate([emb_local, pad], axis=1)
+
+    z_all = np.zeros((len(ep_ids), dim), dtype=np.float32)
+    z_all[idx_global] = emb_local
+
+    meta = {
+        "n_nodes": int(m),
+        "dim": int(dim),
+        "knn_k": int(cfg_pm.replay_laplacian_knn_k),
+        "graph_max": int(cfg_pm.replay_laplacian_graph_max),
+        "eigvals_used": [float(x) for x in evals[start:end].tolist()],
+        "feat_dict_key": "g_lap(e)",
+        "objective": "normalized_graph_laplacian_eigenvectors_posthoc",
+    }
+    return z_all, meta
+
+
 def _spearman_rho_numpy(x: np.ndarray, y: np.ndarray) -> float:
     """Pearson correlation of rank-transformed x, y (Spearman rho). Returns in [-1, 1]."""
     x = np.asarray(x, dtype=np.float64).ravel()
@@ -1296,176 +1384,36 @@ def train_replay_topology_head(
 
     embed_dim = int(encoder_emb.shape[1])
     n_ens = max(1, int(cfg_pm.replay_topology_n_ensemble))
+    topo_dim = int(cfg_pm.replay_topology_dim)
+    # Enforce low-dimensional Euclidean bottleneck to avoid high-D folding.
+    if topo_dim not in (2, 3):
+        topo_dim = 2
+        cfg_pm.replay_topology_dim = 2
     model = TemporalTopoHead(
         embed_dim=embed_dim,
-        topo_dim=int(cfg_pm.replay_topology_dim),
+        topo_dim=topo_dim,
         hidden_dim=int(cfg_pm.replay_topology_hidden),
         n_ensemble=n_ens,
     ).to(device)
 
     e_t = torch.tensor(encoder_emb, dtype=torch.float32, device=device)
-
-    batch_pairs = int(min(cfg_pm.replay_topology_batch_pairs, max(1, len(train_ii))))
+    n_train = len(train_ii)
+    batch_pairs = int(min(cfg_pm.replay_topology_batch_pairs, max(1, n_train)))
+    total_epochs = max(2, int(cfg_pm.replay_topology_epochs))
     best_val = float("inf")
     best_state = None
-    n_train = len(train_ii)
-
-    total_epochs = max(2, int(cfg_pm.replay_topology_epochs))
-    z_cap = max(1, int(cfg_pm.replay_topology_z_head_epochs))
-    z_epochs = max(1, min(z_cap, total_epochs - 1))
-    ens_epochs = total_epochs - z_epochs
-    if ens_epochs < 1:
-        z_epochs = max(1, total_epochs - 1)
-        ens_epochs = total_epochs - z_epochs
 
     print(
-        f"    temporal_dist: {z_epochs} epochs (triplet ranking for g_topo(e)) + "
-        f"{ens_epochs} epochs (frozen-z ensemble K={n_ens}) = {total_epochs} total"
+        f"    temporal_dist: {total_epochs} epochs (pure step-count MSE) "
+        f"with g_topo(e) bottleneck dim={topo_dim}, ensemble K={n_ens}"
     )
-
-    def _build_order_table(ii_arr: np.ndarray, jj_arr: np.ndarray, dd_arr: np.ndarray):
-        by_src: dict[int, dict[int, float]] = {}
-        for a, b, d0 in zip(ii_arr.tolist(), jj_arr.tolist(), dd_arr.tolist()):
-            a_i = int(a)
-            b_i = int(b)
-            d_f = float(d0)
-            if d_f <= 0:
-                continue
-            if a_i not in by_src:
-                by_src[a_i] = {b_i: d_f}
-            else:
-                prev = by_src[a_i].get(b_i, None)
-                if prev is None or d_f < prev:
-                    by_src[a_i][b_i] = d_f
-        return by_src
-
-    def _sample_triplet_batch(
-        by_src: dict[int, dict[int, float]],
-        batch_size: int,
-    ):
-        src_keys = [k for k, v in by_src.items() if len(v) >= 2]
-        if len(src_keys) == 0:
-            return None
-        a_idx = np.empty(batch_size, dtype=np.int64)
-        p_idx = np.empty(batch_size, dtype=np.int64)
-        n_idx = np.empty(batch_size, dtype=np.int64)
-        filled = 0
-        trials = 0
-        max_trials = batch_size * 24
-        while filled < batch_size and trials < max_trials:
-            trials += 1
-            a = int(src_keys[int(rng.integers(0, len(src_keys)))])
-            items = list(by_src[a].items())
-            if len(items) < 2:
-                continue
-            # Need strict ordering: steps(a,p) < steps(a,n)
-            i = int(rng.integers(0, len(items)))
-            j = int(rng.integers(0, len(items)))
-            if i == j:
-                continue
-            bi, di = items[i]
-            bj, dj = items[j]
-            if float(di) == float(dj):
-                continue
-            if float(di) < float(dj):
-                p, n = int(bi), int(bj)
-            else:
-                p, n = int(bj), int(bi)
-            a_idx[filled] = a
-            p_idx[filled] = p
-            n_idx[filled] = n
-            filled += 1
-        if filled < max(4, batch_size // 8):
-            return None
-        return (
-            torch.tensor(a_idx[:filled], dtype=torch.long, device=device),
-            torch.tensor(p_idx[:filled], dtype=torch.long, device=device),
-            torch.tensor(n_idx[:filled], dtype=torch.long, device=device),
-        )
-
-    train_order = _build_order_table(train_ii, train_jj, train_dd)
-    val_order = _build_order_table(val_ii, val_jj, val_dd)
-    if len(train_order) == 0:
-        print("    temporal_dist_head: no valid ordered triplets for ranking.")
-        return None, None, None
-
-    def _val_rank_loss():
-        tri = _sample_triplet_batch(val_order, batch_pairs)
-        if tri is None:
-            return None
-        ai, pi, ni = tri
-        za = model.encode(e_t[ai])
-        zp = model.encode(e_t[pi])
-        zn = model.encode(e_t[ni])
-        d_ap = torch.norm(za - zp, dim=-1)
-        d_an = torch.norm(za - zn, dim=-1)
-        # Smooth ranking objective: encourages d(a,p) < d(a,n).
-        return F.softplus(d_ap - d_an).mean()
 
     def _val_mse_ensemble(ve_i, ve_j, vt):
         pv = model.forward_pair_ensemble(ve_i, ve_j)
         return F.mse_loss(pv, vt.unsqueeze(-1).expand_as(pv))
 
-    # ----- Phase 1: train g_topo(e) with triplet/ranking on replay step ordering -----
-    opt = torch.optim.Adam(
-        list(model.trunk.parameters()) + list(model.z_head.parameters()),
-        lr=3e-4,
-    )
-    best_val_rank = float("inf")
-    best_state_rank = None
-    global_epoch = 0
-    for epoch in range(z_epochs):
-        global_epoch += 1
-        model.train()
-        tri = _sample_triplet_batch(train_order, batch_pairs)
-        if tri is None:
-            continue
-        ai, pi, ni = tri
-        za = model.encode(e_t[ai])
-        zp = model.encode(e_t[pi])
-        zn = model.encode(e_t[ni])
-        d_ap = torch.norm(za - zp, dim=-1)
-        d_an = torch.norm(za - zn, dim=-1)
-        loss = F.softplus(d_ap - d_an).mean()
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-
-        with torch.no_grad():
-            model.eval()
-            val_rank = _val_rank_loss()
-            if val_rank is not None and float(val_rank.item()) < best_val_rank:
-                best_val_rank = float(val_rank.item())
-                best_state_rank = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-
-        if global_epoch % max(1, total_epochs // 6) == 0:
-            val_txt = f"{float(val_rank.item()):.4f}" if val_rank is not None else "n/a"
-            print(
-                f"    temporal_dist epoch {global_epoch}/{total_epochs} (phase=triplet-ranking)  "
-                f"train_rank={float(loss.item()):.4f}  val_rank={val_txt}"
-            )
-
-    if best_state_rank is not None:
-        model.load_state_dict(best_state_rank)
-
-    # Freeze trunk + z_head so ensemble heads cannot move the representation used for z / g_topo(e).
-    for p in model.trunk.parameters():
-        p.requires_grad_(False)
-    for p in model.z_head.parameters():
-        p.requires_grad_(False)
-
-    # Phase-1 ranking and phase-2 MSE are not comparable; track best checkpoint in phase 2 only.
-    best_val = float("inf")
-    best_state = None
-
-    # ----- Phase 2: all K heads, same targets -----
-    opt = torch.optim.Adam(
-        [p for h in model.temporal_dist_heads for p in h.parameters()],
-        lr=3e-4,
-    )
-    for epoch in range(ens_epochs):
-        global_epoch += 1
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+    for epoch in range(total_epochs):
         model.train()
         idx = rng.choice(n_train, size=batch_pairs, replace=n_train < batch_pairs)
         ei = e_t[torch.tensor(train_ii[idx], dtype=torch.long, device=device)]
@@ -1488,9 +1436,9 @@ def train_replay_topology_head(
                 best_val = float(val_loss.item())
                 best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
-        if global_epoch % max(1, total_epochs // 6) == 0:
+        if (epoch + 1) % max(1, total_epochs // 6) == 0:
             print(
-                f"    temporal_dist epoch {global_epoch}/{total_epochs} (phase=ensemble K={n_ens})  "
+                f"    temporal_dist epoch {epoch + 1}/{total_epochs} (phase=step-mse)  "
                 f"train_mse={float(loss.item()):.4f}  val_mse={float(val_loss.item()):.4f}"
             )
 
@@ -1596,9 +1544,9 @@ def train_replay_topology_head(
         "n_pairs_train": int(len(train_ii)),
         "n_pairs_val": int(len(val_ii)),
         "n_ensemble": int(n_ens),
-        "z_phase_epochs": int(z_epochs),
-        "ensemble_phase_epochs": int(ens_epochs),
-        "best_val_rank_loss": float(best_val_rank) if np.isfinite(best_val_rank) else None,
+        "total_epochs": int(total_epochs),
+        "topo_dim": int(topo_dim),
+        "best_val_rank_loss": None,
         "mean_pair_pred_variance_all_pairs": mean_var_all,
         "val_mean_pair_pred_variance": mean_var_val,
         "best_val_mse": float(best_val),
@@ -1801,6 +1749,20 @@ def run_replay_contrastive_eval(cont_meta: dict):
         "embed_dim": int(cont_meta.get("embed_dim", 0)),
         "feat_dict_key": str(cont_meta.get("feat_dict_key", "")),
         "objective": str(cont_meta.get("objective", "")),
+    }
+
+
+def run_replay_laplacian_eval(lap_meta: dict):
+    if lap_meta is None:
+        return None
+    return {
+        "n_nodes": int(lap_meta.get("n_nodes", 0)),
+        "dim": int(lap_meta.get("dim", 0)),
+        "knn_k": int(lap_meta.get("knn_k", 0)),
+        "graph_max": int(lap_meta.get("graph_max", 0)),
+        "eigvals_used": lap_meta.get("eigvals_used", []),
+        "feat_dict_key": str(lap_meta.get("feat_dict_key", "")),
+        "objective": str(lap_meta.get("objective", "")),
     }
 
 
