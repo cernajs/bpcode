@@ -19,6 +19,7 @@ Usage (single seed):
 
 import argparse
 import os
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -252,6 +253,38 @@ class PointMazeRunCfg:
     replay_cont_pos_k: int = 3
     replay_cont_neg_k: int = 32
     replay_cont_temp: float = 0.10
+    # Discrete replay graph on encoder_e: soft node partition + edge scores (no global Euclidean map).
+    replay_graph: bool = True
+    replay_graph_disc_classes: int = 64
+    replay_graph_hidden: int = 256
+    replay_graph_epochs: int = 400
+    replay_graph_batch_edges: int = 512
+    replay_graph_graph_max: int = 1800
+    replay_graph_knn_k: int = 10
+    replay_graph_val_frac: float = 0.1
+    replay_graph_lambda_smooth: float = 1.0
+    replay_graph_lambda_neg: float = 0.15
+    replay_graph_lambda_edge: float = 0.5
+    # Option 1: graph-native node score head b(e)
+    replay_node_score: bool = True
+    replay_node_score_hidden: int = 256
+    replay_node_score_epochs: int = 300
+    replay_node_score_batch: int = 1024
+    replay_node_score_val_frac: float = 0.15
+    # b_score target: α·novelty + β·disagreement + γ·uncertainty + δ·centrality (each term z-scored).
+    replay_node_score_alpha: float = 1.0
+    replay_node_score_beta: float = 1.0
+    replay_node_score_gamma: float = 1.0
+    replay_node_score_delta: float = 1.0
+    replay_node_score_use_centrality: bool = True
+    # Option 2: topology-specific multiclass edge classifier
+    replay_edge_topo: bool = True
+    replay_edge_topo_hidden: int = 256
+    replay_edge_topo_epochs: int = 300
+    replay_edge_topo_batch: int = 1024
+    replay_edge_topo_val_frac: float = 0.15
+    # Among non-temporal edges, mark this fraction as class-2 (replay-graph bottleneck bundle).
+    replay_edge_topo_bottleneck_frac: float = 0.2
 
 
 def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
@@ -279,6 +312,10 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         cfg_pm.replay_cont_epochs = min(80, int(cfg_pm.replay_cont_epochs))
         cfg_pm.replay_cont_batch = min(256, int(cfg_pm.replay_cont_batch))
         cfg_pm.replay_laplacian_graph_max = min(1200, int(cfg_pm.replay_laplacian_graph_max))
+        cfg_pm.replay_graph_epochs = min(80, int(cfg_pm.replay_graph_epochs))
+        cfg_pm.replay_graph_graph_max = min(1200, int(cfg_pm.replay_graph_graph_max))
+        cfg_pm.replay_node_score_epochs = min(80, int(cfg_pm.replay_node_score_epochs))
+        cfg_pm.replay_edge_topo_epochs = min(80, int(cfg_pm.replay_edge_topo_epochs))
 
     maze_name = "PointMaze_Medium_Diverse_GR-v3"
     print(f"Device: {device}")
@@ -372,6 +409,14 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     cont_head = None
     z_cont_all = None
     cont_meta = None
+    graph_head = None
+    z_graph_all = None
+    graph_meta = None
+    node_score_head = None
+    b_score_all = None
+    node_score_meta = None
+    edge_topo_head = None
+    edge_topo_meta = None
     if bool(cfg_pm.replay_topology):
         if data.get("episode_ids", None) is None:
             print("    Skipping replay-topology head: episode_ids missing from replay data.")
@@ -412,6 +457,48 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         else:
             print("    Computing replay-mixed-graph Laplacian eigenvector embedding (post-hoc) ...")
             z_lap_all, lap_meta = compute_replay_laplacian_embedding(data, cfg_pm)
+    if bool(cfg_pm.replay_graph):
+        if data.get("episode_ids", None) is None:
+            print("    Skipping discrete replay-graph head: episode_ids missing from replay data.")
+        elif data.get("encoder_emb", None) is None:
+            print("    Skipping discrete replay-graph head: encoder_emb missing from replay data.")
+        else:
+            print(
+                "    Training g_graph(e): soft node partition + edge scores on mixed replay graph ..."
+            )
+            graph_head, z_graph_all, graph_meta = train_replay_graph_discrete_head(
+                data=data,
+                cfg_pm=cfg_pm,
+                device=device,
+                seed=int(cfg_pm.seed),
+            )
+    if bool(cfg_pm.replay_node_score):
+        if data.get("episode_ids", None) is None:
+            print("    Skipping node-score head: episode_ids missing from replay data.")
+        elif data.get("encoder_emb", None) is None:
+            print("    Skipping node-score head: encoder_emb missing from replay data.")
+        else:
+            print("    Training b(e) to predict graph-native node score ...")
+            node_score_head, b_score_all, node_score_meta = train_replay_node_score_head(
+                data=data,
+                cfg_pm=cfg_pm,
+                device=device,
+                seed=int(cfg_pm.seed),
+                geodesic=env.geodesic,
+            )
+    if bool(cfg_pm.replay_edge_topo):
+        if data.get("episode_ids", None) is None:
+            print("    Skipping edge-topology head: episode_ids missing from replay data.")
+        elif data.get("encoder_emb", None) is None:
+            print("    Skipping edge-topology head: encoder_emb missing from replay data.")
+        else:
+            print("    Training topology-aware multiclass edge classifier (oracle-free bottleneck labels) ...")
+            edge_topo_head, edge_topo_meta = train_replay_edge_topology_head(
+                data=data,
+                cfg_pm=cfg_pm,
+                device=device,
+                seed=int(cfg_pm.seed),
+            )
 
     print("\n  [4/5] Running analyses ...")
     pos = data["pos"]
@@ -425,6 +512,11 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         feat_dict["g_cont(e)"] = z_cont_all
     if z_lap_all is not None:
         feat_dict["g_lap(e)"] = z_lap_all
+    if z_graph_all is not None:
+        feat_dict["g_graph(e)"] = z_graph_all
+    if b_score_all is not None:
+        # Keep scalar score semantics but expose 2D for downstream PCA plotting.
+        feat_dict["b_score(e)"] = np.concatenate([b_score_all, np.zeros_like(b_score_all)], axis=1)
 
     probe_res = run_probes(pos, feat_dict, cfg, device, episode_ids=episode_ids)
     dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg)
@@ -459,6 +551,19 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         device,
         out_dir,
     )
+    lap_kmeans_meta = None
+    if "g_lap(e)" in feat_dict:
+        lap_kmeans_path = os.path.join(out_dir, "g_lap_kmeans9_grid.png")
+        lap_kmeans_meta = plot_laplacian_kmeans_grid(
+            geodesic=env.geodesic,
+            pos=pos,
+            g_lap_feat=feat_dict["g_lap(e)"],
+            out_path=lap_kmeans_path,
+            n_clusters=9,
+            seed=int(cfg_pm.seed),
+        )
+        if lap_kmeans_meta is not None:
+            print(f"    g_lap KMeans grid plot saved to {lap_kmeans_path}")
 
     env.close()
 
@@ -475,6 +580,10 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         "replay_topology_eval": run_replay_topology_eval(topo_meta),
         "replay_contrastive_eval": run_replay_contrastive_eval(cont_meta),
         "replay_laplacian_eval": run_replay_laplacian_eval(lap_meta),
+        "replay_laplacian_kmeans_eval": lap_kmeans_meta,
+        "replay_graph_eval": run_replay_graph_eval(graph_meta),
+        "replay_node_score_eval": run_replay_node_score_eval(node_score_meta),
+        "replay_edge_topology_eval": run_replay_edge_topology_eval(edge_topo_meta),
     }
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         import json
@@ -524,6 +633,56 @@ def parse_args():
         action="store_true",
         help="Disable post-hoc replay-graph Laplacian embedding",
     )
+    p.add_argument(
+        "--no_replay_graph",
+        action="store_true",
+        help="Disable discrete replay-graph head (soft partition + edge scores on encoder_e)",
+    )
+    p.add_argument(
+        "--no_replay_node_score",
+        action="store_true",
+        help="Disable graph-native node-score head b(e)",
+    )
+    p.add_argument(
+        "--no_replay_node_score_centrality",
+        action="store_true",
+        help="Disable cut/bottleneck centrality term in b_score target (novelty/disagreement/uncertainty only)",
+    )
+    p.add_argument(
+        "--replay_node_score_alpha",
+        type=float,
+        default=0.5,
+        help="Weight α on novelty in b_score target (after per-term z-score)",
+    )
+    p.add_argument(
+        "--replay_node_score_beta",
+        type=float,
+        default=0.5,
+        help="Weight β on local-global disagreement in b_score target",
+    )
+    p.add_argument(
+        "--replay_node_score_gamma",
+        type=float,
+        default=0.5,
+        help="Weight γ on replay step-distance uncertainty in b_score target",
+    )
+    p.add_argument(
+        "--replay_node_score_delta",
+        type=float,
+        default=1.0,
+        help="Weight δ on centrality bundle in b_score target",
+    )
+    p.add_argument(
+        "--no_replay_edge_topo",
+        action="store_true",
+        help="Disable topology-aware multiclass edge classifier",
+    )
+    p.add_argument(
+        "--replay_edge_topo_bottleneck_frac",
+        type=float,
+        default=0.2,
+        help="Fraction of non-temporal replay edges labeled as oracle-free bottleneck (class 2)",
+    )
     return p.parse_args()
 
 
@@ -538,6 +697,15 @@ def main():
         replay_topology=not bool(args.no_replay_topology),
         replay_cont=not bool(args.no_replay_cont),
         replay_laplacian=not bool(args.no_replay_laplacian),
+        replay_graph=not bool(args.no_replay_graph),
+        replay_node_score=not bool(args.no_replay_node_score),
+        replay_node_score_alpha=float(args.replay_node_score_alpha),
+        replay_node_score_beta=float(args.replay_node_score_beta),
+        replay_node_score_gamma=float(args.replay_node_score_gamma),
+        replay_node_score_delta=float(args.replay_node_score_delta),
+        replay_node_score_use_centrality=not bool(args.no_replay_node_score_centrality),
+        replay_edge_topo=not bool(args.no_replay_edge_topo),
+        replay_edge_topo_bottleneck_frac=float(args.replay_edge_topo_bottleneck_frac),
     )
     run_single_pointmaze(cfg_pm)
 
@@ -694,6 +862,952 @@ class ReplayContrastiveHead(nn.Module):
     def encode_unit(self, e: torch.Tensor) -> torch.Tensor:
         z = self.encode(e)
         return F.normalize(z, dim=-1, eps=1e-8)
+
+
+class ReplayGraphDiscreteHead(nn.Module):
+    """Discrete replay topology on encoder_e: K-way soft node assignment + edge logits (no global map)."""
+
+    def __init__(self, embed_dim: int, n_classes: int, hidden_dim: int):
+        super().__init__()
+        in_dim = int(embed_dim)
+        hd = int(hidden_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(in_dim, hd),
+            nn.ELU(),
+            nn.Linear(hd, hd),
+            nn.ELU(),
+        )
+        self.node_logits = nn.Linear(hd, int(n_classes))
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(2 * hd, hd),
+            nn.ELU(),
+            nn.Linear(hd, 1),
+        )
+        nn.init.orthogonal_(self.node_logits.weight, gain=0.1)
+        nn.init.zeros_(self.node_logits.bias)
+
+    def forward_node_logits(self, e: torch.Tensor) -> torch.Tensor:
+        return self.node_logits(self.trunk(e))
+
+    def forward_soft(self, e: torch.Tensor) -> torch.Tensor:
+        return F.softmax(self.forward_node_logits(e), dim=-1)
+
+    def forward_edge_logits(self, e_i: torch.Tensor, e_j: torch.Tensor) -> torch.Tensor:
+        hi = self.trunk(e_i)
+        hj = self.trunk(e_j)
+        return self.edge_mlp(torch.cat([hi, hj], dim=-1)).squeeze(-1)
+
+
+class ReplayNodeScoreHead(nn.Module):
+    """Predict graph-native scalar node score b(e) from encoder_e."""
+
+    def __init__(self, embed_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(int(embed_dim), int(hidden_dim)),
+            nn.ELU(),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.ELU(),
+            nn.Linear(int(hidden_dim), 1),
+        )
+
+    def forward(self, e: torch.Tensor) -> torch.Tensor:
+        return self.net(e).squeeze(-1)
+
+
+class ReplayEdgeTopoClassifier(nn.Module):
+    """Classify replay pairs: temporal-neighbor, shortcut-like, boundary-crossing."""
+
+    def __init__(self, embed_dim: int, hidden_dim: int, n_classes: int = 3):
+        super().__init__()
+        hd = int(hidden_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(int(embed_dim), hd),
+            nn.ELU(),
+            nn.Linear(hd, hd),
+            nn.ELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(2 * hd, hd),
+            nn.ELU(),
+            nn.Linear(hd, int(n_classes)),
+        )
+
+    def forward(self, e_i: torch.Tensor, e_j: torch.Tensor) -> torch.Tensor:
+        hi = self.trunk(e_i)
+        hj = self.trunk(e_j)
+        return self.head(torch.cat([hi, hj], dim=-1))
+
+
+def _mixed_graph_undirected_edges(adj_list: list[list[int]]) -> np.ndarray:
+    """Unique undirected edges (u, v) with u < v in local node indices."""
+    pairs: list[tuple[int, int]] = []
+    for i, nei in enumerate(adj_list):
+        for j in nei:
+            a, b = (i, j) if i < j else (j, i)
+            pairs.append((a, b))
+    if not pairs:
+        return np.zeros((0, 2), dtype=np.int64)
+    pairs = sorted(set(pairs))
+    return np.asarray(pairs, dtype=np.int64)
+
+
+def _sample_nonedge_pairs_local(
+    rng: np.random.Generator,
+    m: int,
+    edge_set: set[tuple[int, int]],
+    batch_size: int,
+    max_tries: int = 50_000,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    u_out = np.empty(batch_size, dtype=np.int64)
+    v_out = np.empty(batch_size, dtype=np.int64)
+    filled = 0
+    tries = 0
+    while filled < batch_size and tries < max_tries:
+        tries += 1
+        a = int(rng.integers(0, m))
+        b = int(rng.integers(0, m))
+        if a == b:
+            continue
+        x, y = (a, b) if a < b else (b, a)
+        if (x, y) in edge_set:
+            continue
+        u_out[filled] = a
+        v_out[filled] = b
+        filled += 1
+    if filled < batch_size:
+        return None
+    return u_out, v_out
+
+
+def train_replay_graph_discrete_head(
+    data: dict,
+    cfg_pm: PointMazeRunCfg,
+    device: torch.device,
+    seed: int,
+):
+    """Train soft partition + edge classifier on mixed replay graph (temporal + encoder kNN)."""
+    ep_ids = np.asarray(data["episode_ids"], dtype=np.int64)
+    encoder_emb = np.asarray(data.get("encoder_emb", None), dtype=np.float32)
+    if encoder_emb.ndim != 2 or len(ep_ids) != len(encoder_emb):
+        print("    replay_graph_head: encoder_emb shape mismatch vs episode_ids.")
+        return None, None, None
+
+    rng = np.random.default_rng(int(seed))
+    idx_global, _, adj_list = _build_mixed_replay_graph(
+        encoder_emb,
+        ep_ids,
+        n_graph_max=int(cfg_pm.replay_graph_graph_max),
+        k_knn=int(cfg_pm.replay_graph_knn_k),
+    )
+    m = int(len(idx_global))
+    edges = _mixed_graph_undirected_edges(adj_list)
+    if m < 16 or len(edges) < 8:
+        print("    replay_graph_head: mixed graph too small for training.")
+        return None, None, None
+
+    edge_set = {(int(a), int(b)) for a, b in edges.tolist()}
+
+    perm = rng.permutation(len(edges))
+    n_val = min(
+        max(1, int(round(float(cfg_pm.replay_graph_val_frac) * len(edges)))),
+        len(edges) - 1,
+    )
+    train_edges = edges[perm[n_val:]]
+    val_edges = edges[perm[:n_val]]
+
+    e_t = torch.tensor(encoder_emb, dtype=torch.float32, device=device)
+    embed_dim = int(encoder_emb.shape[1])
+    k_cls = int(max(4, cfg_pm.replay_graph_disc_classes))
+    model = ReplayGraphDiscreteHead(
+        embed_dim=embed_dim,
+        n_classes=k_cls,
+        hidden_dim=int(cfg_pm.replay_graph_hidden),
+    ).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+
+    lam_s = float(cfg_pm.replay_graph_lambda_smooth)
+    lam_n = float(cfg_pm.replay_graph_lambda_neg)
+    lam_e = float(cfg_pm.replay_graph_lambda_edge)
+    n_train_e = len(train_edges)
+    batch_e = int(min(max(32, cfg_pm.replay_graph_batch_edges), max(32, n_train_e)))
+    epochs = int(max(2, cfg_pm.replay_graph_epochs))
+
+    def _batch_loss(e_src: torch.Tensor, e_dst: torch.Tensor, neg_u: torch.Tensor, neg_v: torch.Tensor):
+        p_i = model.forward_soft(e_src)
+        p_j = model.forward_soft(e_dst)
+        loss_smooth = torch.mean((p_i - p_j) ** 2)
+
+        pn_i = model.forward_soft(e_t[neg_u])
+        pn_j = model.forward_soft(e_t[neg_v])
+        loss_neg = -torch.mean((pn_i - pn_j) ** 2)
+
+        logit_pos = model.forward_edge_logits(e_src, e_dst)
+        eni = e_t[neg_u]
+        enj = e_t[neg_v]
+        logit_neg = model.forward_edge_logits(eni, enj)
+        logits = torch.cat([logit_pos, logit_neg], dim=0)
+        targets = torch.cat(
+            [torch.ones_like(logit_pos), torch.zeros_like(logit_neg)],
+            dim=0,
+        )
+        loss_edge = F.binary_cross_entropy_with_logits(logits, targets)
+        total = lam_s * loss_smooth + lam_n * loss_neg + lam_e * loss_edge
+        return total, loss_smooth, loss_neg, loss_edge
+
+    @torch.no_grad()
+    def _eval_val() -> float:
+        model.eval()
+        if len(val_edges) < 4:
+            return float("inf")
+        n_v = min(len(val_edges), batch_e)
+        ve = val_edges[:n_v]
+        neg = _sample_nonedge_pairs_local(rng, m, edge_set, n_v)
+        if neg is None:
+            return float("inf")
+        nu, nv = neg
+        gi = torch.tensor(idx_global[ve[:, 0]], dtype=torch.long, device=device)
+        gj = torch.tensor(idx_global[ve[:, 1]], dtype=torch.long, device=device)
+        gnu = torch.tensor(idx_global[nu], dtype=torch.long, device=device)
+        gnv = torch.tensor(idx_global[nv], dtype=torch.long, device=device)
+        tot, _, _, _ = _batch_loss(e_t[gi], e_t[gj], gnu, gnv)
+        return float(tot.item())
+
+    best_val = float("inf")
+    best_state = None
+    for epoch in range(epochs):
+        model.train()
+        idx = rng.choice(n_train_e, size=batch_e, replace=n_train_e < batch_e)
+        eij = train_edges[idx]
+        u_loc = eij[:, 0]
+        v_loc = eij[:, 1]
+        gi = torch.tensor(idx_global[u_loc], dtype=torch.long, device=device)
+        gj = torch.tensor(idx_global[v_loc], dtype=torch.long, device=device)
+        neg = _sample_nonedge_pairs_local(rng, m, edge_set, len(eij))
+        if neg is None:
+            continue
+        nu, nv = neg
+        gnu = torch.tensor(idx_global[nu], dtype=torch.long, device=device)
+        gnv = torch.tensor(idx_global[nv], dtype=torch.long, device=device)
+        loss, ls, ln, le = _batch_loss(e_t[gi], e_t[gj], gnu, gnv)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        val_loss = _eval_val()
+        if np.isfinite(val_loss) and val_loss < best_val:
+            best_val = float(val_loss)
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+        if (epoch + 1) % max(1, epochs // 6) == 0:
+            print(
+                f"    replay_graph epoch {epoch + 1}/{epochs}  train={float(loss.item()):.4f}  "
+                f"smooth={float(ls.item()):.4f} neg={float(ln.item()):.4f} edge_bce={float(le.item()):.4f}  "
+                f"val={val_loss:.4f}"
+            )
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        z_all = model.forward_soft(e_t).cpu().numpy().astype(np.float32)
+
+    meta = {
+        "n_graph_nodes": int(m),
+        "n_edges": int(len(edges)),
+        "n_edges_train": int(len(train_edges)),
+        "n_edges_val": int(len(val_edges)),
+        "n_classes": int(k_cls),
+        "epochs": int(epochs),
+        "batch_edges": int(batch_e),
+        "best_val_total": float(best_val) if np.isfinite(best_val) else None,
+        "input": "encoder_e_only",
+        "embed_dim": int(embed_dim),
+        "feat_dict_key": "g_graph(e)",
+        "objective": "soft_partition_smoothness_plus_edge_bce",
+        "graph_knn_k": int(cfg_pm.replay_graph_knn_k),
+        "graph_max_nodes": int(cfg_pm.replay_graph_graph_max),
+    }
+    return model, z_all, meta
+
+
+def _zscore_safe(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    mu = float(np.mean(x))
+    sd = float(np.std(x))
+    if sd < 1e-8:
+        return np.zeros_like(x, dtype=np.float32)
+    return ((x - mu) / sd).astype(np.float32)
+
+
+def _cell_replay_adjacency(
+    pos: np.ndarray,
+    episode_ids: np.ndarray,
+    geodesic: GeodesicComputer,
+) -> list[list[int]]:
+    """Undirected free-cell graph from same-episode consecutive transitions (replay dynamics)."""
+    n = int(len(pos))
+    if n < 2:
+        return []
+    cell_idx = _positions_to_cell_indices(geodesic, pos)
+    n_free = int(geodesic.n_free)
+    adj_set = [set() for _ in range(n_free)]
+    ep = np.asarray(episode_ids, dtype=np.int64)
+    for i in range(n - 1):
+        if ep[i] != ep[i + 1]:
+            continue
+        u = int(cell_idx[i])
+        v = int(cell_idx[i + 1])
+        if u == v:
+            continue
+        adj_set[u].add(v)
+        adj_set[v].add(u)
+    return [sorted(s) for s in adj_set]
+
+
+def _node_betweenness_brandes_undirected(adj: list[list[int]]) -> np.ndarray:
+    """Brandes node betweenness; undirected correction ×0.5 at the end."""
+    n = len(adj)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    c_b = np.zeros(n, dtype=np.float64)
+    for s in range(n):
+        s_list: list[int] = []
+        p_pred: list[list[int]] = [[] for _ in range(n)]
+        sigma = np.zeros(n, dtype=np.float64)
+        sigma[s] = 1.0
+        dist = np.full(n, -1, dtype=np.int64)
+        dist[s] = 0
+        q = deque([s])
+        while q:
+            v = int(q.popleft())
+            s_list.append(v)
+            for w in adj[v]:
+                if dist[w] < 0:
+                    dist[w] = dist[v] + 1
+                    q.append(w)
+                if dist[w] == dist[v] + 1:
+                    sigma[w] += sigma[v]
+                    p_pred[w].append(v)
+        delta = np.zeros(n, dtype=np.float64)
+        while s_list:
+            w = int(s_list.pop())
+            sw = float(sigma[w])
+            if sw <= 0.0:
+                continue
+            coeff = (1.0 + delta[w]) / sw
+            for v in p_pred[w]:
+                delta[v] += float(sigma[v]) * coeff
+            if w != s:
+                c_b[w] += delta[w]
+    c_b *= 0.5
+    return c_b
+
+
+def _edge_betweenness_brandes_undirected(adj: list[list[int]]) -> dict[tuple[int, int], float]:
+    """Brandes edge betweenness per undirected edge key (min,max)."""
+    n = len(adj)
+    edge_tot: dict[tuple[int, int], float] = defaultdict(float)
+    if n == 0:
+        return edge_tot
+    for s in range(n):
+        s_list: list[int] = []
+        p_pred: list[list[int]] = [[] for _ in range(n)]
+        sigma = np.zeros(n, dtype=np.float64)
+        sigma[s] = 1.0
+        dist = np.full(n, -1, dtype=np.int64)
+        dist[s] = 0
+        q = deque([s])
+        while q:
+            v = int(q.popleft())
+            s_list.append(v)
+            for w in adj[v]:
+                if dist[w] < 0:
+                    dist[w] = dist[v] + 1
+                    q.append(w)
+                if dist[w] == dist[v] + 1:
+                    sigma[w] += sigma[v]
+                    p_pred[w].append(v)
+        delta = np.zeros(n, dtype=np.float64)
+        while s_list:
+            w = int(s_list.pop())
+            sw = float(sigma[w])
+            if sw <= 0.0:
+                continue
+            coeff = (1.0 + delta[w]) / sw
+            for v in p_pred[w]:
+                c = float(sigma[v]) * coeff
+                delta[v] += c
+                a, b = (v, w) if v < w else (w, v)
+                edge_tot[(a, b)] += c
+    return edge_tot
+
+
+def _edge_betweenness_push_to_nodes(adj: list[list[int]], edge_tot: dict[tuple[int, int], float]) -> np.ndarray:
+    """Sum edge-betweenness values over incident edges at each node."""
+    n = len(adj)
+    out = np.zeros(n, dtype=np.float64)
+    for (a, b), val in edge_tot.items():
+        out[int(a)] += val
+        out[int(b)] += val
+    return out
+
+
+def _articulation_points_undirected(adj: list[list[int]]) -> np.ndarray:
+    """Tarjan articulation flags per node (0/1)."""
+    n = len(adj)
+    visited = [False] * n
+    tin = [0] * n
+    low = [0] * n
+    timer = 0
+    ap = [False] * n
+
+    def dfs(v: int, p: int) -> None:
+        nonlocal timer
+        visited[v] = True
+        tin[v] = low[v] = timer
+        timer += 1
+        children = 0
+        for to in adj[v]:
+            if to == p:
+                continue
+            if visited[to]:
+                low[v] = min(low[v], tin[to])
+            else:
+                dfs(int(to), v)
+                low[v] = min(low[v], low[int(to)])
+                if low[int(to)] >= tin[v] and p != -1:
+                    ap[v] = True
+                children += 1
+        if p == -1 and children > 1:
+            ap[v] = True
+
+    for i in range(n):
+        if not visited[i]:
+            dfs(i, -1)
+    return np.asarray(ap, dtype=np.float32)
+
+
+def _oracle_bridge_boundary_mask(geodesic: GeodesicComputer) -> np.ndarray:
+    """1 on free cells that touch an oracle grid bridge edge (cut / doorway proxy)."""
+    dist_mat = geodesic.dist_matrix
+    adj_oracle = _adj_from_distmat(dist_mat)
+    bridges = _find_bridges(adj_oracle)
+    n_free = int(geodesic.n_free)
+    mask = np.zeros(n_free, dtype=np.float32)
+    for u, v in bridges:
+        mask[int(u)] = 1.0
+        mask[int(v)] = 1.0
+    return mask
+
+
+def _build_cell_centrality_bundle(
+    pos: np.ndarray,
+    episode_ids: np.ndarray,
+    geodesic: GeodesicComputer,
+) -> np.ndarray:
+    """Per free-cell scalar: mean of z-scored (node betweenness, edge push, articulation, oracle bridge)."""
+    adj = _cell_replay_adjacency(pos, episode_ids, geodesic)
+    n_free = int(geodesic.n_free)
+    if n_free == 0:
+        return np.zeros(0, dtype=np.float32)
+    nb = _node_betweenness_brandes_undirected(adj)
+    et = _edge_betweenness_brandes_undirected(adj)
+    eb = _edge_betweenness_push_to_nodes(adj, et)
+    art = _articulation_points_undirected(adj)
+    br = _oracle_bridge_boundary_mask(geodesic)
+    parts = [
+        _zscore_safe(nb.astype(np.float32)),
+        _zscore_safe(eb.astype(np.float32)),
+        _zscore_safe(art.astype(np.float32)),
+        _zscore_safe(br.astype(np.float32)),
+    ]
+    return np.mean(np.stack(parts, axis=0), axis=0).astype(np.float32)
+
+
+def _build_graph_native_node_scores(
+    encoder_emb: np.ndarray,
+    pos: np.ndarray,
+    episode_ids: np.ndarray,
+    geodesic: GeodesicComputer,
+    rng: np.random.Generator,
+    cfg_pm: Optional[PointMazeRunCfg] = None,
+) -> np.ndarray:
+    """Compose b(v) = α·novelty + β·disagreement + γ·uncertainty + δ·centrality (each term z-scored).
+
+    Centrality averages z-scored: node betweenness on the cell replay graph, edge-betweenness mass on
+    incident nodes, articulation on that graph, and oracle bridge-endpoint indicator (community cut).
+    """
+    n = int(len(encoder_emb))
+    alpha = beta = gamma = delta = 1.0
+    use_cent = True
+    if cfg_pm is not None:
+        alpha = float(cfg_pm.replay_node_score_alpha)
+        beta = float(cfg_pm.replay_node_score_beta)
+        gamma = float(cfg_pm.replay_node_score_gamma)
+        delta = float(cfg_pm.replay_node_score_delta)
+        use_cent = bool(cfg_pm.replay_node_score_use_centrality)
+
+    # 1) Novelty / inverse visitation by geodesic cell
+    cell_idx = _positions_to_cell_indices(geodesic, pos)
+    n_free = int(geodesic.n_free)
+    cell_counts = np.zeros(n_free, dtype=np.int64)
+    for c in cell_idx.tolist():
+        cell_counts[int(c)] += 1
+    novelty = 1.0 / np.sqrt(np.maximum(1, cell_counts[cell_idx]).astype(np.float32))
+
+    # 2) Local-global disagreement (already used elsewhere)
+    src_lg, disc_lg = _compute_encoder_temporal_local_global_disagreement(
+        encoder_emb=encoder_emb,
+        episode_ids=episode_ids,
+        rng=rng,
+        k_nn=12,
+        candidate_pool=1800,
+        max_sources=2000,
+        min_labeled_neighbors=4,
+    )
+    disc_all = np.zeros(n, dtype=np.float32)
+    if len(src_lg) > 0:
+        disc_all[src_lg.astype(np.int64)] = disc_lg.astype(np.float32)
+
+    # 3) Temporal-distance uncertainty proxy: std of replay step distances per source
+    pair_pool = _oracle_free_replay_step_distances(
+        episode_ids,
+        n_pairs_target=min(max(2000, n), 10000),
+        max_sources=128,
+        rng=rng,
+    )
+    uncert = np.zeros(n, dtype=np.float32)
+    if pair_pool is not None:
+        ii, _, dd = pair_pool
+        by_src: dict[int, list[float]] = {}
+        for a, d in zip(ii.tolist(), dd.tolist()):
+            by_src.setdefault(int(a), []).append(float(d))
+        for a, vals in by_src.items():
+            if len(vals) >= 2:
+                uncert[a] = float(np.std(np.asarray(vals, dtype=np.float32)))
+
+    nov_z = _zscore_safe(novelty)
+    disc_z = _zscore_safe(disc_all)
+    unc_z = _zscore_safe(uncert)
+
+    if use_cent and delta != 0.0:
+        cent_cell = _build_cell_centrality_bundle(pos, episode_ids, geodesic)
+        if cent_cell.size != n_free:
+            cent_z = np.zeros(n, dtype=np.float32)
+        else:
+            cent_timestep = cent_cell[cell_idx.astype(np.int64)]
+            cent_z = _zscore_safe(cent_timestep)
+        denom = max(1e-8, alpha + beta + gamma + delta)
+        score = (alpha * nov_z + beta * disc_z + gamma * unc_z + delta * cent_z) / denom
+    else:
+        denom = max(1e-8, alpha + beta + gamma)
+        score = (alpha * nov_z + beta * disc_z + gamma * unc_z) / denom
+    return score.astype(np.float32)
+
+
+def train_replay_node_score_head(
+    data: dict,
+    cfg_pm: PointMazeRunCfg,
+    device: torch.device,
+    seed: int,
+    geodesic: GeodesicComputer,
+):
+    ep_ids = np.asarray(data["episode_ids"], dtype=np.int64)
+    pos = np.asarray(data["pos"], dtype=np.float32)
+    encoder_emb = np.asarray(data.get("encoder_emb", None), dtype=np.float32)
+    if encoder_emb.ndim != 2 or len(ep_ids) != len(encoder_emb):
+        print("    replay_node_score_head: encoder_emb shape mismatch vs episode_ids.")
+        return None, None, None
+    n = int(len(encoder_emb))
+    if n < 16:
+        return None, None, None
+
+    rng = np.random.default_rng(int(seed))
+    target_np = _build_graph_native_node_scores(encoder_emb, pos, ep_ids, geodesic, rng, cfg_pm)
+    e_t = torch.tensor(encoder_emb, dtype=torch.float32, device=device)
+    y_t = torch.tensor(target_np, dtype=torch.float32, device=device)
+
+    perm = rng.permutation(n)
+    n_val = min(max(1, int(round(float(cfg_pm.replay_node_score_val_frac) * n))), n - 1)
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+
+    model = ReplayNodeScoreHead(
+        embed_dim=int(encoder_emb.shape[1]),
+        hidden_dim=int(cfg_pm.replay_node_score_hidden),
+    ).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+    epochs = int(max(2, cfg_pm.replay_node_score_epochs))
+    batch = int(min(max(32, cfg_pm.replay_node_score_batch), max(32, len(train_idx))))
+
+    best_val = float("inf")
+    best_state = None
+    for epoch in range(epochs):
+        model.train()
+        idx = rng.choice(train_idx, size=batch, replace=len(train_idx) < batch)
+        it = torch.tensor(idx, dtype=torch.long, device=device)
+        pred = model(e_t[it])
+        loss = F.mse_loss(pred, y_t[it])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        with torch.no_grad():
+            model.eval()
+            iv = torch.tensor(val_idx, dtype=torch.long, device=device)
+            vloss = F.mse_loss(model(e_t[iv]), y_t[iv])
+            if float(vloss.item()) < best_val:
+                best_val = float(vloss.item())
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        if (epoch + 1) % max(1, epochs // 6) == 0:
+            print(
+                f"    replay_node_score epoch {epoch + 1}/{epochs}  "
+                f"train_mse={float(loss.item()):.4f}  val_mse={float(vloss.item()):.4f}"
+            )
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        b_all = model(e_t).cpu().numpy().astype(np.float32).reshape(-1, 1)
+
+    meta = {
+        "n_samples": int(n),
+        "epochs": int(epochs),
+        "batch": int(batch),
+        "best_val_mse": float(best_val),
+        "input": "encoder_e_only",
+        "feat_dict_key": "b_score(e)",
+        "objective": "regress_graph_native_node_score_with_centrality",
+        "replay_node_score_use_centrality": bool(cfg_pm.replay_node_score_use_centrality),
+        "cent_weights": {
+            "alpha": float(cfg_pm.replay_node_score_alpha),
+            "beta": float(cfg_pm.replay_node_score_beta),
+            "gamma": float(cfg_pm.replay_node_score_gamma),
+            "delta": float(cfg_pm.replay_node_score_delta),
+        },
+    }
+    return model, b_all, meta
+
+
+def _zscore_1d_nonconst(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    sd = float(np.std(x))
+    if sd < 1e-12:
+        return np.zeros_like(x, dtype=np.float64)
+    return (x - float(np.mean(x))) / sd
+
+
+def _all_pairs_shortest_paths_bfs(adj_list: list[list[int]]) -> np.ndarray:
+    """Unweighted APSP; D[i,j] = hop count or -1 if unreachable."""
+    m = len(adj_list)
+    d = np.full((m, m), -1, dtype=np.int32)
+    for s in range(m):
+        d[s, s] = 0
+        q = deque([s])
+        while q:
+            v = int(q.popleft())
+            dv = int(d[s, v])
+            for w in adj_list[v]:
+                w = int(w)
+                if d[s, w] < 0:
+                    d[s, w] = dv + 1
+                    q.append(w)
+    return d
+
+
+def _connected_components_from_adj(adj_list: list[list[int]]) -> np.ndarray:
+    n = len(adj_list)
+    comp = np.full(n, -1, dtype=np.int64)
+    cid = 0
+    for i in range(n):
+        if comp[i] >= 0:
+            continue
+        stack = [i]
+        comp[i] = cid
+        while stack:
+            v = int(stack.pop())
+            for w in adj_list[v]:
+                w = int(w)
+                if comp[w] < 0:
+                    comp[w] = cid
+                    stack.append(w)
+        cid += 1
+    return comp
+
+
+def _temporal_only_adj_local(
+    idx_global: np.ndarray,
+    episode_ids: np.ndarray,
+    adj_list: list[list[int]],
+) -> list[list[int]]:
+    """Subgraph of mixed replay graph keeping only same-episode consecutive-timestep edges."""
+    m = len(adj_list)
+    ep = np.asarray(episode_ids, dtype=np.int64)
+    sets = [set() for _ in range(m)]
+    for u_l in range(m):
+        u_g = int(idx_global[u_l])
+        for v_l in adj_list[u_l]:
+            v_l = int(v_l)
+            v_g = int(idx_global[v_l])
+            if abs(u_g - v_g) == 1 and int(ep[u_g]) == int(ep[v_g]):
+                sets[u_l].add(v_l)
+                sets[v_l].add(u_l)
+    return [sorted(s) for s in sets]
+
+
+def _kmeans_numpy(X: np.ndarray, k: int, rng: np.random.Generator, n_iter: int = 25) -> np.ndarray:
+    n, dim = X.shape
+    k = int(max(1, min(k, n)))
+    if k == 1 or n == 0:
+        return np.zeros(n, dtype=np.int64)
+    pick = rng.choice(n, size=k, replace=False)
+    centers = X[pick].copy().astype(np.float64)
+    lab = np.zeros(n, dtype=np.int64)
+    for _ in range(n_iter):
+        diff = X[:, None, :] - centers[None, :, :]
+        dist = np.sum(diff * diff, axis=-1)
+        lab = dist.argmin(axis=1).astype(np.int64)
+        for j in range(k):
+            m = lab == j
+            if np.any(m):
+                centers[j] = X[m].mean(axis=0)
+            else:
+                centers[j] = X[int(rng.integers(0, n))].astype(np.float64)
+    return lab
+
+
+def _spectral_community_labels(adj_list: list[list[int]], rng: np.random.Generator) -> np.ndarray:
+    """Replay-graph communities from normalized Laplacian eigenvectors + k-means (oracle-free)."""
+    m = len(adj_list)
+    if m < 4:
+        return np.zeros(m, dtype=np.int64)
+    a = np.zeros((m, m), dtype=np.float64)
+    for i, nei in enumerate(adj_list):
+        for j in nei:
+            jj = int(j)
+            if jj != i:
+                a[i, jj] = 1.0
+    deg = a.sum(axis=1)
+    inv_sqrt = np.zeros(m, dtype=np.float64)
+    nz = deg > 1e-12
+    inv_sqrt[nz] = 1.0 / np.sqrt(deg[nz])
+    d_inv = np.diag(inv_sqrt)
+    ln = np.eye(m, dtype=np.float64) - d_inv @ a @ d_inv
+    try:
+        _, evecs = np.linalg.eigh(ln)
+    except np.linalg.LinAlgError:
+        return np.zeros(m, dtype=np.int64)
+    n_evec = min(4, m - 2)
+    if n_evec < 1:
+        return np.zeros(m, dtype=np.int64)
+    x = evecs[:, 1 : 1 + n_evec].astype(np.float64)
+    k = int(max(2, min(8, int(round(np.sqrt(m))))))
+    return _kmeans_numpy(x, k=k, rng=rng)
+
+
+def _label_topology_edges(
+    idx_global: np.ndarray,
+    adj_list: list[list[int]],
+    episode_ids: np.ndarray,
+    encoder_emb: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    bottleneck_top_frac: float = 0.2,
+) -> Optional[np.ndarray]:
+    """Label mixed replay-graph edges (oracle-free for class 2).
+
+    0: temporal neighbor (same episode, consecutive timestep).
+    1: non-temporal, not in top bottleneck bundle.
+    2: replay-graph bottleneck — composite of z-scored signals on non-temporal edges only:
+       edge betweenness, articulation at endpoints, different temporal-only component,
+       different spectral community, encoder-near vs graph-far stress.
+    Class 2 is the top ``bottleneck_top_frac`` fraction of non-temporal edges by composite score.
+    """
+    edges = _mixed_graph_undirected_edges(adj_list)
+    if len(edges) < 8:
+        return None
+    m = len(adj_list)
+    idx_global = np.asarray(idx_global, dtype=np.int64)
+    ep = np.asarray(episode_ids, dtype=np.int64)
+    enc = np.asarray(encoder_emb, dtype=np.float32)
+
+    u_l = edges[:, 0].astype(np.int64)
+    v_l = edges[:, 1].astype(np.int64)
+    u_g = idx_global[u_l]
+    v_g = idx_global[v_l]
+    temporal = (np.abs(u_g - v_g) == 1) & (ep[u_g] == ep[v_g])
+
+    edge_bet = _edge_betweenness_brandes_undirected(adj_list)
+    ap = _articulation_points_undirected(adj_list)
+    adj_temp = _temporal_only_adj_local(idx_global, ep, adj_list)
+    comp_temp = _connected_components_from_adj(adj_temp)
+    spec_lab = _spectral_community_labels(adj_list, rng)
+    d_sp = _all_pairs_shortest_paths_bfs(adj_list)
+    x_sub = enc[idx_global]
+    enc_d = np.linalg.norm(x_sub[:, None, :] - x_sub[None, :, :], axis=-1).astype(np.float64)
+
+    n_e = len(edges)
+    a_l = u_l.astype(np.int64)
+    b_l = v_l.astype(np.int64)
+    ak = np.minimum(a_l, b_l)
+    bk = np.maximum(a_l, b_l)
+    eb_arr = np.array([float(edge_bet.get((int(ak[t]), int(bk[t])), 0.0)) for t in range(n_e)], dtype=np.float64)
+    art_arr = np.maximum(ap[a_l], ap[b_l]).astype(np.float64)
+    ct_arr = (comp_temp[a_l] != comp_temp[b_l]).astype(np.float64)
+    cs_arr = (spec_lab[a_l] != spec_lab[b_l]).astype(np.float64)
+    gd = d_sp[a_l, b_l].astype(np.float64)
+    ee = enc_d[a_l, b_l]
+    stress_arr = np.where(gd >= 0.0, np.log(gd + 1.0) - np.log(ee + 1e-6), 0.0).astype(np.float64)
+
+    nt_mask = ~temporal
+    nt_idx = np.flatnonzero(nt_mask)
+    if len(nt_idx) == 0:
+        return None
+
+    feat = np.stack(
+        [
+            eb_arr[nt_idx],
+            art_arr[nt_idx],
+            ct_arr[nt_idx],
+            cs_arr[nt_idx],
+            stress_arr[nt_idx],
+        ],
+        axis=1,
+    )
+    zfeat = np.stack([_zscore_1d_nonconst(feat[:, j]) for j in range(feat.shape[1])], axis=1)
+    composite = zfeat.mean(axis=1)
+
+    frac = float(np.clip(bottleneck_top_frac, 1e-6, 0.999))
+    n_nt = int(len(nt_idx))
+    k_top = max(1, int(round(frac * n_nt)))
+    order = np.argsort(-composite)
+    bot_nt = np.zeros(n_nt, dtype=bool)
+    bot_nt[order[:k_top]] = True
+
+    cls = np.ones(n_e, dtype=np.int64)
+    cls[temporal] = 0
+    cls[nt_idx[bot_nt]] = 2
+
+    rows = []
+    for t in range(n_e):
+        u = int(u_g[t])
+        v = int(v_g[t])
+        rows.append((u, v, int(cls[t])))
+    arr = np.asarray(rows, dtype=np.int64)
+    if len(arr) < 8:
+        return None
+    return arr
+
+
+def train_replay_edge_topology_head(
+    data: dict,
+    cfg_pm: PointMazeRunCfg,
+    device: torch.device,
+    seed: int,
+):
+    ep_ids = np.asarray(data["episode_ids"], dtype=np.int64)
+    encoder_emb = np.asarray(data.get("encoder_emb", None), dtype=np.float32)
+    if encoder_emb.ndim != 2 or len(ep_ids) != len(encoder_emb):
+        print("    replay_edge_topo_head: encoder_emb shape mismatch vs episode_ids.")
+        return None, None
+    idx_global, _, adj_list = _build_mixed_replay_graph(
+        encoder_emb,
+        ep_ids,
+        n_graph_max=int(cfg_pm.replay_graph_graph_max),
+        k_knn=int(cfg_pm.replay_graph_knn_k),
+    )
+    rng = np.random.default_rng(int(seed))
+    labeled = _label_topology_edges(
+        idx_global,
+        adj_list,
+        ep_ids,
+        encoder_emb,
+        rng,
+        bottleneck_top_frac=float(cfg_pm.replay_edge_topo_bottleneck_frac),
+    )
+    if labeled is None:
+        print("    replay_edge_topo_head: not enough labeled edges.")
+        return None, None
+
+    perm = rng.permutation(len(labeled))
+    n_val = min(
+        max(1, int(round(float(cfg_pm.replay_edge_topo_val_frac) * len(labeled)))),
+        len(labeled) - 1,
+    )
+    train_arr = labeled[perm[n_val:]]
+    val_arr = labeled[perm[:n_val]]
+
+    e_t = torch.tensor(encoder_emb, dtype=torch.float32, device=device)
+    model = ReplayEdgeTopoClassifier(
+        embed_dim=int(encoder_emb.shape[1]),
+        hidden_dim=int(cfg_pm.replay_edge_topo_hidden),
+        n_classes=3,
+    ).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+    epochs = int(max(2, cfg_pm.replay_edge_topo_epochs))
+    batch = int(min(max(32, cfg_pm.replay_edge_topo_batch), max(32, len(train_arr))))
+
+    def _loss(arr: np.ndarray):
+        ui = torch.tensor(arr[:, 0], dtype=torch.long, device=device)
+        vi = torch.tensor(arr[:, 1], dtype=torch.long, device=device)
+        yi = torch.tensor(arr[:, 2], dtype=torch.long, device=device)
+        logits = model(e_t[ui], e_t[vi])
+        return F.cross_entropy(logits, yi), logits, yi
+
+    best_val = float("inf")
+    best_state = None
+    for epoch in range(epochs):
+        model.train()
+        idx = rng.choice(len(train_arr), size=batch, replace=len(train_arr) < batch)
+        arr_b = train_arr[idx]
+        loss, _, _ = _loss(arr_b)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        with torch.no_grad():
+            model.eval()
+            vloss, vlogits, vy = _loss(val_arr)
+            if float(vloss.item()) < best_val:
+                best_val = float(vloss.item())
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            vacc = float((vlogits.argmax(dim=-1) == vy).float().mean().item())
+        if (epoch + 1) % max(1, epochs // 6) == 0:
+            print(
+                f"    replay_edge_topo epoch {epoch + 1}/{epochs}  "
+                f"train_ce={float(loss.item()):.4f}  val_ce={float(vloss.item()):.4f}  val_acc={vacc:.3f}"
+            )
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        _, logits_v, y_v = _loss(val_arr)
+        pred_v = logits_v.argmax(dim=-1)
+        val_acc = float((pred_v == y_v).float().mean().item())
+        cls_counts = np.bincount(val_arr[:, 2], minlength=3).astype(np.int64).tolist()
+
+    meta = {
+        "n_pairs_total": int(len(labeled)),
+        "n_pairs_train": int(len(train_arr)),
+        "n_pairs_val": int(len(val_arr)),
+        "epochs": int(epochs),
+        "batch": int(batch),
+        "best_val_ce": float(best_val),
+        "val_acc": float(val_acc),
+        "val_class_counts": cls_counts,
+        "labels": {
+            "0": "temporal_neighbor",
+            "1": "shortcut_like_non_temporal",
+            "2": "replay_graph_bottleneck_bundle",
+        },
+        "objective": "edge_topology_multiclass_ce_oracle_free",
+        "bottleneck_top_frac": float(cfg_pm.replay_edge_topo_bottleneck_frac),
+    }
+    return model, meta
 
 
 def _build_temporal_positive_table(
@@ -1341,6 +2455,74 @@ def plot_encoder_temporal_local_global_disagreement_heatmap(
     plt.close(fig)
 
 
+def plot_laplacian_kmeans_grid(
+    geodesic: GeodesicComputer,
+    pos: np.ndarray,
+    g_lap_feat: np.ndarray,
+    out_path: str,
+    n_clusters: int = 9,
+    seed: int = 0,
+) -> Optional[dict]:
+    """KMeans clusters on g_lap(e), then plot dominant cluster assignment per 8x8 grid cell."""
+    feat = np.asarray(g_lap_feat, dtype=np.float32)
+    if feat.ndim != 2 or len(feat) != len(pos):
+        return None
+
+    # Filter zero-padded entries (unselected nodes in post-hoc Laplacian embedding).
+    norms = np.linalg.norm(feat, axis=1)
+    valid_mask = norms > 1e-8
+    feat_valid = feat[valid_mask]
+    pos_valid = pos[valid_mask]
+
+    n_valid = int(len(feat_valid))
+    if n_valid < max(16, int(n_clusters) * 2):
+        print("    Not enough valid non-zero points for KMeans.")
+        return None
+    try:
+        from sklearn.cluster import KMeans  # type: ignore
+    except Exception:
+        print("    Skipping g_lap KMeans plot: scikit-learn not available.")
+        return None
+
+    k = int(max(2, n_clusters))
+    km = KMeans(n_clusters=k, random_state=int(seed), n_init=10)
+    labels = km.fit_predict(feat_valid).astype(np.int64)
+
+    cell_idx = _positions_to_cell_indices(geodesic, pos_valid)
+    n_free = int(geodesic.n_free)
+    counts = np.zeros((n_free, k), dtype=np.int64)
+    for c, lb in zip(cell_idx.tolist(), labels.tolist()):
+        counts[int(c), int(lb)] += 1
+    dom = np.argmax(counts, axis=1).astype(np.int64)
+    has_data = np.sum(counts, axis=1) > 0
+
+    gh, gw = len(geodesic.grid), len(geodesic.grid[0])
+    grid = np.full((gh, gw), np.nan, dtype=np.float32)
+    for idx, (r, c) in enumerate(geodesic.idx_to_cell):
+        if has_data[idx]:
+            grid[int(r), int(c)] = float(dom[idx])
+
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    cmap = plt.cm.get_cmap("tab10", k)
+    im = ax.imshow(grid, origin="upper", aspect="equal", cmap=cmap, vmin=-0.5, vmax=k - 0.5)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, ticks=np.arange(k))
+    cbar.set_label("KMeans cluster id (dominant per free cell)")
+    ax.set_title(f"g_lap(e) KMeans clusters on maze grid (k={k})")
+    ax.set_xlabel("grid col")
+    ax.set_ylabel("grid row")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+    return {
+        "kmeans_k": int(k),
+        "n_samples": int(len(feat)),
+        "n_samples_valid_nonzero": int(n_valid),
+        "n_cells_with_data": int(np.sum(has_data)),
+        "plot_path": str(out_path),
+    }
+
+
 def train_replay_topology_head(
     data: dict,
     cfg_pm: PointMazeRunCfg,
@@ -1763,6 +2945,59 @@ def run_replay_laplacian_eval(lap_meta: dict):
         "eigvals_used": lap_meta.get("eigvals_used", []),
         "feat_dict_key": str(lap_meta.get("feat_dict_key", "")),
         "objective": str(lap_meta.get("objective", "")),
+    }
+
+
+def run_replay_graph_eval(graph_meta: dict):
+    if graph_meta is None:
+        return None
+    return {
+        "n_graph_nodes": int(graph_meta.get("n_graph_nodes", 0)),
+        "n_edges": int(graph_meta.get("n_edges", 0)),
+        "n_edges_train": int(graph_meta.get("n_edges_train", 0)),
+        "n_edges_val": int(graph_meta.get("n_edges_val", 0)),
+        "n_classes": int(graph_meta.get("n_classes", 0)),
+        "epochs": int(graph_meta.get("epochs", 0)),
+        "batch_edges": int(graph_meta.get("batch_edges", 0)),
+        "best_val_total": graph_meta.get("best_val_total", None),
+        "input": str(graph_meta.get("input", "")),
+        "embed_dim": int(graph_meta.get("embed_dim", 0)),
+        "feat_dict_key": str(graph_meta.get("feat_dict_key", "")),
+        "objective": str(graph_meta.get("objective", "")),
+        "graph_knn_k": int(graph_meta.get("graph_knn_k", 0)),
+        "graph_max_nodes": int(graph_meta.get("graph_max_nodes", 0)),
+    }
+
+
+def run_replay_node_score_eval(node_meta: dict):
+    if node_meta is None:
+        return None
+    return {
+        "n_samples": int(node_meta.get("n_samples", 0)),
+        "epochs": int(node_meta.get("epochs", 0)),
+        "batch": int(node_meta.get("batch", 0)),
+        "best_val_mse": float(node_meta.get("best_val_mse", 0.0)),
+        "input": str(node_meta.get("input", "")),
+        "feat_dict_key": str(node_meta.get("feat_dict_key", "")),
+        "objective": str(node_meta.get("objective", "")),
+    }
+
+
+def run_replay_edge_topology_eval(edge_meta: dict):
+    if edge_meta is None:
+        return None
+    return {
+        "n_pairs_total": int(edge_meta.get("n_pairs_total", 0)),
+        "n_pairs_train": int(edge_meta.get("n_pairs_train", 0)),
+        "n_pairs_val": int(edge_meta.get("n_pairs_val", 0)),
+        "epochs": int(edge_meta.get("epochs", 0)),
+        "batch": int(edge_meta.get("batch", 0)),
+        "best_val_ce": float(edge_meta.get("best_val_ce", 0.0)),
+        "val_acc": float(edge_meta.get("val_acc", 0.0)),
+        "val_class_counts": edge_meta.get("val_class_counts", []),
+        "labels": edge_meta.get("labels", {}),
+        "objective": str(edge_meta.get("objective", "")),
+        "bottleneck_top_frac": float(edge_meta.get("bottleneck_top_frac", 0.2)),
     }
 
 

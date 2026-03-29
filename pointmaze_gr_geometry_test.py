@@ -286,7 +286,8 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     print("\n  [1/5] Training Dreamer world model ...")
     if cfg_pm.wm_path:
         print(f"    Resuming from world model checkpoint at {cfg_pm.wm_path}")
-        checkpoint = torch.load(cfg_pm.wm_path)
+        device = get_device()
+        checkpoint = torch.load(cfg_pm.wm_path, map_location=device)
         act_dim = env.action_space.shape[0]
         
         encoder = ConvEncoder(cfg.embed_dim).to(device)
@@ -651,34 +652,14 @@ def _adj_list_to_csr(adj, n: int) -> csr_matrix:
 
 
 def _build_and_solve_replay_graph(
-    local_feat: np.ndarray,
-    ep_ids: np.ndarray,
-    orig_idx: np.ndarray,
-    knn_k: int = 4,
-    cross_quantile: float = 0.05,
+    local_feat,
+    ep_ids,
+    orig_idx,
+    knn_k=4,
+    cross_quantile=0.05,
     *,
-    include_chart_knn: bool = True,
-    h_nodes: Optional[np.ndarray] = None,
-    s_nodes: Optional[np.ndarray] = None,
-    rssm: Optional[RSSM] = None,
-    actor: Optional[Actor] = None,
-    device: Optional[torch.device] = None,
-    imagination_max_steps: int = 20,
-    imagination_h_thresh: float = 0.0,
-    imagination_pair_batch: int = 512,
-    graph_tag: str = "",
+    include_chart_knn=True,
 ):
-    """
-    Weighted replay graph + all-pairs shortest paths.
-
-    Temporal edges use real timestep gaps (handles subsampling).
-
-    If include_chart_knn: mutual kNN in ``local_feat`` (chart), then keep an edge only
-    if the world model can imagine from i to j (or j to i) within ``imagination_max_steps``
-    with ||h_rollout - h_j|| below a threshold (oracle-free dynamics check).
-
-    Round 0 (bootstrap): set include_chart_knn=False for temporal-only graph.
-    """
     n = len(orig_idx)
     adj = lil_matrix((n, n), dtype=np.float32)
 
@@ -688,75 +669,24 @@ def _build_and_solve_replay_graph(
             adj[i, i + 1] = dt
             adj[i + 1, i] = dt
 
-    n_img_edges = 0
-    if include_chart_knn and n > 2 and int(knn_k) > 0:
-        if rssm is None or actor is None or device is None:
-            raise ValueError("RSSM, actor, and device required when include_chart_knn=True")
-        if h_nodes is None or s_nodes is None:
-            raise ValueError("h_nodes and s_nodes required when include_chart_knn=True")
-
-        h_nodes = np.asarray(h_nodes, dtype=np.float32)
-        s_nodes = np.asarray(s_nodes, dtype=np.float32)
-        thr_h = float(imagination_h_thresh) if float(imagination_h_thresh) > 0 else _auto_imagination_h_threshold(
-            h_nodes, ep_ids
-        )
-
-        d = _pairwise_l2(np.asarray(local_feat, dtype=np.float32))
+    if include_chart_knn and n > 2:
+        d = _pairwise_l2(local_feat)
         np.fill_diagonal(d, np.inf)
         finite_vals = d[np.isfinite(d)]
-        gate = float(np.quantile(finite_vals, float(cross_quantile))) if len(finite_vals) else float("inf")
-
-        k_use = int(min(max(1, int(knn_k)), n - 1))
+        gate = float(np.quantile(finite_vals, cross_quantile))
+        k_use = min(max(1, knn_k), n - 1)
         nn_idx = np.argsort(d, axis=1)[:, :k_use]
         nn_sets = [set(map(int, row)) for row in nn_idx]
-
-        candidates = []
         for i in range(n):
             for j in nn_idx[i]:
                 j = int(j)
-                if j <= i or float(d[i, j]) > gate:
+                if d[i, j] > gate:
                     continue
-                if i not in nn_sets[j]:
-                    continue
-                candidates.append((i, j))
+                if i in nn_sets[j]:   # mutual kNN only
+                    adj[i, j] = float(d[i, j])
+                    adj[j, i] = float(d[i, j])
 
-        if candidates:
-            rssm.eval()
-            actor.eval()
-            h_t = torch.tensor(h_nodes, dtype=torch.float32, device=device)
-            s_t = torch.tensor(s_nodes, dtype=torch.float32, device=device)
-            bs = int(max(32, imagination_pair_batch))
-            tag = f" ({graph_tag})" if graph_tag else ""
-            print(f"      Imagination-validating {len(candidates)} candidate kNN pairs{tag} ...")
-
-            for start in range(0, len(candidates), bs):
-                chunk = candidates[start : start + bs]
-                i_idx = torch.tensor([c[0] for c in chunk], device=device, dtype=torch.long)
-                j_idx = torch.tensor([c[1] for c in chunk], device=device, dtype=torch.long)
-                hi, si = h_t[i_idx], s_t[i_idx]
-                hj, sj = h_t[j_idx], s_t[j_idx]
-                d_ij = _batched_imagination_reach_steps(
-                    rssm, actor, hi, si, hj, imagination_max_steps, thr_h, device
-                )
-                d_ji = _batched_imagination_reach_steps(
-                    rssm, actor, hj, sj, hi, imagination_max_steps, thr_h, device
-                )
-                w = torch.minimum(d_ij, d_ji)
-                valid = w <= float(imagination_max_steps)
-                w_np = w.detach().cpu().numpy()
-                v_np = valid.detach().cpu().numpy()
-                for k in range(len(chunk)):
-                    if bool(v_np[k]):
-                        ii, jj = chunk[k]
-                        wt = float(w_np[k])
-                        adj[ii, jj] = wt
-                        adj[jj, ii] = wt
-                        n_img_edges += 1
-
-    msg_tag = f" [{graph_tag}]" if graph_tag else ""
-    print(f"      Solving weighted shortest paths via Dijkstra{msg_tag} (imagination_edges={n_img_edges})...")
-    dist_mat = shortest_path(csgraph=adj, directed=False, unweighted=False)
-    return dist_mat
+    return shortest_path(csgraph=adj, directed=False, unweighted=False)
 
 
 def _all_pairs_shortest_paths(adj):
@@ -890,15 +820,6 @@ def train_geo_encoder_replay_graph(
             knn_k=int(cfg_pm.replay_graph_knn),
             cross_quantile=float(cfg_pm.replay_graph_quantile),
             include_chart_knn=include_knn,
-            h_nodes=h_train,
-            s_nodes=s_train,
-            rssm=rssm,
-            actor=actor,
-            device=device,
-            imagination_max_steps=int(cfg_pm.replay_graph_imagination_max_steps),
-            imagination_h_thresh=float(cfg_pm.replay_graph_imagination_h_thresh),
-            imagination_pair_batch=int(cfg_pm.replay_imagination_pair_batch),
-            graph_tag=f"train_r{br}",
         )
 
         print(
@@ -978,15 +899,6 @@ def train_geo_encoder_replay_graph(
         knn_k=int(cfg_pm.replay_graph_knn),
         cross_quantile=float(cfg_pm.replay_graph_quantile),
         include_chart_knn=bool(n_rounds > 1),
-        h_nodes=h_test,
-        s_nodes=s_test,
-        rssm=rssm,
-        actor=actor,
-        device=device,
-        imagination_max_steps=int(cfg_pm.replay_graph_imagination_max_steps),
-        imagination_h_thresh=float(cfg_pm.replay_graph_imagination_h_thresh),
-        imagination_pair_batch=int(cfg_pm.replay_imagination_pair_batch),
-        graph_tag="test_final",
     )
 
     with torch.no_grad():
