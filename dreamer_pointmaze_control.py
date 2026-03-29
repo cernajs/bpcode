@@ -578,11 +578,13 @@ def run_periodic_eval(
     lens: list[int] = []
     uniques: list[float] = []
     bridges: list[float] = []
+    successes: list[float] = []
     for _ in range(int(n_episodes)):
         obs, _ = env.reset()
         done = False
         ep_ret = 0.0
         ep_steps = 0
+        ep_success = False
         cells: set[int] = set()
         pos_traj: list[np.ndarray] = []
         c0 = int(_positions_to_cell_indices(geodesic, env.agent_pos.reshape(1, -1))[0])
@@ -599,11 +601,13 @@ def run_periodic_eval(
         while not done:
             action_t, _ = actor.get_action(h_state, s_state, deterministic=True)
             action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
-            next_obs, r, term, trunc, _ = env.step(action, repeat=action_repeat)
+            next_obs, r, term, trunc, step_info = env.step(action, repeat=action_repeat)
             done = bool(term or trunc)
             obs = next_obs
             ep_ret += float(r)
             ep_steps += 1
+            if step_info.get("success", False) or step_info.get("is_success", False):
+                ep_success = True
             c = int(_positions_to_cell_indices(geodesic, env.agent_pos.reshape(1, -1))[0])
             cells.add(c)
             pos_traj.append(env.agent_pos.copy())
@@ -619,6 +623,7 @@ def run_periodic_eval(
         rets.append(ep_ret)
         lens.append(ep_steps)
         uniques.append(float(len(cells)))
+        successes.append(1.0 if ep_success else 0.0)
         if len(pos_traj) >= 2:
             bridges.append(float(_bridge_crossing_count(geodesic, np.stack(pos_traj, axis=0))))
         else:
@@ -629,6 +634,7 @@ def run_periodic_eval(
         "length_mean": float(np.mean(lens)),
         "unique_cells_mean": float(np.mean(uniques)),
         "bridge_crossings_mean": float(np.mean(bridges)),
+        "success_rate": float(np.mean(successes)),
     }
 
 
@@ -866,6 +872,9 @@ def main(args):
             obs = next_obs
             total_steps += 1
 
+    first_goal_step: int | None = None
+    cumulative_successes = 0
+
     print(f"Training {args.max_episodes} episodes  intrinsic={args.intrinsic}  reset={args.reset_mode}")
 
     for episode in range(args.max_episodes):
@@ -873,6 +882,7 @@ def main(args):
         done = False
         ep_ret = 0.0
         ep_steps = 0
+        ep_success = False
         ep_cells: set[int] = set()
         ep_pos_traj: list[np.ndarray] = []
         if args.log_coverage:
@@ -906,7 +916,7 @@ def main(args):
                     action_t = torch.clamp(action_t, -1.0, 1.0)
                 action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
 
-            next_obs, r, term, trunc, _ = env.step(action, repeat=action_repeat)
+            next_obs, r, term, trunc, step_info = env.step(action, repeat=action_repeat)
             done = bool(term or trunc)
             replay.add(
                 obs=np.ascontiguousarray(obs, dtype=np.uint8),
@@ -919,6 +929,8 @@ def main(args):
             ep_ret += float(r)
             ep_steps += 1
             total_steps += 1
+            if step_info.get("success", False) or step_info.get("is_success", False):
+                ep_success = True
 
             if args.log_coverage:
                 c = int(_positions_to_cell_indices(geodesic, env.agent_pos.reshape(1, -1))[0])
@@ -1131,8 +1143,17 @@ def main(args):
         if args.expl_decay > 0:
             expl_amount = max(args.expl_min, expl_amount - args.expl_decay)
 
+        if ep_success:
+            cumulative_successes += 1
+            if first_goal_step is None:
+                first_goal_step = total_steps
+                writer.add_scalar("eval/first_goal_env_step", float(first_goal_step), 0)
+                print(f"  *** First goal reached at env step {first_goal_step}, episode {episode+1}")
+
         writer.add_scalar("train/episode_return", ep_ret, episode)
         writer.add_scalar("episode/return_env_step", ep_ret, total_steps)
+        writer.add_scalar("train/episode_success", 1.0 if ep_success else 0.0, episode)
+        writer.add_scalar("train/success_rate", float(cumulative_successes) / float(episode + 1), episode)
         if args.log_coverage:
             writer.add_scalar("eval/unique_cells_episode", float(len(ep_cells)), episode)
             if len(ep_pos_traj) >= 2:
@@ -1163,10 +1184,11 @@ def main(args):
             writer.add_scalar("eval/length_mean", ev["length_mean"], total_steps)
             writer.add_scalar("eval/unique_cells_mean", ev["unique_cells_mean"], total_steps)
             writer.add_scalar("eval/bridge_crossings_mean", ev["bridge_crossings_mean"], total_steps)
+            writer.add_scalar("eval/success_rate", ev["success_rate"], total_steps)
             print(
                 f"  [eval] return={ev['return_mean']:.2f}±{ev['return_std']:.2f}  "
                 f"len={ev['length_mean']:.1f}  unique_cells={ev['unique_cells_mean']:.1f}  "
-                f"bridges={ev['bridge_crossings_mean']:.2f}"
+                f"bridges={ev['bridge_crossings_mean']:.2f}  success={ev['success_rate']:.2f}"
             )
 
     env.close()
