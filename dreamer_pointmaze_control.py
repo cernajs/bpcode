@@ -842,7 +842,7 @@ def main(args):
             bottleneck_frac=args.bottleneck_frac,
         )
 
-    writer = SummaryWriter(f"{args.log_dir}/{args.run_name}_seed{args.seed}")
+    writer = SummaryWriter(f"{args.log_dir}/{args.run_name}_intrinsic_{args.intrinsic}_seed{args.seed}")
     writer.add_text("hyperparameters", str(vars(args)), 0)
 
     total_steps = 0
