@@ -1255,37 +1255,57 @@ def _edge_betweenness_push_to_nodes(adj: list[list[int]], edge_tot: dict[tuple[i
 
 
 def _articulation_points_undirected(adj: list[list[int]]) -> np.ndarray:
-    """Tarjan articulation flags per node (0/1)."""
+    """Tarjan articulation flags per node (0/1). Iterative to avoid stack overflow."""
     n = len(adj)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
     visited = [False] * n
     tin = [0] * n
     low = [0] * n
-    timer = 0
+    parent = [-1] * n
+    children = [0] * n
     ap = [False] * n
+    timer = 0
+    nei_idx = [0] * n
 
-    def dfs(v: int, p: int) -> None:
-        nonlocal timer
-        visited[v] = True
-        tin[v] = low[v] = timer
+    for root in range(n):
+        if visited[root]:
+            continue
+        stack = [root]
+        visited[root] = True
+        tin[root] = low[root] = timer
         timer += 1
-        children = 0
-        for to in adj[v]:
-            if to == p:
-                continue
-            if visited[to]:
-                low[v] = min(low[v], tin[to])
-            else:
-                dfs(int(to), v)
-                low[v] = min(low[v], low[int(to)])
-                if low[int(to)] >= tin[v] and p != -1:
-                    ap[v] = True
-                children += 1
-        if p == -1 and children > 1:
-            ap[v] = True
+        nei_idx[root] = 0
+        children[root] = 0
 
-    for i in range(n):
-        if not visited[i]:
-            dfs(i, -1)
+        while stack:
+            v = stack[-1]
+            if nei_idx[v] < len(adj[v]):
+                to = int(adj[v][nei_idx[v]])
+                nei_idx[v] += 1
+                if to == parent[v]:
+                    continue
+                if visited[to]:
+                    low[v] = min(low[v], tin[to])
+                else:
+                    parent[to] = v
+                    visited[to] = True
+                    tin[to] = low[to] = timer
+                    timer += 1
+                    nei_idx[to] = 0
+                    children[to] = 0
+                    stack.append(to)
+            else:
+                stack.pop()
+                if stack:
+                    p = parent[v]
+                    low[p] = min(low[p], low[v])
+                    children[p] += 1
+                    if parent[p] != -1 and low[v] >= tin[p]:
+                        ap[p] = True
+                    if parent[p] == -1 and children[p] > 1:
+                        ap[p] = True
+
     return np.asarray(ap, dtype=np.float32)
 
 
