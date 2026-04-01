@@ -270,6 +270,8 @@ class TopologyControlModule:
         node_epochs: int = 40,
         edge_epochs: int = 40,
         bottleneck_frac: float = 0.2,
+        warmup_steps: int = 500,
+        node_mse_threshold: float = 0.25,
     ):
         self.device = device
         self.deter_dim = int(deter_dim)
@@ -286,6 +288,17 @@ class TopologyControlModule:
         self.node_epochs = int(node_epochs)
         self.edge_epochs = int(edge_epochs)
         self.bottleneck_frac = float(bottleneck_frac)
+
+        # Warm-up: don't activate until the buffer has enough diverse experience
+        # and the first node refit produces a reasonable MSE.
+        self.warmup_steps: int = int(warmup_steps)
+        self.node_mse_threshold: float = float(node_mse_threshold)
+
+        # Running EMA of |extrinsic reward| in imagination, used to adaptively
+        # scale r_int so the intrinsic signal stays at a stable fraction of
+        # extrinsic reward across training (prevents fading to irrelevance).
+        self._ema_extrinsic: float = 1.0
+        self._ema_alpha: float = 0.005  # slow EMA
 
         self.b_head_e = ReplayNodeScoreHead(self.embed_dim, self.hidden).to(device)
         self.edge_head_e = ReplayEdgeTopoClassifier(self.embed_dim, self.hidden, n_classes=3).to(device)
@@ -336,7 +349,7 @@ class TopologyControlModule:
     def refit(self, seed: int) -> None:
         rng = np.random.default_rng(int(seed))
         n = len(self._episode_ids)
-        if n < 64:
+        if n < self.warmup_steps:
             self._ready_node = False
             self._ready_edge = False
             return
@@ -391,22 +404,32 @@ class TopologyControlModule:
             self.b_head_e.eval()
             self.tb_last_node_loss = float(np.mean(losses)) if losses else None
 
-            with torch.no_grad():
-                b_t = self.b_head_e(e_t).detach()
+            # Only promote to ready if the first refit produces a useful signal.
+            # best_loss is val MSE; if it's above threshold the b target is still
+            # too noisy to shape the actor reliably (fixes node_seed42 collapse).
+            if best_loss > self.node_mse_threshold:
+                self._ready_node = False
+                self.tb_last_node_loss = best_loss  # still log for debugging
+                # Skip distillation — don't propagate garbage into b_head_hs
+            else:
+                with torch.no_grad():
+                    b_t = self.b_head_e(e_t).detach()
 
-            self.b_head_hs.train()
-            for _ in range(self.distill_steps):
-                idx = rng.integers(0, n, size=min(512, n))
-                hi = torch.tensor(h_np[idx], dtype=torch.float32, device=self.device)
-                si = torch.tensor(s_np[idx], dtype=torch.float32, device=self.device)
-                pred = self.b_head_hs(hi, si)
-                loss = F.mse_loss(pred, b_t[idx])
-                self.opt_b_hs.zero_grad(set_to_none=True)
-                loss.backward()
-                self.opt_b_hs.step()
-            self.b_head_hs.eval()
+                self.b_head_hs.train()
+                for _ in range(self.distill_steps):
+                    idx = rng.integers(0, n, size=min(512, n))
+                    hi = torch.tensor(h_np[idx], dtype=torch.float32, device=self.device)
+                    si = torch.tensor(s_np[idx], dtype=torch.float32, device=self.device)
+                    pred = self.b_head_hs(hi, si)
+                    loss = F.mse_loss(pred, b_t[idx])
+                    self.opt_b_hs.zero_grad(set_to_none=True)
+                    loss.backward()
+                    self.opt_b_hs.step()
+                self.b_head_hs.eval()
 
-        self._ready_node = self.intrinsic_mode in ("novelty", "node", "both")
+        self._ready_node = self.intrinsic_mode in ("novelty", "node", "both") and (
+            not hasattr(self, "_node_mse_ok") or self._node_mse_ok
+        )
 
         # --- edge classifier + distill ---
         edge_ok = False
@@ -478,6 +501,13 @@ class TopologyControlModule:
 
         self._ready_edge = edge_ok
 
+    def update_extrinsic_ema(self, mean_abs_extrinsic: float) -> None:
+        """Call once per train step with mean(|r_extrinsic|) from the imagination batch."""
+        self._ema_extrinsic = (
+            (1.0 - self._ema_alpha) * self._ema_extrinsic
+            + self._ema_alpha * max(float(mean_abs_extrinsic), 1e-4)
+        )
+
     def imagination_intrinsic(
         self,
         h_imag: torch.Tensor,
@@ -485,7 +515,6 @@ class TopologyControlModule:
         lambda_b: float,
         lambda_e: float,
     ) -> torch.Tensor:
-        """r_int[b,t] for t in 0..H-1 matching transitions (t,t+1)."""
         B, Hp1, Dh = h_imag.shape
         Ds = s_imag.size(-1)
         H = Hp1 - 1
@@ -495,23 +524,59 @@ class TopologyControlModule:
 
         self.b_head_hs.eval()
         self.edge_head_hs.eval()
+
+        # Adaptive scale: keep r_int at ~10% of |extrinsic| throughout training.
+        target_fraction = 0.10
+        adapt_scale = float(self._ema_extrinsic) * target_fraction
+
         with torch.no_grad():
             r = torch.zeros((B, H), device=device, dtype=torch.float32)
+            b_scores: torch.Tensor | None = None
+
+            # --- Node: approach bonus ---
+            # ReLU(Δb): positive only when moving TOWARD a high-b state.
+            # Zero when hovering (Δb ≈ 0), zero when crossing away (Δb < 0).
+            # This eliminates the fixed-point attractor at bridge peaks.
             if (
                 self._ready_node
                 and self.intrinsic_mode in ("novelty", "node", "both")
                 and lambda_b > 0
             ):
-                b = self.b_head_hs(h_imag, s_imag)
-                r = r + float(lambda_b) * (b[:, 1:] - b[:, :-1])
+                b = self.b_head_hs(
+                    h_imag.reshape(-1, Dh), s_imag.reshape(-1, Ds)
+                ).reshape(B, Hp1)
+                b_scores = b
+                delta_b = b[:, 1:] - b[:, :-1]          # [B, H]
+                r_node = F.relu(delta_b)                  # approach-only
+                # Normalise per batch so magnitude is predictable, then rescale
+                r_node_scale = r_node.abs().mean().clamp(min=1e-6)
+                r = r + float(lambda_b) * adapt_scale * r_node / r_node_scale
+
+            # --- Edge: crossing bonus ---
+            # P(bottleneck) * ReLU(-Δb): fires when the classifier sees a
+            # bottleneck edge AND b is decreasing (agent exited the bridge on
+            # the far side).  This turns the edge signal from an oscillation
+            # trap into a genuine crossing bonus.
             if self._ready_edge and self.intrinsic_mode in ("edge", "both") and lambda_e > 0:
                 h_i = h_imag[:, :-1].reshape(-1, Dh)
                 s_i = s_imag[:, :-1].reshape(-1, Ds)
                 h_j = h_imag[:, 1:].reshape(-1, Dh)
                 s_j = s_imag[:, 1:].reshape(-1, Ds)
                 logits = self.edge_head_hs(h_i, s_i, h_j, s_j)
-                p_bot = F.softmax(logits, dim=-1)[:, 2].view(B, H)
-                r = r + float(lambda_e) * p_bot
+                p_bot = F.softmax(logits, dim=-1)[:, 2].view(B, H)  # P(class=bottleneck)
+
+                if b_scores is not None:
+                    # Crossing condition: at a bottleneck AND b decreasing (exiting)
+                    delta_b = b_scores[:, 1:] - b_scores[:, :-1]
+                    r_edge = p_bot * F.relu(-delta_b)
+                else:
+                    # Edge-only mode: no b_scores available; use raw p_bot but
+                    # subtract mean to avoid always-on constant bonus
+                    r_edge = p_bot - p_bot.mean()
+
+                r_edge_scale = r_edge.abs().mean().clamp(min=1e-6)
+                r = r + float(lambda_e) * adapt_scale * r_edge / r_edge_scale
+
         return r
 
 
@@ -714,6 +779,18 @@ def build_parser():
     p.add_argument("--topo_edge_epochs", type=int, default=40)
     p.add_argument("--topo_edge_batch", type=int, default=256)
     p.add_argument("--bottleneck_frac", type=float, default=0.2)
+    p.add_argument(
+        "--topo_warmup_steps",
+        type=int,
+        default=500,
+        help="Min replay timesteps in topo buffer before activating intrinsic reward.",
+    )
+    p.add_argument(
+        "--topo_node_mse_threshold",
+        type=float,
+        default=0.25,
+        help="First refit node MSE must be below this before b_head_hs is used.",
+    )
 
     p.add_argument("--wm_path", type=str, default="")
     p.add_argument("--log_dir", type=str, default="runs")
@@ -846,9 +923,11 @@ def main(args):
             node_epochs=args.topo_node_epochs,
             edge_epochs=args.topo_edge_epochs,
             bottleneck_frac=args.bottleneck_frac,
+            warmup_steps=args.topo_warmup_steps,
+            node_mse_threshold=args.topo_node_mse_threshold,
         )
 
-    writer = SummaryWriter(f"{args.log_dir}/{args.run_name}_intrinsic_{args.intrinsic}_seed{args.seed}")
+    writer = SummaryWriter(f"{args.log_dir}/{args.run_name}_fixed_intrinsic_{args.intrinsic}_seed{args.seed}")
     writer.add_text("hyperparameters", str(vars(args)), 0)
 
     total_steps = 0
@@ -1029,7 +1108,23 @@ def main(args):
                     Ds = s_seq.size(-1)
                     if args.imagination_starts and 0 < args.imagination_starts < T_seq:
                         K = args.imagination_starts
-                        t_idx = torch.randint(0, T_seq, (B_seq, K), device=device)
+                        # b-weighted start sampling: focus imagination on
+                        # topologically rich states (high b-score) rather than
+                        # uniform random timesteps.  This improves actor/value
+                        # training in bottleneck regions WITHOUT adding r_int to
+                        # the reward, so it doesn't create hovering incentives.
+                        if topo_mod is not None and topo_mod._ready_node:
+                            with torch.no_grad():
+                                h_flat = h_seq.reshape(-1, Dh)
+                                s_flat = s_seq.reshape(-1, Ds)
+                                b_flat = topo_mod.b_head_hs(h_flat, s_flat)   # [B*T]
+                                b_grid = b_flat.reshape(B_seq, T_seq)
+                                # Temperature-scaled softmax: temperature=3 keeps
+                                # diversity while upweighting high-b states.
+                                w = F.softmax(b_grid * 3.0, dim=1)            # [B, T]
+                                t_idx = torch.multinomial(w, K, replacement=True)  # [B, K]
+                        else:
+                            t_idx = torch.randint(0, T_seq, (B_seq, K), device=device)
                         h_start = h_seq.gather(1, t_idx.unsqueeze(-1).expand(-1, -1, Dh)).reshape(-1, Dh).detach()
                         s_start = s_seq.gather(1, t_idx.unsqueeze(-1).expand(-1, -1, Ds)).reshape(-1, Ds).detach()
                     else:
@@ -1060,6 +1155,9 @@ def main(args):
                     if topo_mod is None:
                         r_int = torch.zeros_like(rewards_imag)
                     else:
+                        # Keep the EMA of |extrinsic| updated so imagination_intrinsic
+                        # can adaptively scale r_int relative to the task reward.
+                        topo_mod.update_extrinsic_ema(float(rewards_imag.abs().mean().item()))
                         r_int = topo_mod.imagination_intrinsic(h_imag, s_imag, args.lambda_b, args.lambda_e)
 
                     rewards_total = rewards_imag + r_int
@@ -1128,6 +1226,8 @@ def main(args):
                 if topo_mod:
                     writer.add_scalar("topo/ready_node", 1.0 if topo_mod._ready_node else 0.0, total_steps)
                     writer.add_scalar("topo/ready_edge", 1.0 if topo_mod._ready_edge else 0.0, total_steps)
+                    writer.add_scalar("topo/buffer_n", float(len(topo_mod._episode_ids)), total_steps)
+                    writer.add_scalar("topo/ema_extrinsic", float(topo_mod._ema_extrinsic), total_steps)
                 if topo_mod and topo_mod.tb_last_node_loss is not None:
                     writer.add_scalar("topo/node_train_mse", topo_mod.tb_last_node_loss, total_steps)
                 if topo_mod and topo_mod.tb_last_edge_loss is not None:
