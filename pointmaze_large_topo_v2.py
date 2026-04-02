@@ -1815,7 +1815,7 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
     else:
         models = train_world_model(env, cfg, device)
         wm_path = os.path.join(out_dir, "world_model.pt")
-        torch.save({k: m.state_dict() for k, m in models.items()}, wm_path)
+        torch.save({k: m.state_dict() for k, m in models.items() if m is not None}, wm_path)
         print(f"    Saved world model to {wm_path}")
 
     # [2] Data collection
