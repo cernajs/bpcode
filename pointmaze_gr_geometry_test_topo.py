@@ -21,7 +21,7 @@ import argparse
 import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -415,6 +415,7 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     node_score_head = None
     b_score_all = None
     node_score_meta = None
+    b_score_components: dict[str, np.ndarray] | None = None
     edge_topo_head = None
     edge_topo_meta = None
     if bool(cfg_pm.replay_topology):
@@ -479,7 +480,7 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
             print("    Skipping node-score head: encoder_emb missing from replay data.")
         else:
             print("    Training b(e) to predict graph-native node score ...")
-            node_score_head, b_score_all, node_score_meta = train_replay_node_score_head(
+            node_score_head, b_score_all, node_score_meta, b_score_components = train_replay_node_score_head(
                 data=data,
                 cfg_pm=cfg_pm,
                 device=device,
@@ -517,11 +518,17 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     if b_score_all is not None:
         # Keep scalar score semantics but expose 2D for downstream PCA plotting.
         feat_dict["b_score(e)"] = np.concatenate([b_score_all, np.zeros_like(b_score_all)], axis=1)
+    if b_score_components is not None:
+        for cname, arr in b_score_components.items():
+            zcol = np.asarray(arr, dtype=np.float32).reshape(-1, 1)
+            feat_dict[f"b_{cname}(e)"] = np.concatenate([zcol, np.zeros_like(zcol)], axis=1)
 
     probe_res = run_probes(pos, feat_dict, cfg, device, episode_ids=episode_ids)
-    dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg)
-    knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg)
-    tc_res = run_trustworthiness_continuity(pos, feat_dict, env.geodesic, cfg, k=cfg.knn_k)
+    dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
+    knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
+    tc_res = run_trustworthiness_continuity(
+        pos, feat_dict, env.geodesic, cfg, k=cfg.knn_k, device=device
+    )
 
     # Directed / controllability geometry from replay transitions
     directed_geo_res = run_directed_geometry_analysis(data, env.geodesic)
@@ -537,6 +544,23 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
     metric_mismatch_res = run_metric_class_mismatch(
         data, feat_dict, env.geodesic, cfg
     )
+
+    b_score_components_report = _collect_b_score_component_metrics(
+        node_score_meta,
+        probe_res,
+        dist_res,
+        knn_res,
+        tc_res,
+        metric_mismatch_res,
+    )
+    if b_score_components_report is not None:
+        print("    b_score per-signal probes (linear / MLP R² → position):")
+        for k in ("novelty", "disagreement", "uncertainty", "centrality"):
+            pr = (b_score_components_report["per_signal"].get(k) or {}).get("probes") or {}
+            print(
+                f"      b_{k}(e): linear_R2={pr.get('linear_R2')}  mlp_R2={pr.get('mlp_R2')}"
+            )
+        print("    Full tables: metrics.json → b_score_components")
 
     print("\n  [5/5] Generating plots ...")
     generate_plots(
@@ -583,6 +607,7 @@ def run_single_pointmaze(cfg_pm: PointMazeRunCfg):
         "replay_laplacian_kmeans_eval": lap_kmeans_meta,
         "replay_graph_eval": run_replay_graph_eval(graph_meta),
         "replay_node_score_eval": run_replay_node_score_eval(node_score_meta),
+        "b_score_components": b_score_components_report,
         "replay_edge_topology_eval": run_replay_edge_topology_eval(edge_topo_meta),
     }
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
@@ -1346,18 +1371,24 @@ def _build_cell_centrality_bundle(
     return np.mean(np.stack(parts, axis=0), axis=0).astype(np.float32)
 
 
-def _build_graph_native_node_scores(
+def _build_graph_native_node_scores_and_components(
     encoder_emb: np.ndarray,
     pos: np.ndarray,
     episode_ids: np.ndarray,
     geodesic: GeodesicComputer,
     rng: np.random.Generator,
     cfg_pm: Optional[PointMazeRunCfg] = None,
-) -> np.ndarray:
-    """Compose b(v) = α·novelty + β·disagreement + γ·uncertainty + δ·centrality (each term z-scored).
+) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, float]]:
+    """Compute z-scored novelty, disagreement, uncertainty, centrality and the weighted combined b(v).
 
-    Centrality averages z-scored: node betweenness on the cell replay graph, edge-betweenness mass on
-    incident nodes, articulation on that graph, and oracle bridge-endpoint indicator (community cut).
+    Always computes all four z-scored terms for logging / ablations. The combined score respects
+    cfg weights and ``replay_node_score_use_centrality`` (centrality omitted from the blend when
+    disabled or δ=0).
+
+    Returns:
+        combined_score: training target for ReplayNodeScoreHead
+        components: keys ``novelty``, ``disagreement``, ``uncertainty``, ``centrality`` (z-scored)
+        summary: flat stats (means, stds, fractions nonzero) for JSON logs
     """
     n = int(len(encoder_emb))
     alpha = beta = gamma = delta = 1.0
@@ -1412,19 +1443,57 @@ def _build_graph_native_node_scores(
     disc_z = _zscore_safe(disc_all)
     unc_z = _zscore_safe(uncert)
 
+    cent_z = np.zeros(n, dtype=np.float32)
+    cent_cell = _build_cell_centrality_bundle(pos, episode_ids, geodesic)
+    if cent_cell.size == n_free:
+        cent_timestep = cent_cell[cell_idx.astype(np.int64)]
+        cent_z = _zscore_safe(cent_timestep)
+
+    components: dict[str, np.ndarray] = {
+        "novelty": nov_z.astype(np.float32),
+        "disagreement": disc_z.astype(np.float32),
+        "uncertainty": unc_z.astype(np.float32),
+        "centrality": cent_z.astype(np.float32),
+    }
+
+    summary: dict[str, float] = {}
+    for name, arr in components.items():
+        summary[f"{name}_mean"] = float(np.mean(arr))
+        summary[f"{name}_std"] = float(np.std(arr))
+        summary[f"{name}_frac_abs_gt_1e-8"] = float(np.mean(np.abs(arr) > 1e-8))
+
     if use_cent and delta != 0.0:
-        cent_cell = _build_cell_centrality_bundle(pos, episode_ids, geodesic)
-        if cent_cell.size != n_free:
-            cent_z = np.zeros(n, dtype=np.float32)
-        else:
-            cent_timestep = cent_cell[cell_idx.astype(np.int64)]
-            cent_z = _zscore_safe(cent_timestep)
         denom = max(1e-8, alpha + beta + gamma + delta)
         score = (alpha * nov_z + beta * disc_z + gamma * unc_z + delta * cent_z) / denom
     else:
         denom = max(1e-8, alpha + beta + gamma)
         score = (alpha * nov_z + beta * disc_z + gamma * unc_z) / denom
-    return score.astype(np.float32)
+
+    summary["combined_target_mean"] = float(np.mean(score))
+    summary["combined_target_std"] = float(np.std(score))
+    summary["combined_denom_terms"] = float(denom)
+    summary["centrality_included_in_target"] = float(1.0 if (use_cent and delta != 0.0) else 0.0)
+
+    return score.astype(np.float32), components, summary
+
+
+def _build_graph_native_node_scores(
+    encoder_emb: np.ndarray,
+    pos: np.ndarray,
+    episode_ids: np.ndarray,
+    geodesic: GeodesicComputer,
+    rng: np.random.Generator,
+    cfg_pm: Optional[PointMazeRunCfg] = None,
+) -> np.ndarray:
+    """Compose b(v) = α·novelty + β·disagreement + γ·uncertainty + δ·centrality (each term z-scored).
+
+    Centrality averages z-scored: node betweenness on the cell replay graph, edge-betweenness mass on
+    incident nodes, articulation on that graph, and oracle bridge-endpoint indicator (community cut).
+    """
+    score, _, _ = _build_graph_native_node_scores_and_components(
+        encoder_emb, pos, episode_ids, geodesic, rng, cfg_pm
+    )
+    return score
 
 
 def train_replay_node_score_head(
@@ -1439,15 +1508,35 @@ def train_replay_node_score_head(
     encoder_emb = np.asarray(data.get("encoder_emb", None), dtype=np.float32)
     if encoder_emb.ndim != 2 or len(ep_ids) != len(encoder_emb):
         print("    replay_node_score_head: encoder_emb shape mismatch vs episode_ids.")
-        return None, None, None
+        return None, None, None, None
     n = int(len(encoder_emb))
     if n < 16:
-        return None, None, None
+        return None, None, None, None
 
     rng = np.random.default_rng(int(seed))
-    target_np = _build_graph_native_node_scores(encoder_emb, pos, ep_ids, geodesic, rng, cfg_pm)
+    target_np, components, component_summary = _build_graph_native_node_scores_and_components(
+        encoder_emb, pos, ep_ids, geodesic, rng, cfg_pm
+    )
     e_t = torch.tensor(encoder_emb, dtype=torch.float32, device=device)
     y_t = torch.tensor(target_np, dtype=torch.float32, device=device)
+
+    idx_all = np.arange(n, dtype=np.int64)
+    component_bridge_sanity: dict[str, dict] = {}
+    for cname, arr in components.items():
+        component_bridge_sanity[cname] = _bridge_sanity_for_conflict_scores(
+            geodesic, pos, idx_all, np.asarray(arr, dtype=np.float32)
+        )
+    print("    b_score target components (z-scored, oracle bridge sanity top_frac=0.15):")
+    for cname in ("novelty", "disagreement", "uncertainty", "centrality"):
+        bs = component_bridge_sanity.get(cname, {})
+        topf = bs.get("top_cells_bridge_frac", None)
+        mb = bs.get("mean_score_bridge", None)
+        mn = bs.get("mean_score_nonbridge", None)
+        print(
+            f"      {cname:14s}  mean={component_summary.get(cname + '_mean', 0):.4f}  "
+            f"std={component_summary.get(cname + '_std', 0):.4f}  "
+            f"bridge_mean={mb}  nonbridge_mean={mn}  top_cells_bridge_frac={topf}"
+        )
 
     perm = rng.permutation(n)
     n_val = min(max(1, int(round(float(cfg_pm.replay_node_score_val_frac) * n))), n - 1)
@@ -1508,8 +1597,10 @@ def train_replay_node_score_head(
             "gamma": float(cfg_pm.replay_node_score_gamma),
             "delta": float(cfg_pm.replay_node_score_delta),
         },
+        "component_summary": component_summary,
+        "component_bridge_sanity": component_bridge_sanity,
     }
-    return model, b_all, meta
+    return model, b_all, meta, components
 
 
 def _zscore_1d_nonconst(x: np.ndarray) -> np.ndarray:
@@ -2989,10 +3080,40 @@ def run_replay_graph_eval(graph_meta: dict):
     }
 
 
+def _collect_b_score_component_metrics(
+    node_meta: Optional[dict],
+    probe_res: dict,
+    dist_res: dict,
+    knn_res: dict,
+    tc_res: dict,
+    metric_mismatch_res: dict,
+) -> Optional[dict[str, Any]]:
+    """Aggregate per-signal b(·) targets into one JSON-friendly report for ablation decisions."""
+    if node_meta is None:
+        return None
+    keys = ("novelty", "disagreement", "uncertainty", "centrality")
+    per_signal: dict[str, dict[str, Any]] = {}
+    for k in keys:
+        fk = f"b_{k}(e)"
+        per_signal[k] = {
+            "probes": probe_res.get(fk) if probe_res else None,
+            "distances": dist_res.get(fk) if dist_res else None,
+            "knn": knn_res.get(fk) if knn_res else None,
+            "trust_cont": tc_res.get(fk) if tc_res else None,
+            "metric_class_mismatch": metric_mismatch_res.get(fk) if metric_mismatch_res else None,
+        }
+    return {
+        "component_summary": node_meta.get("component_summary"),
+        "component_bridge_sanity": node_meta.get("component_bridge_sanity"),
+        "cent_weights": node_meta.get("cent_weights"),
+        "per_signal": per_signal,
+    }
+
+
 def run_replay_node_score_eval(node_meta: dict):
     if node_meta is None:
         return None
-    return {
+    out = {
         "n_samples": int(node_meta.get("n_samples", 0)),
         "epochs": int(node_meta.get("epochs", 0)),
         "batch": int(node_meta.get("batch", 0)),
@@ -3001,6 +3122,11 @@ def run_replay_node_score_eval(node_meta: dict):
         "feat_dict_key": str(node_meta.get("feat_dict_key", "")),
         "objective": str(node_meta.get("objective", "")),
     }
+    if node_meta.get("component_summary") is not None:
+        out["component_summary"] = node_meta["component_summary"]
+    if node_meta.get("component_bridge_sanity") is not None:
+        out["component_bridge_sanity"] = node_meta["component_bridge_sanity"]
+    return out
 
 
 def run_replay_edge_topology_eval(edge_meta: dict):
