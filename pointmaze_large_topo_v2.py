@@ -1841,6 +1841,9 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
         for m in models.values():
             m.eval()
     else:
+        cfg.max_episodes = 200
+        cfg.collect_interval = 100
+        cfg.train_steps = 60
         models = train_world_model(env, cfg, device)
         wm_path = os.path.join(out_dir, "world_model.pt")
         torch.save({k: m.state_dict() for k, m in models.items() if m is not None}, wm_path)
