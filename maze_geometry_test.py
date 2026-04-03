@@ -715,6 +715,25 @@ def _train_probe(probe, X_train, Y_train, X_test, Y_test, device, epochs=1500, l
     return r2
 
 
+def _use_gpu_for_analysis(device: Optional[torch.device]) -> bool:
+    return device is not None and device.type != "cpu"
+
+
+def _latent_indexed_l2(
+    feat: np.ndarray,
+    i1: np.ndarray,
+    i2: np.ndarray,
+    device: Optional[torch.device] = None,
+) -> np.ndarray:
+    """Pairwise L2 between feat[i1] and feat[i2]; on GPU when device is cuda/mps."""
+    if not _use_gpu_for_analysis(device):
+        return np.linalg.norm(feat[i1] - feat[i2], axis=1).astype(np.float32)
+    ft = torch.as_tensor(feat, dtype=torch.float32, device=device)
+    ia = torch.as_tensor(i1, dtype=torch.long, device=device)
+    ib = torch.as_tensor(i2, dtype=torch.long, device=device)
+    return torch.norm(ft[ia] - ft[ib], dim=1).detach().cpu().numpy().astype(np.float32)
+
+
 def _raw_pixel_pca(raw_obs: np.ndarray, n_components: int = 64) -> np.ndarray:
     """PCA baseline: reduce flattened raw pixels to n_components dims."""
     X = raw_obs - raw_obs.mean(axis=0, keepdims=True)
@@ -796,12 +815,20 @@ def run_probes(
 #  5. Distance analysis
 # ===================================================================
 
-def run_distance_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geodesic: "GeodesicComputer",
-                          cfg: TrainCfg):
+def run_distance_analysis(
+    pos: np.ndarray,
+    features: Dict[str, np.ndarray],
+    geodesic: "GeodesicComputer",
+    cfg: TrainCfg,
+    device: Optional[torch.device] = None,
+):
     """Pearson / Spearman of latent distance vs geodesic distance (full + local-binned).
 
     Local bins use only pairs with geodesic <= threshold (e.g. <= 3, <= 5, <= 8),
     aligning the distance metric with kNN/T&C and avoiding far-pairs dominating Spearman.
+
+    If ``device`` is cuda or mps, indexed latent L2 distances are computed on that device.
+    Geodesic distances remain on CPU (precomputed matrix lookup).
     """
     N = len(pos)
     n_pairs = min(cfg.n_pairs, N * (N - 1) // 2)
@@ -816,7 +843,7 @@ def run_distance_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geod
 
     results = {}
     for name, feat in features.items():
-        lat_d = np.linalg.norm(feat[i1] - feat[i2], axis=1)
+        lat_d = _latent_indexed_l2(feat, i1, i2, device=device)
         pr, pp = sp_stats.pearsonr(lat_d, geo_d)
         sr, sp = sp_stats.spearmanr(lat_d, geo_d)
         results[name] = {
@@ -850,11 +877,18 @@ def run_distance_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geod
 #  6. Neighbourhood analysis — kNN overlap
 # ===================================================================
 
-def run_knn_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geodesic: "GeodesicComputer",
-                     cfg: TrainCfg):
+def run_knn_analysis(
+    pos: np.ndarray,
+    features: Dict[str, np.ndarray],
+    geodesic: "GeodesicComputer",
+    cfg: TrainCfg,
+    device: Optional[torch.device] = None,
+):
     """Fraction of k-nearest-neighbours shared between latent and geodesic spaces.
 
     Also reports the chance baseline: k / (N-1).
+
+    Latent pairwise distances use ``torch.cdist`` on ``device`` when cuda/mps.
     """
     N = min(800, len(pos))
     idx = np.random.choice(len(pos), N, replace=False)
@@ -869,9 +903,15 @@ def run_knn_analysis(pos: np.ndarray, features: Dict[str, np.ndarray], geodesic:
     results = {}
     for name, feat_full in features.items():
         feat = feat_full[idx]
-        dm = np.linalg.norm(feat[:, None, :] - feat[None, :, :], axis=-1)
-        np.fill_diagonal(dm, np.inf)
-        lat_knn = np.argsort(dm, axis=1)[:, :cfg.knn_k]
+        if _use_gpu_for_analysis(device):
+            feat_t = torch.as_tensor(feat, dtype=torch.float32, device=device)
+            dm = torch.cdist(feat_t, feat_t)
+            dm.fill_diagonal_(float("inf"))
+            lat_knn = torch.argsort(dm, dim=1)[:, : cfg.knn_k].cpu().numpy()
+        else:
+            dm = np.linalg.norm(feat[:, None, :] - feat[None, :, :], axis=-1)
+            np.fill_diagonal(dm, np.inf)
+            lat_knn = np.argsort(dm, axis=1)[:, : cfg.knn_k]
         overlap = np.mean([len(set(lat_knn[i]) & set(geo_knn[i])) / cfg.knn_k for i in range(N)])
         ratio_vs_chance = overlap / max(chance, 1e-9)
         results[name] = round(float(overlap), 4)
@@ -896,12 +936,15 @@ def run_trustworthiness_continuity(
     geodesic: "GeodesicComputer",
     cfg: TrainCfg,
     k: int = 10,
+    device: Optional[torch.device] = None,
 ):
     """Trustworthiness (T) and Continuity (C) metrics (Venna & Kaski, 2006).
 
     T measures whether latent neighbours are also true (geodesic) neighbours.
     C measures whether true neighbours are also latent neighbours.
     Both in [0, 1]; 1 = perfect.
+
+    Latent distance / rank / kNN on ``device`` when cuda/mps (``torch.cdist`` / ``argsort``).
     """
     N = min(800, len(pos))
     idx = np.random.choice(len(pos), N, replace=False)
@@ -918,11 +961,20 @@ def run_trustworthiness_continuity(
 
     for name, feat_full in features.items():
         feat = feat_full[idx]
-        lat_dm = np.linalg.norm(feat[:, None, :] - feat[None, :, :], axis=-1)
-        np.fill_diagonal(lat_dm, np.inf)
-        lat_ranks = _rank_matrix(lat_dm)
+        if _use_gpu_for_analysis(device):
+            feat_t = torch.as_tensor(feat, dtype=torch.float32, device=device)
+            lat_dm_t = torch.cdist(feat_t, feat_t)
+            lat_dm_t.fill_diagonal_(float("inf"))
+            lat_ranks = (
+                torch.argsort(torch.argsort(lat_dm_t, dim=1), dim=1).cpu().numpy()
+            )
+            lat_knn = torch.argsort(lat_dm_t, dim=1)[:, :k].cpu().numpy()
+        else:
+            lat_dm = np.linalg.norm(feat[:, None, :] - feat[None, :, :], axis=-1)
+            np.fill_diagonal(lat_dm, np.inf)
+            lat_ranks = _rank_matrix(lat_dm)
+            lat_knn = np.argsort(lat_dm, axis=1)[:, :k]
 
-        lat_knn = np.argsort(lat_dm, axis=1)[:, :k]
         geo_knn = np.argsort(geo_dm, axis=1)[:, :k]
 
         # Trustworthiness: penalty for latent-neighbours not in geo top-k
@@ -1001,7 +1053,7 @@ def generate_plots(
     if len(features) == 1:
         axes = [axes]
     for col, (name, feat) in enumerate(features.items()):
-        lat_d = np.linalg.norm(feat[i1] - feat[i2], axis=1)
+        lat_d = _latent_indexed_l2(feat, i1, i2, device=device)
         ax = axes[col]
         ax.scatter(geo_d, lat_d, s=2, alpha=0.15)
         pr = dist_res[name]["pearson_r"]
@@ -1188,9 +1240,11 @@ def run_single_maze(maze_name: str, cfg: TrainCfg, device: torch.device, out_roo
     feat_dict = _build_feature_dict(data, device, geo_temporal=geo_temporal, geo_geodesic=geo_geo)
 
     probe_res = run_probes(pos, feat_dict, cfg, device, episode_ids=episode_ids)
-    dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg)
-    knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg)
-    tc_res = run_trustworthiness_continuity(pos, feat_dict, env.geodesic, cfg, k=cfg.knn_k)
+    dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
+    knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
+    tc_res = run_trustworthiness_continuity(
+        pos, feat_dict, env.geodesic, cfg, k=cfg.knn_k, device=device
+    )
 
     print("\n  [5/5] Generating plots ...")
     generate_plots(maze_name, pos, feat_dict, probe_res, dist_res, dist_raw, knn_res,
