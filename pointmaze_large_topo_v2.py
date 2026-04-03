@@ -137,13 +137,19 @@ def _canonical_oracle_bridges(geodesic: GeodesicComputer) -> tuple[set, list]:
 # ---------------------------------------------------------------------------
 
 class PointMazeLargeDiverseGRWrapper:
-    """Wraps PointMaze_Large_Diverse_GR-v3 for pixel-based Dreamer training."""
-
     def __init__(self, env_name: str = "PointMaze_Large_Diverse_GR-v3", img_size: int = 64):
         gym.register_envs(gymnasium_robotics)
         self._env = gym.make(env_name, render_mode="rgb_array")
         self.img_size = int(img_size)
-        obs_dict, _ = self._env.reset()
+
+        # Geodesic / free cells before first reset so we can randomize start+goal like the medium test.
+        self.geodesic = make_pointmaze_large_gr_geodesic()
+        self.grid_h = len(self.geodesic.grid)
+        self.grid_w = len(self.geodesic.grid[0])
+        # Free cells (row, col) for random reset — ensures coverage across the maze.
+        self._free_cells = list(self.geodesic.idx_to_cell)
+
+        obs_dict, _ = self._env.reset(**self._random_reset_kwargs())
         frame = self._env.render()
         assert isinstance(frame, np.ndarray) and frame.ndim == 3
 
@@ -151,11 +157,6 @@ class PointMazeLargeDiverseGRWrapper:
             low=0, high=255, shape=(self.img_size, self.img_size, 3), dtype=np.uint8
         )
         self.action_space = self._env.action_space
-
-        self.geodesic = make_pointmaze_large_gr_geodesic()
-        self.grid_h = len(self.geodesic.grid)
-        self.grid_w = len(self.geodesic.grid[0])
-        self._free_cells = list(self.geodesic.idx_to_cell)
 
         self._agent_pos = np.zeros(2, dtype=np.float32)
         self._update_agent_pos(obs_dict)
@@ -184,11 +185,32 @@ class PointMazeLargeDiverseGRWrapper:
         if ag is not None:
             self._agent_pos = self._world_to_grid(ag[:2])
 
+    def _random_reset_kwargs(self) -> dict:
+        """Options for gymnasium reset: random start + goal on free cells (PointMaze API)."""
+        if not self._free_cells:
+            return {}
+        n = len(self._free_cells)
+        i0 = int(np.random.randint(0, n))
+        i1 = int(np.random.randint(0, n))
+        if n > 1 and i1 == i0:
+            i1 = (i0 + 1) % n
+        r0, c0 = self._free_cells[i0]
+        r1, c1 = self._free_cells[i1]
+        return {
+            "options": {
+                "reset_cell": np.array([r0, c0], dtype=np.int64),
+                "goal_cell": np.array([r1, c1], dtype=np.int64),
+            }
+        }
+
     def reset(self, **kwargs):
+        # Start agent at a random free cell each episode for full maze coverage (+ random goal).
         if self._free_cells:
-            r, c = self._free_cells[np.random.randint(0, len(self._free_cells))]
-            options = dict(kwargs.get("options") or {})
-            options["reset_cell"] = np.array([r, c], dtype=np.int64)
+            options = kwargs.get("options") or {}
+            options = dict(options)
+            rnd = self._random_reset_kwargs().get("options") or {}
+            options["reset_cell"] = rnd["reset_cell"]
+            options["goal_cell"] = rnd["goal_cell"]
             kwargs = dict(kwargs)
             kwargs["options"] = options
         obs_dict, info = self._env.reset(**kwargs)
