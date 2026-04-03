@@ -1929,12 +1929,15 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
             feat_dict[f"b_{cname}(e)"] = np.concatenate([zcol, np.zeros_like(zcol)], axis=1)
 
     probe_res = run_probes(pos, feat_dict, cfg, device, episode_ids=episode_ids)
+    print("    Probes complete")
     dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
+    print("    Distances complete")
     knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
+    print("    KNN complete")
     tc_res = run_trustworthiness_continuity(
         pos, feat_dict, env.geodesic, cfg, k=cfg.knn_k, device=device
     )
-
+    print("    T&C complete")
     # Annotate T&C with dimensionality (Fix 5)
     tc_annotated = {}
     for name, tc_vals in tc_res.items():
@@ -1949,14 +1952,17 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
             )
         tc_annotated[name] = entry
     tc_res = tc_annotated
-
+    print("    T&C annotated")
     directed_geo_res = run_directed_geometry_analysis(data, env.geodesic)
+    print("    Directed geometry complete")
     imagination_res = run_imagination_vs_replay_geometry(models, data, cfg, device, geo_temporal)
+    print("    Imagination vs replay complete")
     community_res = run_latent_room_discovery_v2(data, env.geodesic, feat_dict, cfg)
+    print("    Latent room discovery complete")
     metric_mismatch_res = run_metric_class_mismatch_v2(
         data, feat_dict, env.geodesic, cfg, device=device
     )
-
+    print("    Metric class mismatch complete")
     # [7] Plots
     print("\n  [7/7] Generating plots ...")
     generate_plots(maze_name, pos, feat_dict, probe_res, dist_res, dist_raw, knn_res, cfg, device, out_dir)
