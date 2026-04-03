@@ -1900,75 +1900,165 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
         fiedler_head, z_fiedler_all, fiedler_meta = train_replay_fiedler_head(
             data, cfg_pm, device, cfg_pm.seed)
 
-    # [6] Analysis (distance/kNN/T&C latent geometry on GPU when device is cuda/mps)
-    print(f"\n  [6/7] Running analyses (latent L2 / cdist on {device}) ...")
+    # -----------------------------------------------------------------------
+    # [6] Analysis — fast path:
+    #   • subsample to ANALYSIS_N_MAX points before any pairwise computation
+    #   • cap probe epochs so they don't run forever
+    #   • T&C only for low-dim heads (≤64-dim); skip for 1024-dim encoder
+    #   • every sub-step has a timed, flushed print so you can see progress
+    # -----------------------------------------------------------------------
+    import sys, time as _time
+
+    ANALYSIS_N_MAX = 5_000   # max replay samples fed to probe/knn/T&C
+    PROBE_EPOCHS_CAP = 500   # cap on linear+MLP probe training epochs
+    TC_DIM_THRESHOLD = 64    # skip T&C for features wider than this
+
+    def _tstamp(msg: str):
+        print(f"\n  [6/7] {msg} ({_time.strftime('%H:%M:%S')})", flush=True)
+
+    _tstamp("Building feature dict ...")
     pos = data["pos"]
     episode_ids = data.get("episode_ids", None)
     feat_dict = _build_feature_dict(data, device, geo_temporal=geo_temporal, geo_geodesic=geo_geo)
 
-    if z_topo_all is not None:
-        feat_dict["g_topo(e)"] = z_topo_all
-    if z_cont_all is not None:
-        feat_dict["g_cont(e)"] = z_cont_all
-    if z_lap_all is not None:
-        feat_dict["g_lap(e)"] = z_lap_all
-    if z_graph_all is not None:
-        feat_dict["g_graph(e)"] = z_graph_all
-    if b_score_all is not None:
-        feat_dict["b_score(e)"] = np.concatenate([b_score_all, np.zeros_like(b_score_all)], axis=1)
-    if z_sr_all is not None:
-        feat_dict["g_sr(e)"] = z_sr_all
-    if z_hit_all is not None:
-        feat_dict["g_hit(e)"] = z_hit_all
-    if z_fiedler_all is not None:
-        feat_dict["g_fiedler(e)"] = z_fiedler_all
+    # Inject trained head embeddings
+    for _key, _arr in [
+        ("g_topo(e)",    z_topo_all),
+        ("g_cont(e)",    z_cont_all),
+        ("g_lap(e)",     z_lap_all),
+        ("g_graph(e)",   z_graph_all),
+        ("g_sr(e)",      z_sr_all),
+        ("g_hit(e)",     z_hit_all),
+        ("g_fiedler(e)", z_fiedler_all),
+    ]:
+        if _arr is not None:
+            feat_dict[_key] = _arr
 
+    # b_score scalar: pad to 2-col so downstream code doesn't break on 1-col
+    if b_score_all is not None:
+        feat_dict["b_score(e)"] = np.concatenate(
+            [b_score_all, np.zeros_like(b_score_all)], axis=1
+        )
     if b_score_components is not None:
         for cname, arr in b_score_components.items():
             zcol = np.asarray(arr, dtype=np.float32).reshape(-1, 1)
             feat_dict[f"b_{cname}(e)"] = np.concatenate([zcol, np.zeros_like(zcol)], axis=1)
 
-    probe_res = run_probes(pos, feat_dict, cfg, device, episode_ids=episode_ids)
-    print("    Probes complete")
-    dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
-    print("    Distances complete")
-    knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
-    print("    KNN complete")
-    tc_res = run_trustworthiness_continuity(
-        pos, feat_dict, env.geodesic, cfg, k=cfg.knn_k, device=device
+    # ── Subsample ─────────────────────────────────────────────────────────
+    N_full = len(pos)
+    if N_full > ANALYSIS_N_MAX:
+        rng_sub = np.random.default_rng(cfg_pm.seed + 9999)
+        sub_idx = rng_sub.choice(N_full, size=ANALYSIS_N_MAX, replace=False)
+        sub_idx.sort()
+        pos_sub = pos[sub_idx]
+        feat_dict_sub = {k: v[sub_idx] for k, v in feat_dict.items()}
+        ep_ids_sub = episode_ids[sub_idx] if episode_ids is not None else None
+        # sub_data: consistent view for functions that read data["pos"] internally
+        sub_data = dict(data)
+        sub_data["pos"] = pos_sub
+        if episode_ids is not None:
+            sub_data["episode_ids"] = ep_ids_sub
+        # traj_pos is per-episode, not per-timestep — keep full for directed geometry
+        print(f"    Subsampled {N_full} → {ANALYSIS_N_MAX} points for analyses", flush=True)
+    else:
+        sub_idx = None
+        pos_sub = pos
+        feat_dict_sub = feat_dict
+        ep_ids_sub = episode_ids
+        sub_data = data
+
+    # ── Cap probe epochs ──────────────────────────────────────────────────
+    orig_probe_epochs = cfg.n_probe_epochs
+    cfg.n_probe_epochs = min(cfg.n_probe_epochs, PROBE_EPOCHS_CAP)
+    print(f"    Probe epochs capped: {orig_probe_epochs} → {cfg.n_probe_epochs}", flush=True)
+
+    # ── Probes ────────────────────────────────────────────────────────────
+    _tstamp(f"Probes (n_features={len(feat_dict_sub)}, n_probe_epochs={cfg.n_probe_epochs}) ...")
+    probe_res = run_probes(pos_sub, feat_dict_sub, cfg, device, episode_ids=ep_ids_sub)
+    print("    Probes complete", flush=True)
+
+    # Restore probe epochs for any later use
+    cfg.n_probe_epochs = orig_probe_epochs
+
+    # ── Distance correlations ─────────────────────────────────────────────
+    _tstamp("Distance correlations ...")
+    dist_res, dist_raw = run_distance_analysis(
+        pos_sub, feat_dict_sub, env.geodesic, cfg, device=device
     )
-    print("    T&C complete")
-    # Annotate T&C with dimensionality (Fix 5)
+    print("    Distances complete", flush=True)
+
+    # ── kNN ───────────────────────────────────────────────────────────────
+    _tstamp("kNN analysis ...")
+    knn_res = run_knn_analysis(pos_sub, feat_dict_sub, env.geodesic, cfg, device=device)
+    print("    KNN complete", flush=True)
+
+    # ── T&C — only for low-dim heads ──────────────────────────────────────
+    # High-dim features (encoder_e 1024-dim, h 200-dim) require an N×N
+    # cdist that takes minutes each.  We skip them and note it explicitly.
+    _tstamp(f"Trustworthiness & Continuity (dim ≤ {TC_DIM_THRESHOLD} only) ...")
+    feat_dict_tc = {
+        k: v for k, v in feat_dict_sub.items() if v.shape[1] <= TC_DIM_THRESHOLD
+    }
+    skipped_tc = [k for k in feat_dict_sub if k not in feat_dict_tc]
+    if skipped_tc:
+        print(f"    T&C skipping high-dim features: {skipped_tc}", flush=True)
+
+    tc_res_raw = run_trustworthiness_continuity(
+        pos_sub, feat_dict_tc, env.geodesic, cfg, k=cfg.knn_k, device=device
+    )
+    # Add skipped entries with note
+    for k in skipped_tc:
+        tc_res_raw[k] = {
+            "trustworthiness": None,
+            "continuity": None,
+            "skipped": f"dim={feat_dict_sub[k].shape[1]} > {TC_DIM_THRESHOLD}; "
+                       "full cdist would OOM/stall — use subsampled kNN instead",
+        }
+    print("    T&C complete", flush=True)
+
+    # Annotate with dimensionality (Fix 5)
     tc_annotated = {}
-    for name, tc_vals in tc_res.items():
-        feat = feat_dict.get(name)
+    for name, tc_vals in tc_res_raw.items():
+        feat = feat_dict_sub.get(name)
         dim = int(feat.shape[1]) if feat is not None else -1
         entry = dict(tc_vals) if isinstance(tc_vals, dict) else {"value": tc_vals}
         entry["feat_dim"] = dim
-        if dim <= 2:
+        if 0 < dim <= 2:
             entry["warning"] = (
-                f"{dim}D scalar: T&C measures nearest-neighbor overlap which is trivially "
+                f"{dim}D scalar: T&C nearest-neighbor overlap is trivially "
                 "high for scalars correlated with maze geometry. Not comparable to high-dim."
             )
         tc_annotated[name] = entry
     tc_res = tc_annotated
-    print("    T&C annotated")
+
+    # ── Remaining analyses ────────────────────────────────────────────────
+    _tstamp("Directed geometry ...")
     directed_geo_res = run_directed_geometry_analysis(data, env.geodesic)
-    print("    Directed geometry complete")
-    imagination_res = run_imagination_vs_replay_geometry(models, data, cfg, device, geo_temporal)
-    print("    Imagination vs replay complete")
-    community_res = run_latent_room_discovery_v2(data, env.geodesic, feat_dict, cfg)
-    print("    Latent room discovery complete")
-    metric_mismatch_res = run_metric_class_mismatch_v2(
-        data, feat_dict, env.geodesic, cfg, device=device
+    print("    Directed geometry complete", flush=True)
+
+    _tstamp("Imagination vs replay geometry ...")
+    imagination_res = run_imagination_vs_replay_geometry(
+        models, data, cfg, device, geo_temporal
     )
-    print("    Metric class mismatch complete")
-    # [7] Plots
-    print("\n  [7/7] Generating plots ...")
-    generate_plots(maze_name, pos, feat_dict, probe_res, dist_res, dist_raw, knn_res, cfg, device, out_dir)
-    if "g_lap(e)" in feat_dict:
+    print("    Imagination vs replay complete", flush=True)
+
+    _tstamp("Latent room discovery ...")
+    community_res = run_latent_room_discovery_v2(
+        sub_data, env.geodesic, feat_dict_sub, cfg
+    )
+    print("    Latent room discovery complete", flush=True)
+
+    _tstamp("Metric class mismatch ...")
+    metric_mismatch_res = run_metric_class_mismatch_v2(
+        sub_data, feat_dict_sub, env.geodesic, cfg, device=device
+    )
+    print("    Metric class mismatch complete", flush=True)
+    # [7] Plots — use subsampled pos/feat_dict so plots match the analysis data
+    print("\n  [7/7] Generating plots ...", flush=True)
+    generate_plots(maze_name, pos_sub, feat_dict_sub, probe_res, dist_res, dist_raw, knn_res, cfg, device, out_dir)
+    if "g_lap(e)" in feat_dict_sub:
         plot_laplacian_kmeans_grid(
-            geodesic=env.geodesic, pos=pos, g_lap_feat=feat_dict["g_lap(e)"],
+            geodesic=env.geodesic, pos=pos_sub, g_lap_feat=feat_dict_sub["g_lap(e)"],
             out_path=os.path.join(out_dir, "g_lap_kmeans9_grid.png"), n_clusters=9, seed=cfg_pm.seed)
 
     env.close()
@@ -2019,6 +2109,15 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
         "fix8_community_failure_flagged": True,
         "fix9_canonical_bridges": True,
         "fix10_imagination_flagged": True,
+    }
+    results["analysis_settings"] = {
+        "analysis_n_max": ANALYSIS_N_MAX,
+        "n_full_replay": int(N_full),
+        "n_subsampled": int(len(pos_sub)),
+        "probe_epochs_cap": PROBE_EPOCHS_CAP,
+        "probe_epochs_used": int(min(orig_probe_epochs, PROBE_EPOCHS_CAP)),
+        "tc_dim_threshold": TC_DIM_THRESHOLD,
+        "tc_skipped_features": skipped_tc,
     }
 
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
