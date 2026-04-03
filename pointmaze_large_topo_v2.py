@@ -29,6 +29,7 @@ from maze_geometry_test import (
     train_geo_encoder,
     train_geo_encoder_geodesic,
     _build_feature_dict,
+    _latent_indexed_l2,
     run_probes,
     run_distance_analysis,
     run_knn_analysis,
@@ -1659,7 +1660,7 @@ def run_latent_room_discovery_v2(data, geodesic, features, cfg):
     return results
 
 
-def run_metric_class_mismatch_v2(data, features, geodesic, cfg):
+def run_metric_class_mismatch_v2(data, features, geodesic, cfg, device=None):
     """Fix 2: flag g_lap same-graph correlation as tautological."""
     from scipy import stats as sp_stats
 
@@ -1707,7 +1708,7 @@ def run_metric_class_mismatch_v2(data, features, geodesic, cfg):
 
     results = {}
     for name, feat in features.items():
-        lat_d = np.linalg.norm(feat[i1] - feat[i2], axis=1)
+        lat_d = _latent_indexed_l2(feat, i1, i2, device=device)
         pr_geo = float(sp_stats.pearsonr(lat_d, geo_d)[0])
         sr_geo = float(sp_stats.spearmanr(lat_d, geo_d)[0])
         pr_rep = float(sp_stats.pearsonr(lat_d, rep_d)[0])
@@ -1737,7 +1738,7 @@ def run_metric_class_mismatch_v2(data, features, geodesic, cfg):
 
         if oracle_free_pairs is not None:
             ii_of, jj_of, d_steps = oracle_free_pairs
-            lat_d_s = np.linalg.norm(feat[ii_of] - feat[jj_of], axis=1)
+            lat_d_s = _latent_indexed_l2(feat, ii_of, jj_of, device=device)
             entry["pearson_latent_vs_replay_steps"] = float(sp_stats.pearsonr(lat_d_s, d_steps)[0])
             entry["spearman_latent_vs_replay_steps"] = float(sp_stats.spearmanr(lat_d_s, d_steps)[0])
 
@@ -1752,6 +1753,11 @@ def run_metric_class_mismatch_v2(data, features, geodesic, cfg):
 def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
     device = get_device()
     set_seed(cfg_pm.seed)
+    _mps_ok = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    print(
+        f"  Device: {device!s}  |  torch.cuda.is_available()={torch.cuda.is_available()}  "
+        f"|  torch.backends.mps.is_available()={_mps_ok}"
+    )
 
     cfg = TrainCfg()
     if cfg_pm.quick:
@@ -1894,8 +1900,8 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
         fiedler_head, z_fiedler_all, fiedler_meta = train_replay_fiedler_head(
             data, cfg_pm, device, cfg_pm.seed)
 
-    # [6] Analysis
-    print("\n  [6/7] Running analyses ...")
+    # [6] Analysis (distance/kNN/T&C latent geometry on GPU when device is cuda/mps)
+    print(f"\n  [6/7] Running analyses (latent L2 / cdist on {device}) ...")
     pos = data["pos"]
     episode_ids = data.get("episode_ids", None)
     feat_dict = _build_feature_dict(data, device, geo_temporal=geo_temporal, geo_geodesic=geo_geo)
@@ -1923,9 +1929,11 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
             feat_dict[f"b_{cname}(e)"] = np.concatenate([zcol, np.zeros_like(zcol)], axis=1)
 
     probe_res = run_probes(pos, feat_dict, cfg, device, episode_ids=episode_ids)
-    dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg)
-    knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg)
-    tc_res = run_trustworthiness_continuity(pos, feat_dict, env.geodesic, cfg, k=cfg.knn_k)
+    dist_res, dist_raw = run_distance_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
+    knn_res = run_knn_analysis(pos, feat_dict, env.geodesic, cfg, device=device)
+    tc_res = run_trustworthiness_continuity(
+        pos, feat_dict, env.geodesic, cfg, k=cfg.knn_k, device=device
+    )
 
     # Annotate T&C with dimensionality (Fix 5)
     tc_annotated = {}
@@ -1945,7 +1953,9 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
     directed_geo_res = run_directed_geometry_analysis(data, env.geodesic)
     imagination_res = run_imagination_vs_replay_geometry(models, data, cfg, device, geo_temporal)
     community_res = run_latent_room_discovery_v2(data, env.geodesic, feat_dict, cfg)
-    metric_mismatch_res = run_metric_class_mismatch_v2(data, feat_dict, env.geodesic, cfg)
+    metric_mismatch_res = run_metric_class_mismatch_v2(
+        data, feat_dict, env.geodesic, cfg, device=device
+    )
 
     # [7] Plots
     print("\n  [7/7] Generating plots ...")
