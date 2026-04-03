@@ -294,7 +294,7 @@ class PointMazeLargeRunCfg:
     replay_edge_topo_epochs: int = 300
     replay_edge_topo_batch: int = 1024
     replay_edge_topo_val_frac: float = 0.15
-    replay_edge_topo_bottleneck_frac: float = 0.2
+    replay_edge_topo_bottleneck_frac: float = 0.1
     # --- new heads ---
     replay_sr: bool = True
     replay_sr_dim: int = 8
@@ -856,15 +856,15 @@ def _build_graph_native_node_scores_oracle_free(
     rng: np.random.Generator,
     cfg: Optional[PointMazeLargeRunCfg] = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, float]]:
-    """Oracle-free node scores: novelty + disagreement + uncertainty + centrality.
+    """Oracle-free node scores: novelty + uncertainty + centrality (no disagreement term).
 
     Centrality uses only betweenness and articulation (no oracle bridge mask).
+    ``replay_node_score_beta`` is ignored (disagreement removed from the blend).
     """
     n = int(len(encoder_emb))
-    alpha = beta = gamma = delta = 1.0
+    alpha = gamma = delta = 1.0
     if cfg is not None:
         alpha = float(cfg.replay_node_score_alpha)
-        beta = float(cfg.replay_node_score_beta)
         gamma = float(cfg.replay_node_score_gamma)
         delta = float(cfg.replay_node_score_delta)
 
@@ -874,14 +874,6 @@ def _build_graph_native_node_scores_oracle_free(
     for c in cell_idx.tolist():
         cell_counts[int(c)] += 1
     novelty = 1.0 / np.sqrt(np.maximum(1, cell_counts[cell_idx]).astype(np.float32))
-
-    src_lg, disc_lg = _compute_encoder_temporal_local_global_disagreement(
-        encoder_emb=encoder_emb, episode_ids=episode_ids, rng=rng,
-        k_nn=12, candidate_pool=1800, max_sources=2000, min_labeled_neighbors=4,
-    )
-    disc_all = np.zeros(n, dtype=np.float32)
-    if len(src_lg) > 0:
-        disc_all[src_lg.astype(np.int64)] = disc_lg.astype(np.float32)
 
     pair_pool = _oracle_free_replay_step_distances(
         episode_ids, n_pairs_target=min(max(2000, n), 10000), max_sources=128, rng=rng,
@@ -897,7 +889,6 @@ def _build_graph_native_node_scores_oracle_free(
                 uncert[a] = float(np.std(np.asarray(vals, dtype=np.float32)))
 
     nov_z = _zscore_safe(novelty)
-    disc_z = _zscore_safe(disc_all)
     unc_z = _zscore_safe(uncert)
 
     cent_z = np.zeros(n, dtype=np.float32)
@@ -906,8 +897,9 @@ def _build_graph_native_node_scores_oracle_free(
         cent_z = _zscore_safe(cent_cell[cell_idx.astype(np.int64)])
 
     components: dict[str, np.ndarray] = {
-        "novelty": nov_z, "disagreement": disc_z,
-        "uncertainty": unc_z, "centrality": cent_z,
+        "novelty": nov_z,
+        "uncertainty": unc_z,
+        "centrality": cent_z,
     }
     summary: dict[str, float] = {}
     for name, arr in components.items():
@@ -916,16 +908,109 @@ def _build_graph_native_node_scores_oracle_free(
         summary[f"{name}_frac_abs_gt_1e-8"] = float(np.mean(np.abs(arr) > 1e-8))
 
     if delta != 0.0:
-        denom = max(1e-8, alpha + beta + gamma + delta)
-        score = (alpha * nov_z + beta * disc_z + gamma * unc_z + delta * cent_z) / denom
+        denom = max(1e-8, alpha + gamma + delta)
+        score = (alpha * nov_z + gamma * unc_z + delta * cent_z) / denom
     else:
-        denom = max(1e-8, alpha + beta + gamma)
-        score = (alpha * nov_z + beta * disc_z + gamma * unc_z) / denom
+        denom = max(1e-8, alpha + gamma)
+        score = (alpha * nov_z + gamma * unc_z) / denom
 
     summary["combined_target_mean"] = float(np.mean(score))
     summary["combined_target_std"] = float(np.std(score))
     summary["oracle_contamination"] = False
+    summary["disagreement_term_included"] = False
+    summary["blend_weights_used"] = {"alpha_novelty": alpha, "gamma_uncertainty": gamma, "delta_centrality": delta}
     return score.astype(np.float32), components, summary
+
+
+def analyze_b_head_target_terms(
+    components: dict[str, np.ndarray],
+    y: np.ndarray,
+    term_names: tuple[str, ...] = ("novelty", "uncertainty", "centrality"),
+) -> dict[str, Any]:
+    """How useful each b_head component is alone vs its contribution in a joint linear model.
+
+    ``y`` is the combined b_score training target (same scale as fed to ReplayNodeScoreHead).
+    """
+    y = np.asarray(y, dtype=np.float64).ravel()
+    alone: dict[str, Any] = {}
+    for name in term_names:
+        if name not in components:
+            continue
+        x = np.asarray(components[name], dtype=np.float64).ravel()
+        if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+            alone[name] = {
+                "pearson_vs_target": None,
+                "spearman_vs_target": None,
+                "r2_univariate_vs_target": None,
+            }
+            continue
+        pr = float(np.corrcoef(x, y)[0, 1])
+        sr = float(_spearman_rho_numpy(x.astype(np.float32), y.astype(np.float32)))
+        alone[name] = {
+            "pearson_vs_target": pr,
+            "spearman_vs_target": sr,
+            "r2_univariate_vs_target": float(pr * pr),
+        }
+
+    cols: list[np.ndarray] = []
+    valid_names: list[str] = []
+    for name in term_names:
+        if name in components:
+            cols.append(np.asarray(components[name], dtype=np.float64).ravel())
+            valid_names.append(name)
+    if not cols:
+        return {
+            "alone": alone,
+            "ols_on_combined_target": None,
+            "note": "no component columns",
+        }
+
+    X = np.column_stack(cols)
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0) + 1e-12
+    Xs = (X - mu) / sd
+    coef, *_ = np.linalg.lstsq(Xs, y, rcond=None)
+    y_hat = Xs @ coef
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2_full = float(1.0 - ss_res / max(ss_tot, 1e-12))
+    sq = coef * coef
+    den = float(np.sum(sq) + 1e-12)
+    rel_sq = {valid_names[i]: float(sq[i] / den) for i in range(len(valid_names))}
+
+    drop_one: dict[str, float] = {}
+    for j in range(len(valid_names)):
+        mask = np.ones(len(valid_names), dtype=bool)
+        mask[j] = False
+        X_sub = Xs[:, mask]
+        if X_sub.shape[1] == 0:
+            drop_one[valid_names[j]] = float(r2_full)
+            continue
+        c2, *_ = np.linalg.lstsq(X_sub, y, rcond=None)
+        y2 = X_sub @ c2
+        ss2 = float(np.sum((y - y2) ** 2))
+        r2_minus = float(1.0 - ss2 / max(ss_tot, 1e-12))
+        drop_one[valid_names[j]] = float(r2_full - r2_minus)
+
+    return {
+        "alone": alone,
+        "ols_on_combined_target": {
+            "term_names": valid_names,
+            "coefficients_standardized_X": {
+                valid_names[i]: float(coef[i]) for i in range(len(valid_names))
+            },
+            "r2_full_multivariate": r2_full,
+            "relative_contribution_squared_beta": rel_sq,
+            "r2_drop_one_delta": drop_one,
+        },
+        "note": (
+            "alone: univariate association with combined b_score target; "
+            "r2_univariate_vs_target = Pearson^2. "
+            "ols_on_combined_target: multivariate OLS on z-scored columns; "
+            "relative_contribution_squared_beta normalizes coef^2 to sum 1; "
+            "r2_drop_one_delta = R2_full - R2_without term (approx. unique variance)."
+        ),
+    }
 
 
 # =====================================================================
@@ -1124,6 +1209,22 @@ def train_replay_node_score_head_v2(
             geodesic, pos, idx_all, np.asarray(arr, dtype=np.float32)
         )
 
+    b_head_target_analysis = analyze_b_head_target_terms(components, target_np)
+    print("    b_score target term analysis (see metrics.json → b_head_target_analysis):")
+    for tn, row in b_head_target_analysis.get("alone", {}).items():
+        print(
+            f"      {tn:12s}  r(target)={row.get('pearson_vs_target')}  "
+            f"R²_uni={row.get('r2_univariate_vs_target')}"
+        )
+    ols = b_head_target_analysis.get("ols_on_combined_target") or {}
+    if ols.get("relative_contribution_squared_beta"):
+        print(
+            "      joint OLS rel. |β|² share:",
+            ols["relative_contribution_squared_beta"],
+            " R²_full=",
+            ols.get("r2_full_multivariate"),
+        )
+
     perm = rng.permutation(n)
     n_val = min(max(1, int(round(cfg.replay_node_score_val_frac * n))), n - 1)
     val_idx = perm[:n_val]
@@ -1172,8 +1273,10 @@ def train_replay_node_score_head_v2(
         "oracle_free": True,
         "centrality_terms": ["node_betweenness", "edge_betweenness", "articulation"],
         "removed_oracle_term": "oracle_bridge_boundary_mask",
+        "disagreement_removed_from_blend": True,
         "component_summary": component_summary,
         "component_bridge_sanity": component_bridge_sanity,
+        "b_head_target_analysis": b_head_target_analysis,
     }
     return model, b_all, meta, components
 
@@ -1208,6 +1311,14 @@ def train_replay_edge_topology_head_v2(
     train_arr = labeled[perm[n_val:]]
     val_arr = labeled[perm[:n_val]]
 
+    # Class-weighted CE (inverse frequency on train split; mean weight = 1)
+    train_cls = train_arr[:, 2].astype(np.int64)
+    train_cls_counts_np = np.bincount(train_cls, minlength=3).astype(np.float64)
+    n_tr = max(len(train_arr), 1)
+    inv_freq = n_tr / (3.0 * np.maximum(train_cls_counts_np, 1.0))
+    inv_freq = inv_freq * (3.0 / np.sum(inv_freq))
+    ce_class_weight = torch.tensor(inv_freq, dtype=torch.float32, device=device)
+
     e_t = torch.tensor(encoder_emb, dtype=torch.float32, device=device)
     model = ReplayEdgeTopoClassifier(
         embed_dim=int(encoder_emb.shape[1]),
@@ -1223,7 +1334,7 @@ def train_replay_edge_topology_head_v2(
         vi = torch.tensor(arr[:, 1], dtype=torch.long, device=device)
         yi = torch.tensor(arr[:, 2], dtype=torch.long, device=device)
         logits = model(e_t[ui], e_t[vi])
-        return F.cross_entropy(logits, yi), logits, yi
+        return F.cross_entropy(logits, yi, weight=ce_class_weight), logits, yi
 
     best_val = float("inf")
     best_state = None
@@ -1252,7 +1363,7 @@ def train_replay_edge_topology_head_v2(
     with torch.no_grad():
         _, logits_v, y_v = _loss(val_arr)
         val_acc = float((logits_v.argmax(dim=-1) == y_v).float().mean().item())
-        cls_counts = np.bincount(val_arr[:, 2], minlength=3).astype(np.int64).tolist()
+        val_cls_counts = np.bincount(val_arr[:, 2], minlength=3).astype(np.int64).tolist()
 
     meta = {
         "n_pairs_total": int(len(labeled)),
@@ -1261,7 +1372,10 @@ def train_replay_edge_topology_head_v2(
         "epochs": epochs, "batch": batch,
         "best_val_ce": float(best_val),
         "val_acc": float(val_acc),
-        "val_class_counts": cls_counts,
+        "val_class_counts": val_cls_counts,
+        "train_class_counts": [int(x) for x in train_cls_counts_np.tolist()],
+        "cross_entropy_class_weights": [float(x) for x in inv_freq.tolist()],
+        "cross_entropy_weighting": "inverse_frequency_train_split_mean_normalized",
         "label_features": ["edge_betweenness", "articulation", "temporal_component", "spectral_community"],
         "removed_feature": "encoder_distance_stress (Fix 3: removes circularity)",
         "bottleneck_top_frac": float(cfg.replay_edge_topo_bottleneck_frac),
@@ -2115,6 +2229,9 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
         results["g_graph_eval"] = graph_meta
     if node_score_meta:
         results["b_score_eval"] = node_score_meta
+        bhta = node_score_meta.get("b_head_target_analysis")
+        if bhta is not None:
+            results["b_head_target_analysis"] = bhta
     if edge_topo_meta:
         results["edge_topo_eval"] = edge_topo_meta
     if sr_meta:
@@ -2332,7 +2449,7 @@ def print_summary_table(summary: dict):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Multi-seed topology eval on PointMaze_Large_Diverse_GR-v3")
-    p.add_argument("--seeds", type=str, default="0,1,2", help="Comma-separated seeds")
+    p.add_argument("--seeds", type=str, default="1,2", help="Comma-separated seeds")
     p.add_argument("--output_dir", default="pointmaze_large_gr_results")
     p.add_argument("--quick", action="store_true")
     p.add_argument("--geo_supervised", action="store_true")
@@ -2346,6 +2463,12 @@ def parse_args():
     p.add_argument("--no_replay_graph", action="store_true")
     p.add_argument("--no_replay_node_score", action="store_true")
     p.add_argument("--no_replay_edge_topo", action="store_true")
+    p.add_argument(
+        "--replay_edge_topo_bottleneck_frac",
+        type=float,
+        default=0.1,
+        help="Top fraction of non-temporal edges labeled as bottleneck (class 2)",
+    )
     return p.parse_args()
 
 
@@ -2368,6 +2491,7 @@ def main():
             replay_graph=not args.no_replay_graph,
             replay_node_score=not args.no_replay_node_score,
             replay_edge_topo=not args.no_replay_edge_topo,
+            replay_edge_topo_bottleneck_frac=float(args.replay_edge_topo_bottleneck_frac),
             replay_sr=not args.no_replay_sr,
             replay_hit=not args.no_replay_hit,
             replay_fiedler=not args.no_replay_fiedler,
