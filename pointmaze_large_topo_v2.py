@@ -5,7 +5,7 @@ import json
 import os
 import math
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -256,11 +256,11 @@ class PointMazeLargeRunCfg:
     replay_topology_pair_pool: int = 8000
     replay_topology_val_frac: float = 0.15
     replay_topology_n_ensemble: int = 5
-    replay_laplacian: bool = True
+    replay_laplacian: bool = False
     replay_laplacian_dim: int = 3
     replay_laplacian_graph_max: int = 1800
     replay_laplacian_knn_k: int = 10
-    replay_cont: bool = True
+    replay_cont: bool = False
     replay_cont_dim: int = 16
     replay_cont_hidden: int = 256
     replay_cont_epochs: int = 700
@@ -269,7 +269,7 @@ class PointMazeLargeRunCfg:
     replay_cont_pos_k: int = 3
     replay_cont_neg_k: int = 32
     replay_cont_temp: float = 0.10
-    replay_graph: bool = True
+    replay_graph: bool = False
     replay_graph_disc_classes: int = 64
     replay_graph_hidden: int = 256
     replay_graph_epochs: int = 400
@@ -286,7 +286,7 @@ class PointMazeLargeRunCfg:
     replay_node_score_batch: int = 1024
     replay_node_score_val_frac: float = 0.15
     replay_node_score_alpha: float = 1.0
-    replay_node_score_beta: float = 1.0
+    replay_node_score_beta: float = 0.0
     replay_node_score_gamma: float = 1.0
     replay_node_score_delta: float = 1.0
     replay_edge_topo: bool = True
@@ -295,15 +295,15 @@ class PointMazeLargeRunCfg:
     replay_edge_topo_batch: int = 1024
     replay_edge_topo_val_frac: float = 0.15
     replay_edge_topo_bottleneck_frac: float = 0.1
-    # --- new heads ---
-    replay_sr: bool = True
+    # --- optional heads (off unless CLI enables) ---
+    replay_sr: bool = False
     replay_sr_dim: int = 8
     replay_sr_hidden: int = 256
     replay_sr_epochs: int = 600
     replay_sr_batch: int = 512
     replay_sr_val_frac: float = 0.15
     replay_sr_gamma: float = 0.95
-    replay_hit: bool = True
+    replay_hit: bool = False
     replay_hit_dim: int = 8
     replay_hit_hidden: int = 256
     replay_hit_epochs: int = 600
@@ -311,7 +311,7 @@ class PointMazeLargeRunCfg:
     replay_hit_val_frac: float = 0.15
     replay_hit_n_walks: int = 200
     replay_hit_walk_len: int = 300
-    replay_fiedler: bool = True
+    replay_fiedler: bool = False
     replay_fiedler_dim: int = 16
     replay_fiedler_hidden: int = 256
     replay_fiedler_epochs: int = 700
@@ -1977,8 +1977,8 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
     if cfg_pm.geo_supervised:
         geo_geo = train_geo_encoder_geodesic(data, cfg, device, env.geodesic)
 
-    # [4] Existing heads (with fixes applied)
-    print("\n  [4/7] Training topology heads ...")
+    # [4] Primary replay heads: b_score (oracle-free), edge_topo, g_topo
+    print("\n  [4/7] Training primary replay heads (b_score, edge_topo, g_topo) ...")
     topo_head = z_topo_all = topo_meta = None
     z_lap_all = lap_meta = None
     cont_head = z_cont_all = cont_meta = None
@@ -2020,8 +2020,10 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
         edge_topo_head, edge_topo_meta = train_replay_edge_topology_head_v2(
             data, cfg_pm, device, cfg_pm.seed)
 
-    # [5] NEW heads
-    print("\n  [5/7] Training new heads (g_sr, g_hit, g_fiedler) ...")
+    # [5] Optional heads (CLI --enable_* only)
+    _opt = cfg_pm.replay_sr or cfg_pm.replay_hit or cfg_pm.replay_fiedler
+    print("\n  [5/7] Optional replay heads (g_sr / g_hit / g_fiedler) ..."
+          f" {'training' if _opt else 'skipped (pass --enable_replay_*)'}")
     sr_head = z_sr_all = sr_meta = None
     hit_head = z_hit_all = hit_meta = None
     fiedler_head = z_fiedler_all = fiedler_meta = None
@@ -2206,6 +2208,22 @@ def run_single_seed(cfg_pm: PointMazeLargeRunCfg):
     results = {
         "seed": cfg_pm.seed,
         "maze": maze_name,
+        "replay_heads_enabled": {
+            "b_score": bool(cfg_pm.replay_node_score),
+            "edge_topo": bool(cfg_pm.replay_edge_topo),
+            "g_topo": bool(cfg_pm.replay_topology),
+            "g_cont": bool(cfg_pm.replay_cont),
+            "g_lap": bool(cfg_pm.replay_laplacian),
+            "g_graph": bool(cfg_pm.replay_graph),
+            "g_sr": bool(cfg_pm.replay_sr),
+            "g_hit": bool(cfg_pm.replay_hit),
+            "g_fiedler": bool(cfg_pm.replay_fiedler),
+        },
+        "b_score_blend": {
+            "components": ["novelty", "uncertainty", "centrality"],
+            "disagreement_in_blend": False,
+            "replay_node_score_beta": float(cfg_pm.replay_node_score_beta),
+        },
         "n_free_cells": int(env.geodesic.n_free),
         "n_bridges_oracle": int(len(bridge_cells)),
         "n_bridge_edges_oracle": int(len(bridge_edges)),
@@ -2414,11 +2432,16 @@ def print_summary_table(summary: dict):
     print(f"  Room coverage:      {_fmt(summary.get('room_coverage'))}")
     print(f"  g_topo val R²:      {_fmt(summary.get('g_topo_val_r2'))}")
     print(f"  g_topo val MSE:     {_fmt(summary.get('g_topo_val_mse'))}")
-    print(f"  g_sr val Bellman:   {_fmt(summary.get('g_sr_val_bellman_mse'))}")
-    print(f"  g_hit val R²:       {_fmt(summary.get('g_hit_val_r2'))}")
-    print(f"  g_fiedler val:      {_fmt(summary.get('g_fiedler_val_combined'))}")
     print(f"  b_score val MSE:    {_fmt(summary.get('b_score_val_mse'))}")
     print(f"  edge_topo val acc:  {_fmt(summary.get('edge_topo_val_acc'))}")
+    for label, key in (
+        ("g_sr val Bellman", "g_sr_val_bellman_mse"),
+        ("g_hit val R²", "g_hit_val_r2"),
+        ("g_fiedler val", "g_fiedler_val_combined"),
+    ):
+        block = summary.get(key)
+        if block and block.get("n", 0) > 0:
+            print(f"  {label}: {_fmt(block)}")
 
     if summary.get("community_failure_all_seeds"):
         print("\n  *** COMMUNITY FAILURE: No representation recovered multi-room structure ***")
@@ -2448,21 +2471,53 @@ def print_summary_table(summary: dict):
 # =====================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Multi-seed topology eval on PointMaze_Large_Diverse_GR-v3")
-    p.add_argument("--seeds", type=str, default="1,2", help="Comma-separated seeds")
+    p = argparse.ArgumentParser(
+        description="Multi-seed topology eval on PointMaze_Large_Diverse_GR-v3. "
+        "Default: b_score (3-term oracle-free), edge_topo, g_topo only."
+    )
+    p.add_argument(
+        "--seeds",
+        type=str,
+        default="1,2",
+        help="Comma-separated seeds (default 3 seeds for mean±std)",
+    )
     p.add_argument("--output_dir", default="pointmaze_large_gr_results")
     p.add_argument("--quick", action="store_true")
     p.add_argument("--geo_supervised", action="store_true")
     p.add_argument("--wm_path", type=str, default="")
-    p.add_argument("--no_replay_sr", action="store_true")
-    p.add_argument("--no_replay_hit", action="store_true")
-    p.add_argument("--no_replay_fiedler", action="store_true")
-    p.add_argument("--no_replay_topology", action="store_true")
-    p.add_argument("--no_replay_cont", action="store_true")
-    p.add_argument("--no_replay_laplacian", action="store_true")
-    p.add_argument("--no_replay_graph", action="store_true")
-    p.add_argument("--no_replay_node_score", action="store_true")
-    p.add_argument("--no_replay_edge_topo", action="store_true")
+    p.add_argument("--no_replay_topology", action="store_true", help="Disable g_topo")
+    p.add_argument("--no_replay_node_score", action="store_true", help="Disable b_score")
+    p.add_argument("--no_replay_edge_topo", action="store_true", help="Disable edge classifier")
+    p.add_argument(
+        "--enable_replay_cont",
+        action="store_true",
+        help="Train g_cont(e) and include in probes / distance analysis",
+    )
+    p.add_argument(
+        "--enable_replay_laplacian",
+        action="store_true",
+        help="Compute g_lap(e) and include in analysis",
+    )
+    p.add_argument(
+        "--enable_replay_graph",
+        action="store_true",
+        help="Train g_graph(e) discrete head and include in analysis",
+    )
+    p.add_argument(
+        "--enable_replay_sr",
+        action="store_true",
+        help="Train g_sr(e) successor-feature head",
+    )
+    p.add_argument(
+        "--enable_replay_hit",
+        action="store_true",
+        help="Train g_hit(e) hitting-time head",
+    )
+    p.add_argument(
+        "--enable_replay_fiedler",
+        action="store_true",
+        help="Train g_fiedler(e) contrastive head",
+    )
     p.add_argument(
         "--replay_edge_topo_bottleneck_frac",
         type=float,
@@ -2486,15 +2541,15 @@ def main():
             geo_supervised=bool(args.geo_supervised),
             wm_path=args.wm_path,
             replay_topology=not args.no_replay_topology,
-            replay_cont=not args.no_replay_cont,
-            replay_laplacian=not args.no_replay_laplacian,
-            replay_graph=not args.no_replay_graph,
             replay_node_score=not args.no_replay_node_score,
             replay_edge_topo=not args.no_replay_edge_topo,
             replay_edge_topo_bottleneck_frac=float(args.replay_edge_topo_bottleneck_frac),
-            replay_sr=not args.no_replay_sr,
-            replay_hit=not args.no_replay_hit,
-            replay_fiedler=not args.no_replay_fiedler,
+            replay_cont=bool(args.enable_replay_cont),
+            replay_laplacian=bool(args.enable_replay_laplacian),
+            replay_graph=bool(args.enable_replay_graph),
+            replay_sr=bool(args.enable_replay_sr),
+            replay_hit=bool(args.enable_replay_hit),
+            replay_fiedler=bool(args.enable_replay_fiedler),
         )
         results = run_single_seed(cfg_pm)
         all_results.append(results)
