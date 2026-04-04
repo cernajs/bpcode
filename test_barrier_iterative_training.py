@@ -68,6 +68,11 @@ class BarrierTrainingCfg:
     min_temporal_detour_for_barrier: int = 2
     fallback_seed_split_topk: int = 32
     far_neg_min_graph_steps: int = 8
+    barrier_embed_normalize: bool = True
+    barrier_denom_floor_abs: float = 0.20
+    barrier_denom_floor_rel: float = 0.50
+    barrier_score_clip_percentile: float = 99.5
+    barrier_score_clip_max: float = 50.0
 
     # contrastive correction
     geo_lr: float = 1e-4
@@ -77,6 +82,8 @@ class BarrierTrainingCfg:
     geo_batch: int = 256
     pos_k: int = 3
     n_hard_neg: int = 32
+    core_node_percentile: float = 70.0
+    frontier_node_percentile: float = 90.0
 
     # reconstruction regularization
     recon_lambda: float = 1.0
@@ -195,6 +202,32 @@ def _zscore_safe(x: np.ndarray) -> np.ndarray:
     return ((x - mu) / sd).astype(np.float32)
 
 
+def _normalize_rows_np(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    n = np.linalg.norm(x, axis=-1, keepdims=True)
+    return (x / np.maximum(n, eps)).astype(np.float64)
+
+
+def _node_scores_from_edge_scores(n_nodes: int, edges: np.ndarray, edge_scores: np.ndarray) -> np.ndarray:
+    """Robust node saliency from incident edge scores.
+
+    We combine mean and max incident edge score so that nodes touching many
+    suspicious edges or one extremely suspicious edge both stand out.
+    """
+    if n_nodes <= 0:
+        return np.zeros(0, dtype=np.float32)
+    mean_acc = np.zeros(n_nodes, dtype=np.float64)
+    max_acc = np.zeros(n_nodes, dtype=np.float64)
+    deg = np.zeros(n_nodes, dtype=np.float64)
+    for (u, v), s in zip(np.asarray(edges, dtype=np.int64), np.asarray(edge_scores, dtype=np.float64)):
+        u = int(u); v = int(v); s = float(s)
+        mean_acc[u] += s; mean_acc[v] += s
+        max_acc[u] = max(max_acc[u], s); max_acc[v] = max(max_acc[v], s)
+        deg[u] += 1.0; deg[v] += 1.0
+    mean_acc = mean_acc / np.maximum(deg, 1.0)
+    return (0.5 * mean_acc + 0.5 * max_acc).astype(np.float32)
+
+
 # =====================================================================
 # Phase 3: Barrier score computation
 # =====================================================================
@@ -223,26 +256,35 @@ def compute_per_edge_barrier_scores(
     adj_list: list[list[int]],
     d_temporal: np.ndarray | None = None,
     min_temporal_detour: int = 2,
+    normalize_embeddings: bool = True,
+    denom_floor_abs: float = 0.20,
+    denom_floor_rel: float = 0.50,
+    score_clip_percentile: float = 99.5,
+    score_clip_max: float = 50.0,
 ) -> np.ndarray:
     """Score each mixed-graph edge by how much it looks like a shortcut/barrier.
 
-    The previous version used d_graph(u,v) / d_enc(u,v) on direct edges. Since
-    direct mixed-graph edges have d_graph(u,v)=1 by construction, that reduced
-    to roughly 1/d_enc and did not measure barriers at all.
-
-    We fix this by using an exact *detour distance* after removing the edge from
-    the mixed graph. For kNN wormholes, the detour remains long. For true graph
-    bridges, the detour becomes very long or disconnected. We also blend in a
-    temporal-only proxy so that edges far in replay time but close in encoder
-    space get emphasized early.
+    Key robustness fixes:
+      - encoder embeddings can be L2-normalized before distance computation so
+        distances remain in a stable range instead of collapsing toward 1e-4,
+      - the denominator uses a non-trivial adaptive floor,
+      - the detour term is bounded via log1p and final scores are percentile-clipped.
     """
     if len(edges) == 0:
         return np.zeros(0, dtype=np.float32)
 
-    emb_sub = encoder_emb[idx_global]
+    emb_sub = np.asarray(encoder_emb[idx_global], dtype=np.float64)
+    if normalize_embeddings:
+        emb_sub = _normalize_rows_np(emb_sub)
     d_enc_all = np.linalg.norm(
         emb_sub[:, None, :] - emb_sub[None, :, :], axis=-1
     ).astype(np.float64)
+
+    raw_edge_d = np.array([d_enc_all[int(e[0]), int(e[1])] for e in edges], dtype=np.float64)
+    pos_raw = raw_edge_d[raw_edge_d > 1e-8]
+    raw_med = float(np.median(pos_raw)) if pos_raw.size else 1.0
+    denom_floor = max(float(denom_floor_abs), float(denom_floor_rel) * raw_med)
+    denom = np.maximum(raw_edge_d, denom_floor)
 
     detour_steps = np.zeros(len(edges), dtype=np.float64)
     temporal_steps = np.zeros(len(edges), dtype=np.float64)
@@ -263,15 +305,16 @@ def compute_per_edge_barrier_scores(
         else:
             temporal_steps[ei] = 0.0
 
-    denom = np.array([d_enc_all[int(e[0]), int(e[1])] for e in edges], dtype=np.float64)
-    denom = np.maximum(denom, 1e-8)
-
-    detour_ratio = detour_steps / denom
+    detour_term = np.log1p(detour_steps)
+    scores = detour_term / denom
     if d_temporal is not None:
-        temporal_ratio = temporal_steps / denom
-        scores = detour_ratio + 0.5 * np.maximum(0.0, _zscore_safe(temporal_ratio))
-    else:
-        scores = detour_ratio
+        temporal_term = np.log1p(temporal_steps) / denom
+        scores = scores + 0.35 * np.maximum(0.0, _zscore_safe(temporal_term))
+
+    if len(scores) > 0:
+        clip_hi = float(np.percentile(scores, min(max(score_clip_percentile, 90.0), 100.0)))
+        clip_hi = min(clip_hi, float(score_clip_max))
+        scores = np.clip(scores, 0.0, clip_hi)
     return scores.astype(np.float32)
 
 
@@ -377,110 +420,134 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
                pos_k: int = 3, n_hard_neg: int = 32,
                rng: np.random.Generator = None,
                d_graph_local: np.ndarray | None = None,
-               far_neg_min_graph_steps: int = 8):
-    """Mine positive pairs and hard negatives.
+               far_neg_min_graph_steps: int = 8,
+               forced_split: bool = False,
+               node_scores_local: np.ndarray | None = None,
+               core_node_percentile: float = 70.0,
+               frontier_node_percentile: float = 90.0):
+    """Mine cleaner positives and negatives.
 
-    Primary negatives come from different discovered rooms. If the current split
-    is still weak, we fall back to replay-graph-far but encoder-close negatives
-    so the InfoNCE stage never collapses to zero.
+    Fixes applied:
+      - when the partition is forced, we do *not* trust room labels for negatives,
+      - positives are restricted to low-barrier/core nodes to reduce boundary noise,
+      - negatives prefer frontier/high-barrier nodes or graph-far states rather
+        than arbitrary global room labels.
     """
     if rng is None:
         rng = np.random.default_rng(0)
 
     N = len(encoder_emb)
-    m = len(idx_global)
-    global_to_local = {int(g): i for i, g in enumerate(idx_global.tolist())}
+    graph_indices = idx_global.copy()
+    global_to_local = {int(g): i for i, g in enumerate(graph_indices.tolist())}
+
+    # Stable encoder distances for mining
+    emb_all = _normalize_rows_np(np.asarray(encoder_emb, dtype=np.float64))
+    emb_graph = emb_all[graph_indices]
 
     # Global room labels for all replay states (-1 = not in graph)
     global_room = np.full(N, -1, dtype=np.int64)
-    for loc, g in enumerate(idx_global.tolist()):
+    for loc, g in enumerate(graph_indices.tolist()):
         global_room[int(g)] = int(room_labels[loc])
 
-    # Positive pairs: same room + temporally close
+    # Node confidence masks
+    if node_scores_local is not None and len(node_scores_local) == len(graph_indices):
+        core_thr = float(np.percentile(node_scores_local, core_node_percentile))
+        frontier_thr = float(np.percentile(node_scores_local, frontier_node_percentile))
+        core_local = np.asarray(node_scores_local <= core_thr, dtype=bool)
+        frontier_local = np.asarray(node_scores_local >= frontier_thr, dtype=bool)
+    else:
+        core_local = np.ones(len(graph_indices), dtype=bool)
+        frontier_local = np.zeros(len(graph_indices), dtype=bool)
+
+    global_core = np.zeros(N, dtype=bool)
+    for loc, g in enumerate(graph_indices.tolist()):
+        global_core[int(g)] = bool(core_local[loc])
+
+    # Positive pairs: temporal close + both on core nodes. If split is trusted,
+    # also require same room. If split is forced, fall back to local temporal positives.
     pos_table = _build_temporal_positive_table(episode_ids, pos_k=pos_k)
     anchors, positives = [], []
     for i in range(N):
-        if global_room[i] < 0 or len(pos_table[i]) == 0:
+        if global_room[i] < 0 or len(pos_table[i]) == 0 or not bool(global_core[i]):
             continue
         for j in pos_table[i].tolist():
-            if global_room[int(j)] == global_room[i]:
-                anchors.append(i)
-                positives.append(int(j))
+            j = int(j)
+            if j < 0 or j >= N or global_room[j] < 0 or not bool(global_core[j]):
+                continue
+            if forced_split or int(global_room[j]) == int(global_room[i]):
+                anchors.append(int(i))
+                positives.append(j)
 
     if len(anchors) == 0:
         return None, None, None
 
-    anchors = np.array(anchors, dtype=np.int64)
-    positives = np.array(positives, dtype=np.int64)
+    anchors = np.asarray(anchors, dtype=np.int64)
+    positives = np.asarray(positives, dtype=np.int64)
 
-    # Hard negatives: different room if available, otherwise graph-far but encoder-close
-    graph_indices = idx_global.copy()
-    emb_graph = encoder_emb[graph_indices]
-    pair_probe = np.linalg.norm(emb_graph[:1] - emb_graph[1:], axis=-1) if len(emb_graph) > 1 else np.array([1.0])
-    median_dist = float(np.median(pair_probe))
+    # Use a stable local distance scale in normalized space
+    if len(emb_graph) > 1:
+        probe_j = min(512, len(emb_graph) - 1)
+        pair_probe = np.linalg.norm(emb_graph[:1] - emb_graph[1:1 + probe_j], axis=-1)
+        median_dist = float(np.median(pair_probe)) if len(pair_probe) else 1.0
+    else:
+        median_dist = 1.0
+    close_radius = max(0.20, 2.0 * median_dist)
+
     unique_rooms = np.unique(room_labels) if len(room_labels) else np.array([], dtype=np.int64)
-    allow_room_neg = len(unique_rooms) >= 2
+    allow_room_neg = (len(unique_rooms) >= 2) and (not forced_split)
 
     unique_anchors = np.unique(anchors)
     hard_neg_map: dict[int, np.ndarray] = {}
-
     sample_anchors = unique_anchors
     if len(sample_anchors) > 2000:
         sample_anchors = rng.choice(sample_anchors, size=2000, replace=False)
 
+    graph_room = np.asarray(room_labels, dtype=np.int64)
     for a in sample_anchors.tolist():
         a = int(a)
         a_room = int(global_room[a])
-        if a_room < 0:
+        a_loc = global_to_local.get(a)
+        if a_room < 0 or a_loc is None:
             continue
 
-        dists = np.linalg.norm(encoder_emb[graph_indices] - encoder_emb[a], axis=-1)
-        close_mask = dists < 2.0 * median_dist
+        dists = np.linalg.norm(emb_graph - emb_all[a], axis=-1)
+        close_mask = dists <= close_radius
+        not_self = np.arange(len(graph_indices)) != int(a_loc)
 
-        cand_mask = np.zeros(len(graph_indices), dtype=bool)
+        valid_idx = np.zeros(0, dtype=np.int64)
+
+        # 1) Trusted room negatives, preferably near frontier / cut candidates.
         if allow_room_neg:
-            cand_mask = np.array([
-                int(global_room[int(g)]) != a_room and int(global_room[int(g)]) >= 0
-                for g in graph_indices
-            ], dtype=bool)
+            diff_room = (graph_room != a_room) & core_local & not_self
+            preferred = diff_room & frontier_local & close_mask
+            valid_local = np.where(preferred)[0]
+            if len(valid_local) == 0:
+                valid_local = np.where(diff_room & close_mask)[0]
+            if len(valid_local) == 0:
+                valid_local = np.where(diff_room)[0]
+            valid_idx = graph_indices[valid_local]
 
-        valid = cand_mask & close_mask
-        valid_idx = graph_indices[valid]
-
-        if len(valid_idx) == 0 and d_graph_local is not None and a in global_to_local:
-            a_loc = int(global_to_local[a])
-            dg = d_graph_local[a_loc]
-            far_mask_local = dg >= max(int(far_neg_min_graph_steps), 2)
-            valid = far_mask_local & close_mask
-            valid_idx = graph_indices[valid]
+        # 2) Otherwise, or as fallback, use graph-far but encoder-close negatives.
+        if len(valid_idx) == 0 and d_graph_local is not None:
+            dg = np.asarray(d_graph_local[int(a_loc)], dtype=np.int32)
+            far_local = (dg >= max(int(far_neg_min_graph_steps), 2)) & not_self
+            preferred = far_local & frontier_local & close_mask
+            valid_local = np.where(preferred)[0]
+            if len(valid_local) == 0:
+                valid_local = np.where(far_local & close_mask)[0]
+            if len(valid_local) == 0:
+                valid_local = np.where(far_local)[0]
+            valid_idx = graph_indices[valid_local]
 
         if len(valid_idx) == 0:
-            diff_room = graph_indices[cand_mask] if allow_room_neg else np.zeros(0, dtype=np.int64)
-            if len(diff_room) > 0:
-                d_diff = np.linalg.norm(encoder_emb[diff_room] - encoder_emb[a], axis=-1)
-                k = min(n_hard_neg, len(diff_room))
-                top_k = np.argpartition(d_diff, kth=k - 1)[:k]
-                valid_idx = diff_room[top_k]
-            elif d_graph_local is not None and a in global_to_local:
-                a_loc = int(global_to_local[a])
-                dg = d_graph_local[a_loc]
-                far_idx = graph_indices[dg >= max(int(far_neg_min_graph_steps), 2)]
-                if len(far_idx) > 0:
-                    d_far = np.linalg.norm(encoder_emb[far_idx] - encoder_emb[a], axis=-1)
-                    k = min(n_hard_neg, len(far_idx))
-                    top_k = np.argpartition(d_far, kth=k - 1)[:k]
-                    valid_idx = far_idx[top_k]
-                else:
-                    continue
-            else:
-                continue
+            continue
 
         if len(valid_idx) > n_hard_neg:
-            d_valid = np.linalg.norm(encoder_emb[valid_idx] - encoder_emb[a], axis=-1)
+            d_valid = np.linalg.norm(emb_all[valid_idx] - emb_all[a], axis=-1)
             top_k = np.argpartition(d_valid, kth=n_hard_neg - 1)[:n_hard_neg]
             valid_idx = valid_idx[top_k]
 
-        hard_neg_map[a] = valid_idx
+        hard_neg_map[a] = np.asarray(valid_idx, dtype=np.int64)
 
     return anchors, positives, hard_neg_map
 
@@ -510,7 +577,7 @@ def infonce_loss(encoder: ConvEncoder, obs_tensor: torch.Tensor,
     idx_to_local = {g: i for i, g in enumerate(all_indices)}
 
     obs_batch = obs_tensor[all_indices]
-    emb = encoder(obs_batch)
+    emb = F.normalize(encoder(obs_batch), dim=-1)
 
     total_loss = torch.tensor(0.0, device=device)
     count = 0
@@ -831,7 +898,13 @@ def run_iterative_barrier_training(
             edges, encoder_emb, idx_global, adj_list,
             d_temporal=d_temporal,
             min_temporal_detour=cfg_barrier.min_temporal_detour_for_barrier,
+            normalize_embeddings=cfg_barrier.barrier_embed_normalize,
+            denom_floor_abs=cfg_barrier.barrier_denom_floor_abs,
+            denom_floor_rel=cfg_barrier.barrier_denom_floor_rel,
+            score_clip_percentile=cfg_barrier.barrier_score_clip_percentile,
+            score_clip_max=cfg_barrier.barrier_score_clip_max,
         )
+        node_scores_local = _node_scores_from_edge_scores(n_nodes, edges, edge_scores)
 
         barrier_thresh = float(np.percentile(edge_scores,
                                              100.0 * (1.0 - cfg_barrier.barrier_threshold_frac)))
@@ -886,6 +959,9 @@ def run_iterative_barrier_training(
                     "n_high_barrier_edges": n_high,
                     "barrier_threshold": barrier_thresh,
                     "forced_split": bool(forced_split),
+                    "mean_edge_score": float(np.mean(edge_scores)) if len(edge_scores) else 0.0,
+                    "median_edge_score": float(np.median(edge_scores)) if len(edge_scores) else 0.0,
+                    "mean_node_score": float(np.mean(node_scores_local)) if len(node_scores_local) else 0.0,
                     "converged": True,
                     **eval_final,
                 })
@@ -903,6 +979,10 @@ def run_iterative_barrier_training(
             rng=rng,
             d_graph_local=d_graph,
             far_neg_min_graph_steps=cfg_barrier.far_neg_min_graph_steps,
+            forced_split=bool(forced_split),
+            node_scores_local=node_scores_local,
+            core_node_percentile=cfg_barrier.core_node_percentile,
+            frontier_node_percentile=cfg_barrier.frontier_node_percentile,
         )
 
         if anchors is None or len(anchors) == 0:
@@ -918,6 +998,11 @@ def run_iterative_barrier_training(
                 "barrier_threshold": barrier_thresh,
                 "mean_geo_loss": 0.0,
                 "forced_split": bool(forced_split),
+                "n_pos_pairs": 0,
+                "n_anchors_with_neg": 0,
+                "mean_edge_score": float(np.mean(edge_scores)) if len(edge_scores) else 0.0,
+                "median_edge_score": float(np.median(edge_scores)) if len(edge_scores) else 0.0,
+                "mean_node_score": float(np.mean(node_scores_local)) if len(node_scores_local) else 0.0,
                 "converged": False,
                 **eval_iter,
             })
@@ -984,6 +1069,12 @@ def run_iterative_barrier_training(
             "barrier_threshold": barrier_thresh,
             "mean_geo_loss": mean_geo_loss,
             "elapsed_s": dt,
+            "forced_split": bool(forced_split),
+            "n_pos_pairs": int(len(anchors)),
+            "n_anchors_with_neg": int(n_anchors_with_neg),
+            "mean_edge_score": float(np.mean(edge_scores)) if len(edge_scores) else 0.0,
+            "median_edge_score": float(np.median(edge_scores)) if len(edge_scores) else 0.0,
+            "mean_node_score": float(np.mean(node_scores_local)) if len(node_scores_local) else 0.0,
             "converged": False,
             **eval_iter,
         })
