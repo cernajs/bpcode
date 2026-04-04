@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Barrier-aware replay-graph training: projector head, detour+routed edge scores, topology metrics."""
 
 import argparse
 import json
 import os
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+import cv2
+import gymnasium as gym
+import gymnasium_robotics  # type: ignore
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,18 +18,15 @@ import torch.nn.functional as F
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.special import comb
 
 from maze_env import GeodesicComputer
 from maze_geometry_test import (
     TrainCfg,
     collect_data,
+    compute_sanity_metrics,
     _positions_to_cell_indices,
-    _adj_from_distmat,
-    _find_bridges,
-    _components_without_bridges,
 )
-from utils import get_device, set_seed, preprocess_img
+from utils import get_device, set_seed, preprocess_img, bottle
 from models import RSSM, ContinueModel, ConvDecoder, ConvEncoder, RewardModel
 
 from pointmaze_gr_geometry_test_topo import (
@@ -37,12 +36,12 @@ from pointmaze_gr_geometry_test_topo import (
     _connected_components_from_adj,
     _build_temporal_positive_table,
     _spearman_rho_numpy,
-    _temporal_only_adj_local,
-    _edge_betweenness_brandes_undirected,
-    _kmeans_numpy,
 )
 
-from pointmaze_large_topo_v2 import PointMazeLargeDiverseGRWrapper
+from pointmaze_large_topo_v2 import (
+    PointMazeLargeDiverseGRWrapper,
+    make_pointmaze_large_gr_geodesic,
+)
 
 
 # =====================================================================
@@ -66,31 +65,20 @@ class BarrierTrainingCfg:
     # barrier score & partitioning
     barrier_threshold_frac: float = 0.15
     min_room_size: int = 5
-    detour_max_edges: int = 4000
-    route_sample_pairs: int = 1200
-    route_d_min: int = 4
-    score_w_detour: float = 0.55
-    score_w_route: float = 0.45
-    unreachable_cap_mul: int = 2
+    min_temporal_detour_for_barrier: int = 2
+    fallback_seed_split_topk: int = 32
+    far_neg_min_graph_steps: int = 8
 
-    # projector head (train before / instead of full encoder fine-tune)
-    projector_dim: int = 128
-    projector_hidden: int = 256
-    projector_lr: float = 3e-4
-    projector_warmup_steps: int = 80
-    projector_steps: int = 200
-    finetune_encoder: bool = False
-    finetune_encoder_steps: int = 0
-    finetune_encoder_lr: float = 5e-6
-
-    # contrastive correction (on projector features; optional encoder FT)
+    # contrastive correction
+    geo_lr: float = 1e-4
     geo_lambda: float = 0.5
     geo_temperature: float = 0.07
+    geo_train_steps: int = 200
     geo_batch: int = 256
     pos_k: int = 3
     n_hard_neg: int = 32
 
-    # reconstruction regularization (only when finetune_encoder)
+    # reconstruction regularization
     recon_lambda: float = 1.0
     recon_batch: int = 16
 
@@ -100,7 +88,6 @@ class BarrierTrainingCfg:
 
     # evaluation
     eval_n_pairs: int = 2000
-    topo_top_frac: float = 0.15
 
 
 # =====================================================================
@@ -129,209 +116,231 @@ def compute_graph_distances(adj_list: list[list[int]]) -> np.ndarray:
     return _all_pairs_shortest_paths_bfs(adj_list)
 
 
-# =====================================================================
-# Phase 3: Edge scores (detour + routed mismatch)
-# =====================================================================
+def _build_temporal_subgraph(idx_global: np.ndarray, episode_ids: np.ndarray) -> list[list[int]]:
+    """Temporal-only adjacency on the sampled replay nodes.
 
-def bfs_dist_without_edge(
-    adj_list: list[list[int]],
-    n: int,
-    src: int,
-    dst: int,
-    skip_u: int,
-    skip_v: int,
-) -> int:
-    """Shortest hop distance src→dst when undirected edge (skip_u, skip_v) is forbidden."""
-    dist = np.full(n, -1, dtype=np.int32)
-    dist[src] = 0
-    q: deque[int] = deque([src])
-    while q:
-        x = int(q.popleft())
-        dx = int(dist[x])
-        for y in adj_list[x]:
-            y = int(y)
-            if (x == skip_u and y == skip_v) or (x == skip_v and y == skip_u):
+    Nodes are connected only to immediate predecessor/successor states from the
+    same episode that also survived the graph subsampling. This gives an
+    oracle-free teacher for temporal reachability and helps identify kNN
+    shortcuts whose endpoints are far in replay time.
+    """
+    m = len(idx_global)
+    g2l = {int(g): i for i, g in enumerate(idx_global.tolist())}
+    adj = [[] for _ in range(m)]
+    for loc, g in enumerate(idx_global.tolist()):
+        g = int(g)
+        ep = int(episode_ids[g])
+        for ng in (g - 1, g + 1):
+            if ng < 0 or ng >= len(episode_ids):
                 continue
-            if dist[y] < 0:
-                dist[y] = dx + 1
-                if y == dst:
-                    return int(dist[y])
-                q.append(y)
+            if int(episode_ids[ng]) != ep:
+                continue
+            j = g2l.get(int(ng))
+            if j is None or j == loc:
+                continue
+            adj[loc].append(int(j))
+    for i in range(m):
+        if len(adj[i]) > 1:
+            adj[i] = sorted(set(adj[i]))
+    return adj
+
+
+def _bfs_single_source(adj_list: list[list[int]], src: int) -> np.ndarray:
+    dist = np.full(len(adj_list), -1, dtype=np.int32)
+    q = deque([int(src)])
+    dist[int(src)] = 0
+    while q:
+        u = int(q.popleft())
+        du = int(dist[u])
+        for v in adj_list[u]:
+            v = int(v)
+            if dist[v] >= 0:
+                continue
+            dist[v] = du + 1
+            q.append(v)
+    return dist
+
+
+def _bfs_distance_without_edge(adj_list: list[list[int]], src: int, dst: int) -> int:
+    """Shortest-path distance after removing the undirected edge (src, dst)."""
+    src = int(src)
+    dst = int(dst)
+    q = deque([src])
+    dist = np.full(len(adj_list), -1, dtype=np.int32)
+    dist[src] = 0
+    while q:
+        u = int(q.popleft())
+        du = int(dist[u])
+        for v in adj_list[u]:
+            v = int(v)
+            if (u == src and v == dst) or (u == dst and v == src):
+                continue
+            if dist[v] >= 0:
+                continue
+            dist[v] = du + 1
+            if v == dst:
+                return int(dist[v])
+            q.append(v)
     return -1
 
 
-def bfs_shortest_path_edges(
-    adj_list: list[list[int]], n: int, src: int, dst: int
-) -> list[tuple[int, int]]:
-    """Undirected edges (min,max) on one BFS shortest path src→dst; empty if unreachable."""
-    parent = np.full(n, -1, dtype=np.int32)
-    dist = np.full(n, -1, dtype=np.int32)
-    dist[src] = 0
-    q: deque[int] = deque([src])
-    while q:
-        x = int(q.popleft())
-        dx = int(dist[x])
-        for y in adj_list[x]:
-            y = int(y)
-            if dist[y] < 0:
-                dist[y] = dx + 1
-                parent[y] = x
-                if y == dst:
-                    q.clear()
-                    break
-                q.append(y)
-    if dist[dst] < 0:
-        return []
-    path_edges: list[tuple[int, int]] = []
-    cur = int(dst)
-    while cur != src:
-        p = int(parent[cur])
-        a, b = (p, cur) if p < cur else (cur, p)
-        path_edges.append((a, b))
-        cur = p
-    return path_edges
-
-
-def _zscore_1d(x: np.ndarray) -> np.ndarray:
+def _zscore_safe(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
-    m = float(np.mean(x))
-    s = float(np.std(x))
-    if s < 1e-12:
-        return np.zeros_like(x, dtype=np.float64)
-    return (x - m) / s
+    if x.size == 0:
+        return x.astype(np.float32)
+    mu = float(np.mean(x))
+    sd = float(np.std(x))
+    if sd < 1e-8:
+        return np.zeros_like(x, dtype=np.float32)
+    return ((x - mu) / sd).astype(np.float32)
 
 
-def compute_detour_edge_scores(
+# =====================================================================
+# Phase 3: Barrier score computation
+# =====================================================================
+
+def compute_barrier_scores(encoder_emb: np.ndarray, idx_global: np.ndarray,
+                           adj_list: list[list[int]], d_graph: np.ndarray
+                           ) -> np.ndarray:
+    """Pairwise replay-graph / encoder-distance ratio for diagnostics only."""
+    emb_sub = encoder_emb[idx_global]
+    d_enc = np.linalg.norm(
+        emb_sub[:, None, :] - emb_sub[None, :, :], axis=-1
+    ).astype(np.float64)
+
+    d_g = d_graph.astype(np.float64)
+    d_g[d_g < 0] = 0.0
+
+    barrier = d_g / np.maximum(d_enc, 1e-8)
+    np.fill_diagonal(barrier, 0.0)
+    return barrier.astype(np.float32)
+
+
+def compute_per_edge_barrier_scores(
     edges: np.ndarray,
+    encoder_emb: np.ndarray,
+    idx_global: np.ndarray,
     adj_list: list[list[int]],
-    emb_sub: np.ndarray,
-    rng: np.random.Generator,
-    max_eval_edges: int = 4000,
-    unreachable_cap_mul: int = 2,
+    d_temporal: np.ndarray | None = None,
+    min_temporal_detour: int = 2,
 ) -> np.ndarray:
-    """score_e ≈ d_{G\\e}(u,v) / d_enc(u,v); bridges get large detour / small d_enc."""
-    m = len(adj_list)
-    n_e = len(edges)
-    scores = np.zeros(n_e, dtype=np.float64)
-    if n_e == 0:
-        return scores.astype(np.float32)
-    cap = int(max(2, unreachable_cap_mul * m))
-    order = np.arange(n_e)
-    if n_e > max_eval_edges:
-        order = rng.permutation(n_e)[:max_eval_edges]
-    mask = np.zeros(n_e, dtype=bool)
-    for ei in order.tolist():
-        u, v = int(edges[ei, 0]), int(edges[ei, 1])
-        raw = bfs_dist_without_edge(adj_list, m, u, v, u, v)
-        if raw < 0:
-            raw = cap
-        d_enc = float(np.linalg.norm(emb_sub[u] - emb_sub[v])) + 1e-8
-        scores[ei] = raw / d_enc
-        mask[ei] = True
-    if not np.all(mask):
-        fill = float(np.median(scores[mask])) if mask.any() else 1.0
-        scores[~mask] = fill
+    """Score each mixed-graph edge by how much it looks like a shortcut/barrier.
+
+    The previous version used d_graph(u,v) / d_enc(u,v) on direct edges. Since
+    direct mixed-graph edges have d_graph(u,v)=1 by construction, that reduced
+    to roughly 1/d_enc and did not measure barriers at all.
+
+    We fix this by using an exact *detour distance* after removing the edge from
+    the mixed graph. For kNN wormholes, the detour remains long. For true graph
+    bridges, the detour becomes very long or disconnected. We also blend in a
+    temporal-only proxy so that edges far in replay time but close in encoder
+    space get emphasized early.
+    """
+    if len(edges) == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    emb_sub = encoder_emb[idx_global]
+    d_enc_all = np.linalg.norm(
+        emb_sub[:, None, :] - emb_sub[None, :, :], axis=-1
+    ).astype(np.float64)
+
+    detour_steps = np.zeros(len(edges), dtype=np.float64)
+    temporal_steps = np.zeros(len(edges), dtype=np.float64)
+    fallback_detour = float(max(len(adj_list), 2))
+
+    for ei, e in enumerate(edges.tolist()):
+        u, v = int(e[0]), int(e[1])
+        d_detour = _bfs_distance_without_edge(adj_list, u, v)
+        if d_detour < 0:
+            d_detour = fallback_detour
+        detour_steps[ei] = float(max(d_detour, 2))
+
+        if d_temporal is not None:
+            dt = int(d_temporal[u, v])
+            if dt < 0:
+                dt = int(fallback_detour)
+            temporal_steps[ei] = float(max(dt, min_temporal_detour))
+        else:
+            temporal_steps[ei] = 0.0
+
+    denom = np.array([d_enc_all[int(e[0]), int(e[1])] for e in edges], dtype=np.float64)
+    denom = np.maximum(denom, 1e-8)
+
+    detour_ratio = detour_steps / denom
+    if d_temporal is not None:
+        temporal_ratio = temporal_steps / denom
+        scores = detour_ratio + 0.5 * np.maximum(0.0, _zscore_safe(temporal_ratio))
+    else:
+        scores = detour_ratio
     return scores.astype(np.float32)
 
 
-def compute_routed_mismatch_edge_scores(
-    edges: np.ndarray,
-    adj_list: list[list[int]],
-    d_graph: np.ndarray,
-    emb_sub: np.ndarray,
-    rng: np.random.Generator,
-    n_samples: int = 1200,
-    d_min: int = 4,
-) -> np.ndarray:
-    """Accumulate graph-vs-encoder mismatch along shortest paths for distant pairs."""
+# =====================================================================
+# Phase 4: Barrier-aware graph partitioning
+# =====================================================================
+
+def _merge_tiny_rooms(room_labels: np.ndarray, adj_list: list[list[int]], min_room_size: int) -> np.ndarray:
+    room_labels = np.asarray(room_labels, dtype=np.int64).copy()
+    unique, counts = np.unique(room_labels, return_counts=True)
+    large_rooms = set(unique[counts >= min_room_size].tolist())
+    if not large_rooms:
+        return room_labels
+    for i in range(len(room_labels)):
+        if int(room_labels[i]) in large_rooms:
+            continue
+        nbr_rooms = [int(room_labels[int(n)]) for n in adj_list[i] if int(room_labels[int(n)]) in large_rooms]
+        if nbr_rooms:
+            vals, cnts = np.unique(np.asarray(nbr_rooms, dtype=np.int64), return_counts=True)
+            room_labels[i] = int(vals[int(np.argmax(cnts))])
+    remap = {int(r): k for k, r in enumerate(np.unique(room_labels).tolist())}
+    return np.asarray([remap[int(r)] for r in room_labels], dtype=np.int64)
+
+
+def force_seed_partition(adj_list: list[list[int]], edges: np.ndarray, edge_scores: np.ndarray,
+                         topk: int = 32, min_room_size: int = 5) -> np.ndarray:
+    """Escape hatch when threshold-cut returns one giant room.
+
+    We pick a high-score edge, treat its endpoints as two seeds, and partition
+    nodes by nearest-seed graph distance. This is not claimed as a true room
+    decomposition; it is a non-degenerate pseudo-split so the contrastive stage
+    can bootstrap instead of dying with zero negatives.
+    """
     m = len(adj_list)
-    n_e = len(edges)
-    accum = np.zeros(n_e, dtype=np.float64)
-    counts = np.zeros(n_e, dtype=np.int64)
-    if n_e == 0 or m < 4:
-        return accum.astype(np.float32)
+    if m == 0 or len(edges) == 0:
+        return np.zeros(m, dtype=np.int64)
 
-    edge_to_i: dict[tuple[int, int], int] = {}
-    for i in range(n_e):
-        a, b = int(edges[i, 0]), int(edges[i, 1])
-        edge_to_i[(a, b) if a < b else (b, a)] = i
+    order = np.argsort(-np.asarray(edge_scores, dtype=np.float64))
+    tried = min(int(topk), len(order))
+    for oi in order[:tried].tolist():
+        u, v = int(edges[int(oi)][0]), int(edges[int(oi)][1])
+        du = _bfs_single_source(adj_list, u)
+        dv = _bfs_single_source(adj_list, v)
+        labels = np.where((du >= 0) & ((dv < 0) | (du <= dv)), 0, 1).astype(np.int64)
+        sizes = np.bincount(labels, minlength=2)
+        if int(sizes.min()) >= int(min_room_size):
+            return labels
 
-    # Candidate pairs with long graph distance
-    ii, jj = np.where((d_graph >= d_min) & (d_graph >= 0))
-    if len(ii) == 0:
-        return accum.astype(np.float32)
-    pool = np.stack([ii, jj], axis=1)
-    pool = pool[pool[:, 0] < pool[:, 1]]
-    if len(pool) == 0:
-        return accum.astype(np.float32)
-    take = min(int(n_samples), len(pool))
-    sel = rng.choice(len(pool), size=take, replace=len(pool) < take)
-    for t in sel.tolist():
-        i, j = int(pool[t, 0]), int(pool[t, 1])
-        dg = int(d_graph[i, j])
-        de = float(np.linalg.norm(emb_sub[i] - emb_sub[j])) + 1e-8
-        mismatch = float(dg) / de
-        for a, b in bfs_shortest_path_edges(adj_list, m, i, j):
-            key = (a, b) if a < b else (b, a)
-            ei = edge_to_i.get(key, None)
-            if ei is not None:
-                accum[ei] += mismatch
-                counts[ei] += 1
-
-    out = np.zeros(n_e, dtype=np.float64)
-    nz = counts > 0
-    out[nz] = accum[nz] / counts[nz].astype(np.float64)
-    if (~nz).any() and nz.any():
-        out[~nz] = float(np.median(out[nz]))
-    return out.astype(np.float32)
+    u = int(edges[int(order[0])][0])
+    du = _bfs_single_source(adj_list, u)
+    v = int(np.argmax(du)) if np.any(du >= 0) else int(edges[int(order[0])][1])
+    dv = _bfs_single_source(adj_list, v)
+    labels = np.where((du >= 0) & ((dv < 0) | (du <= dv)), 0, 1).astype(np.int64)
+    return labels
 
 
-def compute_combined_edge_barrier_scores(
-    edges: np.ndarray,
-    adj_list: list[list[int]],
-    d_graph: np.ndarray,
-    emb_sub: np.ndarray,
-    rng: np.random.Generator,
-    *,
-    detour_max_edges: int = 4000,
-    unreachable_cap_mul: int = 2,
-    route_sample_pairs: int = 1200,
-    route_d_min: int = 4,
-    w_detour: float = 0.55,
-    w_route: float = 0.45,
-) -> np.ndarray:
-    d_detour = compute_detour_edge_scores(
-        edges, adj_list, emb_sub, rng,
-        max_eval_edges=detour_max_edges,
-        unreachable_cap_mul=unreachable_cap_mul,
-    )
-    d_route = compute_routed_mismatch_edge_scores(
-        edges, adj_list, d_graph, emb_sub, rng,
-        n_samples=route_sample_pairs,
-        d_min=route_d_min,
-    )
-    z_d = _zscore_1d(d_detour.astype(np.float64))
-    z_r = _zscore_1d(d_route.astype(np.float64))
-    wsum = max(w_detour + w_route, 1e-8)
-    combined = (w_detour * z_d + w_route * z_r) / wsum
-    return combined.astype(np.float32)
+def partition_into_rooms(adj_list: list[list[int]], edges: np.ndarray,
+                         edge_scores: np.ndarray,
+                         threshold_frac: float = 0.15,
+                         min_room_size: int = 5,
+                         fallback_seed_split_topk: int = 32) -> tuple[np.ndarray, bool]:
+    """Remove top barrier edges, return connected-component room labels.
 
-
-# =====================================================================
-# Phase 4: Barrier-aware graph partitioning + escape hatch
-# =====================================================================
-
-def partition_into_rooms(
-    adj_list: list[list[int]],
-    edges: np.ndarray,
-    edge_scores: np.ndarray,
-    threshold_frac: float = 0.15,
-    min_room_size: int = 5,
-) -> np.ndarray:
-    """Remove top barrier-score edges; return connected-component room labels."""
+    Returns (room_labels, forced_split). The forced split is used only when the
+    threshold cut leaves a single connected component.
+    """
     m = len(adj_list)
     if len(edges) == 0:
-        return np.zeros(m, dtype=np.int64)
+        return np.zeros(m, dtype=np.int64), False
 
     threshold = float(np.percentile(edge_scores, 100.0 * (1.0 - threshold_frac)))
 
@@ -343,125 +352,20 @@ def partition_into_rooms(
             filtered_adj[v].append(u)
 
     room_labels = _connected_components_from_adj(filtered_adj)
+    room_labels = _merge_tiny_rooms(room_labels, adj_list, min_room_size=min_room_size)
 
-    unique, counts = np.unique(room_labels, return_counts=True)
-    large_rooms = set(unique[counts >= min_room_size].tolist())
-    if large_rooms:
-        for i in range(m):
-            if int(room_labels[i]) not in large_rooms:
-                for nbr in adj_list[i]:
-                    if int(room_labels[int(nbr)]) in large_rooms:
-                        room_labels[i] = room_labels[int(nbr)]
-                        break
-
-    return room_labels
-
-
-def fiedler_bisection_two_way(adj_list: list[list[int]], rng: np.random.Generator) -> np.ndarray:
-    """Second eigenvector of normalized Laplacian, split at median → two pseudo-rooms."""
-    m = len(adj_list)
-    if m < 4:
-        return np.zeros(m, dtype=np.int64)
-    a = np.zeros((m, m), dtype=np.float64)
-    for i, nei in enumerate(adj_list):
-        for j in nei:
-            jj = int(j)
-            if jj != i:
-                a[i, jj] = 1.0
-    deg = a.sum(axis=1)
-    inv_sqrt = np.zeros(m, dtype=np.float64)
-    nz = deg > 1e-12
-    inv_sqrt[nz] = 1.0 / np.sqrt(deg[nz])
-    d_inv = np.diag(inv_sqrt)
-    ln = np.eye(m, dtype=np.float64) - d_inv @ a @ d_inv
-    try:
-        evals, evecs = np.linalg.eigh(ln)
-    except np.linalg.LinAlgError:
-        return np.zeros(m, dtype=np.int64)
-    f = evecs[:, 1].astype(np.float64)
-    med = float(np.median(f))
-    return (f > med).astype(np.int64)
-
-
-def split_by_high_betweenness_cut(adj_list: list[list[int]], rng: np.random.Generator) -> np.ndarray | None:
-    """Remove single highest-betweenness edge and return two components if disconnected."""
-    eb = _edge_betweenness_brandes_undirected(adj_list)
-    if not eb:
-        return None
-    # pick max edge
-    best_e, best_s = None, -1.0
-    for (a, b), s in eb.items():
-        if float(s) > best_s:
-            best_s, best_e = float(s), (int(a), int(b))
-    if best_e is None:
-        return None
-    u, v = best_e[0], best_e[1]
-    m = len(adj_list)
-    filt: list[list[int]] = [[] for _ in range(m)]
-    for i in range(m):
-        for j in adj_list[i]:
-            j = int(j)
-            if {i, j} == {u, v}:
-                continue
-            filt[i].append(j)
-    comp = _connected_components_from_adj(filt)
-    if int(comp.max()) + 1 >= 2:
-        return comp
-    return None
-
-
-def apply_escape_hatch_singleton(
-    room_labels: np.ndarray,
-    adj_list: list[list[int]],
-    idx_global: np.ndarray,
-    episode_ids: np.ndarray,
-    emb_sub: np.ndarray,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, str]:
-    """If pruning yields one room, force ≥2 groups from graph/geometry structure."""
-    n_rooms = int(room_labels.max()) + 1
-    if n_rooms >= 2:
-        return room_labels, "none"
-
-    lab = fiedler_bisection_two_way(adj_list, rng)
-    if len(np.unique(lab)) >= 2:
-        return lab.astype(np.int64), "fiedler_bisection"
-
-    adj_t = _temporal_only_adj_local(idx_global, episode_ids, adj_list)
-    comp_t = _connected_components_from_adj(adj_t)
-    if int(comp_t.max()) + 1 >= 2:
-        return comp_t.astype(np.int64), "temporal_components"
-
-    cut = split_by_high_betweenness_cut(adj_list, rng)
-    if cut is not None:
-        return cut.astype(np.int64), "betweenness_cut"
-
-    # k-means k=2 on embeddings (last resort)
-    if len(emb_sub) >= 8:
-        km = _kmeans_numpy(emb_sub.astype(np.float64), k=2, rng=rng, n_iter=30)
-        if len(np.unique(km)) >= 2:
-            return km.astype(np.int64), "kmeans_emb_k2"
-
-    return room_labels, "failed"
-
-
-# =====================================================================
-# Projector head (trained before optional encoder fine-tune)
-# =====================================================================
-
-class GeoProjector(nn.Module):
-    """Small MLP on frozen encoder features; outputs L2-normalized z for contrastive loss."""
-
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim),
+    n_rooms = int(room_labels.max()) + 1 if len(room_labels) else 0
+    forced_split = False
+    if n_rooms <= 1:
+        room_labels = force_seed_partition(
+            adj_list, edges, edge_scores,
+            topk=fallback_seed_split_topk,
+            min_room_size=min_room_size,
         )
+        room_labels = _merge_tiny_rooms(room_labels, adj_list, min_room_size=min_room_size)
+        forced_split = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.net(x), p=2, dim=-1, eps=1e-8)
+    return room_labels, forced_split
 
 
 # =====================================================================
@@ -471,14 +375,21 @@ class GeoProjector(nn.Module):
 def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
                episode_ids: np.ndarray, idx_global: np.ndarray,
                pos_k: int = 3, n_hard_neg: int = 32,
-               rng: np.random.Generator = None):
-    """Mine positive pairs (same room + temporally close) and hard negatives
-    (different room + close in encoder space)."""
+               rng: np.random.Generator = None,
+               d_graph_local: np.ndarray | None = None,
+               far_neg_min_graph_steps: int = 8):
+    """Mine positive pairs and hard negatives.
+
+    Primary negatives come from different discovered rooms. If the current split
+    is still weak, we fall back to replay-graph-far but encoder-close negatives
+    so the InfoNCE stage never collapses to zero.
+    """
     if rng is None:
         rng = np.random.default_rng(0)
 
     N = len(encoder_emb)
     m = len(idx_global)
+    global_to_local = {int(g): i for i, g in enumerate(idx_global.tolist())}
 
     # Global room labels for all replay states (-1 = not in graph)
     global_room = np.full(N, -1, dtype=np.int64)
@@ -502,11 +413,13 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
     anchors = np.array(anchors, dtype=np.int64)
     positives = np.array(positives, dtype=np.int64)
 
-    # Hard negatives: different room but close in encoder space
+    # Hard negatives: different room if available, otherwise graph-far but encoder-close
     graph_indices = idx_global.copy()
     emb_graph = encoder_emb[graph_indices]
-    median_dist = float(np.median(np.linalg.norm(
-        emb_graph[:1] - emb_graph[1:], axis=-1)))
+    pair_probe = np.linalg.norm(emb_graph[:1] - emb_graph[1:], axis=-1) if len(emb_graph) > 1 else np.array([1.0])
+    median_dist = float(np.median(pair_probe))
+    unique_rooms = np.unique(room_labels) if len(room_labels) else np.array([], dtype=np.int64)
+    allow_room_neg = len(unique_rooms) >= 2
 
     unique_anchors = np.unique(anchors)
     hard_neg_map: dict[int, np.ndarray] = {}
@@ -522,22 +435,43 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
             continue
 
         dists = np.linalg.norm(encoder_emb[graph_indices] - encoder_emb[a], axis=-1)
-        # Candidates: different room, within 2x median distance
-        cand_mask = np.array([
-            int(global_room[int(g)]) != a_room and int(global_room[int(g)]) >= 0
-            for g in graph_indices
-        ], dtype=bool)
         close_mask = dists < 2.0 * median_dist
+
+        cand_mask = np.zeros(len(graph_indices), dtype=bool)
+        if allow_room_neg:
+            cand_mask = np.array([
+                int(global_room[int(g)]) != a_room and int(global_room[int(g)]) >= 0
+                for g in graph_indices
+            ], dtype=bool)
+
         valid = cand_mask & close_mask
         valid_idx = graph_indices[valid]
 
+        if len(valid_idx) == 0 and d_graph_local is not None and a in global_to_local:
+            a_loc = int(global_to_local[a])
+            dg = d_graph_local[a_loc]
+            far_mask_local = dg >= max(int(far_neg_min_graph_steps), 2)
+            valid = far_mask_local & close_mask
+            valid_idx = graph_indices[valid]
+
         if len(valid_idx) == 0:
-            diff_room = graph_indices[cand_mask]
+            diff_room = graph_indices[cand_mask] if allow_room_neg else np.zeros(0, dtype=np.int64)
             if len(diff_room) > 0:
                 d_diff = np.linalg.norm(encoder_emb[diff_room] - encoder_emb[a], axis=-1)
                 k = min(n_hard_neg, len(diff_room))
                 top_k = np.argpartition(d_diff, kth=k - 1)[:k]
                 valid_idx = diff_room[top_k]
+            elif d_graph_local is not None and a in global_to_local:
+                a_loc = int(global_to_local[a])
+                dg = d_graph_local[a_loc]
+                far_idx = graph_indices[dg >= max(int(far_neg_min_graph_steps), 2)]
+                if len(far_idx) > 0:
+                    d_far = np.linalg.norm(encoder_emb[far_idx] - encoder_emb[a], axis=-1)
+                    k = min(n_hard_neg, len(far_idx))
+                    top_k = np.argpartition(d_far, kth=k - 1)[:k]
+                    valid_idx = far_idx[top_k]
+                else:
+                    continue
             else:
                 continue
 
@@ -551,28 +485,20 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
     return anchors, positives, hard_neg_map
 
 
-def infonce_projector_loss(
-    encoder: ConvEncoder,
-    projector: GeoProjector,
-    obs_tensor: torch.Tensor,
-    anchor_idx: np.ndarray,
-    pos_idx: np.ndarray,
-    neg_idx_map: dict[int, np.ndarray],
-    batch_size: int,
-    temperature: float,
-    device: torch.device,
-    rng: np.random.Generator,
-    *,
-    grad_encoder: bool,
-) -> torch.Tensor:
-    """InfoNCE on L2-normalized projector features; encoder grads optional."""
+def infonce_loss(encoder: ConvEncoder, obs_tensor: torch.Tensor,
+                 anchor_idx: np.ndarray, pos_idx: np.ndarray,
+                 neg_idx_map: dict[int, np.ndarray],
+                 batch_size: int, temperature: float,
+                 device: torch.device, rng: np.random.Generator,
+                 cfg: TrainCfg):
+    """Compute InfoNCE geo-correction loss on a mini-batch."""
     n_pairs = len(anchor_idx)
     batch_idx = rng.choice(n_pairs, size=min(batch_size, n_pairs), replace=False)
 
     batch_anchors = anchor_idx[batch_idx]
     batch_pos = pos_idx[batch_idx]
 
-    all_indices: set[int] = set()
+    all_indices = set()
     for a in batch_anchors.tolist():
         all_indices.add(int(a))
         if int(a) in neg_idx_map:
@@ -580,18 +506,11 @@ def infonce_projector_loss(
                 all_indices.add(int(n))
     for p in batch_pos.tolist():
         all_indices.add(int(p))
-    sorted_idx = sorted(all_indices)
-    idx_to_local = {g: i for i, g in enumerate(sorted_idx)}
+    all_indices = sorted(all_indices)
+    idx_to_local = {g: i for i, g in enumerate(all_indices)}
 
-    obs_batch = obs_tensor[sorted_idx].contiguous()
-
-    if grad_encoder:
-        e = encoder(obs_batch)
-        z = projector(e)
-    else:
-        with torch.no_grad():
-            e = encoder(obs_batch)
-        z = projector(e)
+    obs_batch = obs_tensor[all_indices]
+    emb = encoder(obs_batch)
 
     total_loss = torch.tensor(0.0, device=device)
     count = 0
@@ -601,20 +520,20 @@ def infonce_projector_loss(
         if a not in neg_idx_map or len(neg_idx_map[a]) == 0:
             continue
 
-        a_z = z[idx_to_local[a]]
-        p_z = z[idx_to_local[p]]
+        a_emb = emb[idx_to_local[a]]
+        p_emb = emb[idx_to_local[p]]
 
         neg_globals = neg_idx_map[a]
-        n_z = z[[idx_to_local[int(n)] for n in neg_globals.tolist()
-                 if int(n) in idx_to_local]]
+        n_embs = emb[[idx_to_local[int(n)] for n in neg_globals.tolist()
+                       if int(n) in idx_to_local]]
 
-        if len(n_z) == 0:
+        if len(n_embs) == 0:
             continue
 
-        pos_sim = (a_z * p_z).sum() / temperature
-        neg_sim = (a_z.unsqueeze(0) * n_z).sum(dim=-1) / temperature
+        pos_sim = F.cosine_similarity(a_emb.unsqueeze(0), p_emb.unsqueeze(0)) / temperature
+        neg_sim = F.cosine_similarity(a_emb.unsqueeze(0).expand_as(n_embs), n_embs) / temperature
 
-        logits = torch.cat([pos_sim.unsqueeze(0), neg_sim], dim=0)
+        logits = torch.cat([pos_sim, neg_sim], dim=0)
         labels = torch.zeros(1, dtype=torch.long, device=device)
         total_loss = total_loss + F.cross_entropy(logits.unsqueeze(0), labels)
         count += 1
@@ -657,140 +576,9 @@ def recompute_embeddings(encoder: ConvEncoder, obs_tensor: torch.Tensor,
     all_emb = []
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
-        emb = encoder(obs_tensor[start:end].contiguous())
+        emb = encoder(obs_tensor[start:end])
         all_emb.append(emb.cpu().numpy())
     return np.concatenate(all_emb, axis=0).astype(np.float32)
-
-
-@torch.no_grad()
-def recompute_latent_repr(
-    encoder: ConvEncoder,
-    projector: GeoProjector,
-    obs_tensor: torch.Tensor,
-    device: torch.device,
-    batch_size: int = 256,
-) -> np.ndarray:
-    """L2-normalized projector features for every replay row."""
-    encoder.eval()
-    projector.eval()
-    N = obs_tensor.shape[0]
-    out: list[np.ndarray] = []
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        x = obs_tensor[start:end].contiguous()
-        z = projector(encoder(x))
-        out.append(z.cpu().numpy())
-    return np.concatenate(out, axis=0).astype(np.float32)
-
-
-def adjusted_rand_index(yt: np.ndarray, yp: np.ndarray) -> float:
-    """Adjusted Rand index (oracle-free labels vs predicted); needs scipy.special.comb."""
-    yt = np.asarray(yt, dtype=np.int64)
-    yp = np.asarray(yp, dtype=np.int64)
-    n = len(yt)
-    if n < 2:
-        return 0.0
-    classes = np.unique(yt)
-    clusters = np.unique(yp)
-    ct = np.zeros((len(classes), len(clusters)), dtype=np.int64)
-    for i, c in enumerate(classes):
-        for j, k in enumerate(clusters):
-            ct[i, j] = int(np.sum((yt == c) & (yp == k)))
-    nijs = ct.ravel()
-    ni = ct.sum(axis=1)
-    nj = ct.sum(axis=0)
-    tn = float(comb(nijs, 2, exact=False).sum())
-    sum_comb_c = float(comb(ni, 2, exact=False).sum())
-    sum_comb_k = float(comb(nj, 2, exact=False).sum())
-    cn = float(comb(n, 2, exact=False))
-    if cn < 1e-12:
-        return 0.0
-    prod_comb = sum_comb_c * sum_comb_k / cn
-    mean_comb = 0.5 * (sum_comb_c + sum_comb_k)
-    denom = mean_comb - prod_comb
-    if abs(denom) < 1e-12:
-        return 0.0
-    return float((tn - prod_comb) / denom)
-
-
-def warmup_temporal_projector(
-    encoder: ConvEncoder,
-    projector: GeoProjector,
-    obs_tensor: torch.Tensor,
-    episode_ids: np.ndarray,
-    device: torch.device,
-    rng: np.random.Generator,
-    n_steps: int,
-    lr: float,
-    temperature: float,
-    batch: int = 128,
-    n_neg: int = 24,
-) -> None:
-    """Projector-only InfoNCE using consecutive same-episode indices as positives."""
-    if n_steps <= 0:
-        return
-    encoder.eval()
-    for p in encoder.parameters():
-        p.requires_grad = False
-    projector.train()
-    opt = torch.optim.Adam(projector.parameters(), lr=lr)
-    ep = np.asarray(episode_ids, dtype=np.int64)
-    N = int(len(ep))
-    if N < 4:
-        for p in encoder.parameters():
-            p.requires_grad = True
-        return
-    for _ in range(n_steps):
-        anchors = []
-        positives = []
-        for _ in range(batch * 4):
-            i = int(rng.integers(0, N - 1))
-            if ep[i] == ep[i + 1]:
-                anchors.append(i)
-                positives.append(i + 1)
-            if len(anchors) >= batch:
-                break
-        if len(anchors) < 8:
-            continue
-        anchors = np.asarray(anchors[:batch], dtype=np.int64)
-        positives = np.asarray(positives[:batch], dtype=np.int64)
-        neg = rng.integers(0, N, size=(len(anchors), n_neg), dtype=np.int64)
-        for r in range(neg.shape[0]):
-            for c in range(neg.shape[1]):
-                if neg[r, c] == anchors[r] or neg[r, c] == positives[r]:
-                    neg[r, c] = (neg[r, c] + 1) % N
-
-        idx_set: set[int] = set()
-        for a, p in zip(anchors.tolist(), positives.tolist()):
-            idx_set.add(int(a))
-            idx_set.add(int(p))
-        for row in neg.tolist():
-            for j in row:
-                idx_set.add(int(j))
-        idx_list = sorted(idx_set)
-        local = {g: i for i, g in enumerate(idx_list)}
-        obs_b = obs_tensor[idx_list].contiguous()
-        with torch.no_grad():
-            e_all = encoder(obs_b)
-        z_all = projector(e_all)
-        opt.zero_grad(set_to_none=True)
-        total = torch.tensor(0.0, device=device)
-        for bi in range(len(anchors)):
-            a = local[int(anchors[bi])]
-            p = local[int(positives[bi])]
-            a_z = z_all[a]
-            p_z = z_all[p]
-            n_idx = [local[int(x)] for x in neg[bi].tolist()]
-            n_z = z_all[n_idx]
-            pos_sim = (a_z * p_z).sum() / temperature
-            neg_sim = (a_z.unsqueeze(0) * n_z).sum(dim=-1) / temperature
-            logits = torch.cat([pos_sim.unsqueeze(0), neg_sim], dim=0)
-            labels = torch.zeros(1, dtype=torch.long, device=device)
-            total = total + F.cross_entropy(logits.unsqueeze(0), labels)
-        (total / len(anchors)).backward()
-        opt.step()
-    for p in encoder.parameters():
-        p.requires_grad = True
 
 
 # =====================================================================
@@ -799,14 +587,10 @@ def warmup_temporal_projector(
 
 def rooms_converged(rooms_new: np.ndarray, rooms_prev: np.ndarray | None,
                     tolerance: float = 0.05) -> bool:
-    """Check if room partitioning has stabilized (pairwise co-assignment agreement)."""
+    """Check if room partitioning has stabilized (adjusted Rand index proxy)."""
     if rooms_prev is None:
         return False
     if len(rooms_new) != len(rooms_prev):
-        return False
-
-    n_rooms = int(rooms_new.max()) + 1
-    if n_rooms < 2:
         return False
 
     n = len(rooms_new)
@@ -881,82 +665,6 @@ def evaluate_encoder_geometry(encoder_emb: np.ndarray, pos: np.ndarray,
     }
 
 
-def oracle_cell_rooms(geodesic: GeodesicComputer) -> tuple[np.ndarray, set[tuple[int, int]]]:
-    """Room label per free cell (components after deleting maze bridges) + bridge edge set."""
-    adj = _adj_from_distmat(geodesic.dist_matrix)
-    bridges = _find_bridges(adj)
-    comp, _ = _components_without_bridges(adj, bridges)
-    return comp.astype(np.int64), bridges
-
-
-def evaluate_topology_metrics(
-    pos: np.ndarray,
-    geodesic: GeodesicComputer,
-    idx_global: np.ndarray,
-    edges: np.ndarray,
-    edge_scores: np.ndarray,
-    pred_room_global: np.ndarray,
-    top_frac: float = 0.15,
-    rng: np.random.Generator | None = None,
-) -> dict[str, float]:
-    """Room–oracle agreement, cut-edge enrichment, bridge-adjacent hit rate on top-scored edges."""
-    if rng is None:
-        rng = np.random.default_rng(0)
-
-    oracle_rooms, bridge_set = oracle_cell_rooms(geodesic)
-    cells = _positions_to_cell_indices(geodesic, pos).astype(np.int64)
-    oracle_for_replay = oracle_rooms[cells]
-
-    valid = pred_room_global >= 0
-    if valid.sum() >= 4:
-        ari = adjusted_rand_index(oracle_for_replay[valid], pred_room_global[valid])
-    else:
-        ari = 0.0
-
-    def _cell_pair(gu: int, gv: int) -> tuple[int, int]:
-        cu, cv = int(cells[gu]), int(cells[gv])
-        return (cu, cv) if cu < cv else (cv, cu)
-
-    n_e = len(edges)
-    room_cut = np.zeros(n_e, dtype=bool)
-    bridge_hit = np.zeros(n_e, dtype=bool)
-    for ei in range(n_e):
-        u, v = int(edges[ei, 0]), int(edges[ei, 1])
-        gu, gv = int(idx_global[u]), int(idx_global[v])
-        cu, cv = int(cells[gu]), int(cells[gv])
-        room_cut[ei] = oracle_rooms[cu] != oracle_rooms[cv]
-        bridge_hit[ei] = _cell_pair(gu, gv) in bridge_set
-
-    if n_e > 0:
-        thr = float(np.percentile(edge_scores, 100.0 * (1.0 - top_frac)))
-        top_mask = edge_scores >= thr
-        rand_mask = np.zeros(n_e, dtype=bool)
-        rand_mask[rng.choice(n_e, size=min(n_e, max(1, int(top_mask.sum()))), replace=False)] = True
-        p_top = float(room_cut[top_mask].mean()) if top_mask.any() else 0.0
-        p_rand = float(room_cut[rand_mask].mean()) if rand_mask.any() else 0.0
-        cut_enrich = p_top / max(p_rand, 1e-6)
-        b_top = float(bridge_hit[top_mask].mean()) if top_mask.any() else 0.0
-        b_rand = float(bridge_hit[rand_mask].mean()) if rand_mask.any() else 0.0
-        bridge_enrich = b_top / max(b_rand, 1e-6)
-    else:
-        p_top = p_rand = cut_enrich = b_top = b_rand = bridge_enrich = 0.0
-
-    n_oracle_rooms = int(oracle_rooms.max()) + 1
-    n_pred = int(pred_room_global[valid].max()) + 1 if valid.any() else 0
-
-    return {
-        "adjusted_rand_vs_oracle_rooms": float(ari),
-        "n_oracle_rooms": float(n_oracle_rooms),
-        "n_pred_rooms_on_graph": float(n_pred),
-        "cut_edge_rate_top_frac": float(p_top),
-        "cut_edge_rate_random": float(p_rand),
-        "cut_edge_enrichment": float(cut_enrich),
-        "bridge_hit_rate_top_frac": float(b_top),
-        "bridge_hit_rate_random": float(b_rand),
-        "bridge_hit_enrichment": float(bridge_enrich),
-    }
-
-
 # =====================================================================
 # Visualization
 # =====================================================================
@@ -1000,9 +708,9 @@ def plot_barrier_distribution(edge_scores: np.ndarray, threshold: float,
     ax.hist(edge_scores, bins=80, color="steelblue", alpha=0.7, edgecolor="none")
     ax.axvline(threshold, color="red", linestyle="--", linewidth=2,
                label=f"Threshold={threshold:.2f}")
-    ax.set_xlabel("Combined edge score (z-detour + z-routed mismatch)")
+    ax.set_xlabel("Barrier score (detour / d_enc)")
     ax.set_ylabel("Edge count")
-    ax.set_title(f"Edge score distribution (iter {iteration})")
+    ax.set_title(f"Barrier score distribution (iter {iteration})")
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -1010,40 +718,28 @@ def plot_barrier_distribution(edge_scores: np.ndarray, threshold: float,
 
 
 def plot_convergence(history: list[dict], out_path: str):
-    """Topology-focused metrics across iterations."""
+    """Plot key metrics across iterations."""
     iters = [h["iteration"] for h in history]
     n_rooms = [h["n_rooms"] for h in history]
-    ari = [h.get("adjusted_rand_vs_oracle_rooms", 0.0) for h in history]
-    cut_e = [h.get("cut_edge_enrichment", 0.0) for h in history]
-    bridge_e = [h.get("bridge_hit_enrichment", 0.0) for h in history]
+    spearman = [h.get("spearman_enc_vs_geodesic", 0.0) for h in history]
     geo_loss = [h.get("mean_geo_loss", 0.0) for h in history]
 
-    fig, axes = plt.subplots(1, 5, figsize=(22, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
     axes[0].plot(iters, n_rooms, "o-", color="teal")
     axes[0].set_xlabel("Iteration")
-    axes[0].set_ylabel("Predicted rooms")
-    axes[0].set_title("Room count")
+    axes[0].set_ylabel("Rooms discovered")
+    axes[0].set_title("Room count convergence")
 
-    axes[1].plot(iters, ari, "s-", color="darkgreen")
+    axes[1].plot(iters, spearman, "s-", color="darkorange")
     axes[1].set_xlabel("Iteration")
-    axes[1].set_ylabel("ARI vs oracle rooms")
-    axes[1].set_title("Room agreement")
+    axes[1].set_ylabel("Spearman ρ (enc vs geodesic)")
+    axes[1].set_title("Encoder-geodesic correlation")
 
-    axes[2].plot(iters, cut_e, "^-", color="coral")
+    axes[2].plot(iters, geo_loss, "^-", color="crimson")
     axes[2].set_xlabel("Iteration")
-    axes[2].set_ylabel("Enrichment")
-    axes[2].set_title("Cut-edge enrichment")
-
-    axes[3].plot(iters, bridge_e, "d-", color="purple")
-    axes[3].set_xlabel("Iteration")
-    axes[3].set_ylabel("Enrichment")
-    axes[3].set_title("Bridge-hit enrichment")
-
-    axes[4].plot(iters, geo_loss, "v-", color="crimson")
-    axes[4].set_xlabel("Iteration")
-    axes[4].set_ylabel("L_geo")
-    axes[4].set_title("InfoNCE (projector)")
+    axes[2].set_ylabel("L_geo (InfoNCE)")
+    axes[2].set_title("Contrastive correction loss")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -1061,7 +757,7 @@ def run_iterative_barrier_training(
     cfg_barrier: BarrierTrainingCfg,
     device: torch.device,
 ):
-    """Bootstrap loop on projector features: detour+routed scores → rooms → InfoNCE → repeat."""
+    """Main bootstrap loop: graph -> barriers -> rooms -> correct -> repeat."""
     out_dir = cfg_barrier.output_dir
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1072,49 +768,35 @@ def run_iterative_barrier_training(
 
     rng = np.random.default_rng(cfg_barrier.seed)
 
-    projector = GeoProjector(
-        int(cfg_train.embed_dim),
-        int(cfg_barrier.projector_hidden),
-        int(cfg_barrier.projector_dim),
-    ).to(device)
-
     # ---- Collect replay data ----
     print("\n  [Collect] Gathering replay data ...")
     cfg_train.collect_episodes = cfg_barrier.collect_episodes
     data = collect_data(env, models, cfg_train, device)
     pos = data["pos"]
     episode_ids = data["episode_ids"]
-    raw_obs = data["raw_obs"]
+    raw_obs = data["raw_obs"]  # [N, H*W*C] flattened, /255
     N = len(pos)
     print(f"    {N} replay states from {cfg_barrier.collect_episodes} episodes")
 
+    # Reconstruct image tensors for encoder forward passes: [N, C, H, W]
     img_size = cfg_train.img_size
     obs_images = raw_obs.reshape(N, img_size, img_size, 3)
     obs_tensor = torch.tensor(obs_images, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
     preprocess_img(obs_tensor, depth=cfg_train.bit_depth)
 
-    print("  [Warmup] Projector-only temporal InfoNCE ...")
-    warmup_temporal_projector(
-        encoder, projector, obs_tensor, episode_ids, device, rng,
-        n_steps=int(cfg_barrier.projector_warmup_steps),
-        lr=float(cfg_barrier.projector_lr),
-        temperature=float(cfg_barrier.geo_temperature),
-    )
-
-    latent_np = recompute_latent_repr(encoder, projector, obs_tensor, device)
+    # Initial encoder embeddings
     encoder_emb = recompute_embeddings(encoder, obs_tensor, device)
 
-    eval0_enc = evaluate_encoder_geometry(
-        encoder_emb, pos, geodesic, n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
-    print(f"    Initial encoder–geodesic Spearman ρ = {eval0_enc['spearman_enc_vs_geodesic']:.4f} (diagnostic)")
+    # Initial evaluation
+    eval0 = evaluate_encoder_geometry(encoder_emb, pos, geodesic,
+                                      n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
+    print(f"    Initial encoder-geodesic Spearman ρ = {eval0['spearman_enc_vs_geodesic']:.4f}")
 
-    projector_opt = torch.optim.Adam(projector.parameters(), lr=float(cfg_barrier.projector_lr))
-    encoder_opt = None
-    if cfg_barrier.finetune_encoder or int(cfg_barrier.finetune_encoder_steps) > 0:
-        encoder_opt = torch.optim.Adam(encoder.parameters(), lr=float(cfg_barrier.finetune_encoder_lr))
+    # Optimizer for encoder fine-tuning (low LR to preserve reconstruction)
+    encoder_opt = torch.optim.Adam(encoder.parameters(), lr=cfg_barrier.geo_lr)
 
     history: list[dict] = []
-    prev_rooms: np.ndarray | None = None
+    prev_rooms = None
     patience_counter = 0
 
     for iteration in range(cfg_barrier.max_iterations):
@@ -1123,37 +805,39 @@ def run_iterative_barrier_training(
         print(f"  Iteration {iteration + 1}/{cfg_barrier.max_iterations}")
         print(f"{'='*60}")
 
-        print("  [Phase 1] Building mixed replay graph (projector features) ...")
+        # Phase 1: Build replay graph
+        print("  [Phase 1] Building mixed replay graph ...")
         idx_global, g2l, adj_list, edges, n_nodes, n_edges = build_replay_graph(
-            latent_np, episode_ids,
+            encoder_emb, episode_ids,
             n_graph_max=cfg_barrier.graph_max,
             k_knn=cfg_barrier.knn_k,
         )
-        emb_sub = latent_np[idx_global]
         print(f"    Graph: {n_nodes} nodes, {n_edges} edges")
 
         if n_nodes < 16:
             print("    Graph too small, stopping.")
             break
 
-        print("  [Phase 2] All-pairs shortest paths ...")
+        # Phase 2: Compute graph shortest paths
+        print("  [Phase 2] Computing all-pairs shortest paths ...")
         d_graph = compute_graph_distances(adj_list)
+        temporal_adj = _build_temporal_subgraph(idx_global, episode_ids)
+        d_temporal = compute_graph_distances(temporal_adj)
 
-        print("  [Phase 3] Edge scores (detour without edge + routed mismatch) ...")
-        edge_scores = compute_combined_edge_barrier_scores(
-            edges, adj_list, d_graph, emb_sub, rng,
-            detour_max_edges=int(cfg_barrier.detour_max_edges),
-            unreachable_cap_mul=int(cfg_barrier.unreachable_cap_mul),
-            route_sample_pairs=int(cfg_barrier.route_sample_pairs),
-            route_d_min=int(cfg_barrier.route_d_min),
-            w_detour=float(cfg_barrier.score_w_detour),
-            w_route=float(cfg_barrier.score_w_route),
+        # Phase 3: Compute barrier scores
+        print("  [Phase 3] Computing barrier scores ...")
+        barrier_matrix = compute_barrier_scores(encoder_emb, idx_global, adj_list, d_graph)
+        edge_scores = compute_per_edge_barrier_scores(
+            edges, encoder_emb, idx_global, adj_list,
+            d_temporal=d_temporal,
+            min_temporal_detour=cfg_barrier.min_temporal_detour_for_barrier,
         )
 
-        barrier_thresh = float(np.percentile(
-            edge_scores, 100.0 * (1.0 - cfg_barrier.barrier_threshold_frac)))
+        barrier_thresh = float(np.percentile(edge_scores,
+                                             100.0 * (1.0 - cfg_barrier.barrier_threshold_frac)))
         n_high = int(np.sum(edge_scores >= barrier_thresh))
-        print(f"    Prune threshold={barrier_thresh:.3f}, high-score edges={n_high}/{len(edge_scores)}")
+        print(f"    Barrier threshold={barrier_thresh:.2f}, "
+              f"high-barrier edges={n_high}/{len(edge_scores)}")
 
         plot_barrier_distribution(
             edge_scores, barrier_thresh,
@@ -1161,55 +845,48 @@ def run_iterative_barrier_training(
             iteration=iteration,
         )
 
-        print("  [Phase 4] Partition + escape hatch if single room ...")
-        room_labels = partition_into_rooms(
+        # Phase 4: Partition into rooms
+        print("  [Phase 4] Partitioning into candidate rooms ...")
+        room_labels, forced_split = partition_into_rooms(
             adj_list, edges, edge_scores,
             threshold_frac=cfg_barrier.barrier_threshold_frac,
             min_room_size=cfg_barrier.min_room_size,
+            fallback_seed_split_topk=cfg_barrier.fallback_seed_split_topk,
         )
-        n_rooms_pre = int(room_labels.max()) + 1
-        room_labels, hatch = apply_escape_hatch_singleton(
-            room_labels, adj_list, idx_global, episode_ids, emb_sub, rng)
         n_rooms = int(room_labels.max()) + 1
         room_sizes = [int(np.sum(room_labels == r)) for r in range(n_rooms)]
-        print(f"    Rooms after prune: {n_rooms_pre}; after hatch ({hatch}): {n_rooms} — sizes={room_sizes}")
+        split_note = " (forced seed split)" if forced_split else ""
+        print(f"    Discovered {n_rooms} rooms{split_note}: sizes={room_sizes}")
 
+        # Map room labels to global space for visualization
         global_room = np.full(N, -1, dtype=np.int64)
         for loc, g in enumerate(idx_global.tolist()):
             global_room[int(g)] = int(room_labels[loc])
 
-        topo = evaluate_topology_metrics(
-            pos, geodesic, idx_global, edges, edge_scores, global_room,
-            top_frac=float(cfg_barrier.topo_top_frac), rng=rng,
-        )
-        print(f"    ARI vs oracle rooms={topo['adjusted_rand_vs_oracle_rooms']:.4f}  "
-              f"cut-enrich={topo['cut_edge_enrichment']:.3f}  "
-              f"bridge-enrich={topo['bridge_hit_enrichment']:.3f}")
-
         plot_rooms_on_maze(
             geodesic, pos, global_room,
             os.path.join(out_dir, f"rooms_iter{iteration}.png"),
-            title=f"Rooms (iter {iteration}, hatch={hatch})",
+            title=f"Rooms (iter {iteration})",
         )
 
-        converged = rooms_converged(room_labels, prev_rooms)
+        # Convergence check
+        converged = (not forced_split) and (n_rooms > 1) and rooms_converged(room_labels, prev_rooms)
         if converged:
             patience_counter += 1
-            print(f"    Partition stable ({patience_counter}/{cfg_barrier.convergence_patience})")
+            print(f"    Rooms converged ({patience_counter}/{cfg_barrier.convergence_patience})")
             if patience_counter >= cfg_barrier.convergence_patience:
-                print("    Stopping (partition convergence).")
-                encoder_emb = recompute_embeddings(encoder, obs_tensor, device)
+                print("    Converged! Stopping iteration.")
                 eval_final = evaluate_encoder_geometry(
-                    encoder_emb, pos, geodesic, n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
+                    encoder_emb, pos, geodesic,
+                    n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
                 history.append({
                     "iteration": iteration,
                     "n_rooms": n_rooms,
                     "room_sizes": room_sizes,
-                    "escape_hatch": hatch,
                     "n_high_barrier_edges": n_high,
                     "barrier_threshold": barrier_thresh,
+                    "forced_split": bool(forced_split),
                     "converged": True,
-                    **topo,
                     **eval_final,
                 })
                 break
@@ -1217,119 +894,106 @@ def run_iterative_barrier_training(
             patience_counter = 0
         prev_rooms = room_labels.copy()
 
-        print("  [Phase 5] Mine pairs (projector latent space) ...")
+        # Phase 5: Mine pairs and train encoder
+        print("  [Phase 5] Mining hard positives/negatives ...")
         anchors, positives, hard_neg_map = mine_pairs(
-            latent_np, room_labels, episode_ids, idx_global,
+            encoder_emb, room_labels, episode_ids, idx_global,
             pos_k=cfg_barrier.pos_k,
             n_hard_neg=cfg_barrier.n_hard_neg,
             rng=rng,
+            d_graph_local=d_graph,
+            far_neg_min_graph_steps=cfg_barrier.far_neg_min_graph_steps,
         )
 
         if anchors is None or len(anchors) == 0:
-            print("    No valid pairs; skipping training.")
-            encoder_emb = recompute_embeddings(encoder, obs_tensor, device)
+            print("    No valid pairs found, skipping training step.")
             eval_iter = evaluate_encoder_geometry(
-                encoder_emb, pos, geodesic, n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
+                encoder_emb, pos, geodesic,
+                n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
             history.append({
                 "iteration": iteration,
                 "n_rooms": n_rooms,
                 "room_sizes": room_sizes,
-                "escape_hatch": hatch,
                 "n_high_barrier_edges": n_high,
                 "barrier_threshold": barrier_thresh,
                 "mean_geo_loss": 0.0,
+                "forced_split": bool(forced_split),
                 "converged": False,
-                **topo,
                 **eval_iter,
             })
-            latent_np = recompute_latent_repr(encoder, projector, obs_tensor, device)
             continue
 
         n_anchors_with_neg = sum(1 for a in np.unique(anchors) if int(a) in hard_neg_map)
-        print(f"    {len(anchors)} positives, {n_anchors_with_neg} anchors with hard negatives")
+        print(f"    {len(anchors)} positive pairs, "
+              f"{n_anchors_with_neg} anchors with hard negatives")
 
-        print(f"  [Phase 5b] Train projector ({cfg_barrier.projector_steps} steps, encoder frozen) ...")
-        projector.train()
-        encoder.eval()
-        geo_losses: list[float] = []
+        print(f"  [Phase 5] Training encoder ({cfg_barrier.geo_train_steps} steps) ...")
+        encoder.train()
+        geo_losses = []
 
-        for step in range(int(cfg_barrier.projector_steps)):
-            projector_opt.zero_grad(set_to_none=True)
-            l_geo = infonce_projector_loss(
-                encoder, projector, obs_tensor,
+        for step in range(cfg_barrier.geo_train_steps):
+            encoder_opt.zero_grad(set_to_none=True)
+
+            # L_geo: InfoNCE contrastive correction
+            l_geo = infonce_loss(
+                encoder, obs_tensor,
                 anchors, positives, hard_neg_map,
-                batch_size=int(cfg_barrier.geo_batch),
-                temperature=float(cfg_barrier.geo_temperature),
-                device=device, rng=rng,
-                grad_encoder=False,
+                batch_size=cfg_barrier.geo_batch,
+                temperature=cfg_barrier.geo_temperature,
+                device=device, rng=rng, cfg=cfg_train,
             )
-            (cfg_barrier.geo_lambda * l_geo).backward()
-            torch.nn.utils.clip_grad_norm_(projector.parameters(), 10.0)
-            projector_opt.step()
-            geo_losses.append(float(l_geo.item()))
-            if (step + 1) % max(1, int(cfg_barrier.projector_steps) // 5) == 0:
-                print(f"      proj step {step+1}/{cfg_barrier.projector_steps}  L_geo={l_geo.item():.4f}")
 
-        n_ft = int(cfg_barrier.finetune_encoder_steps)
-        if cfg_barrier.finetune_encoder and encoder_opt is not None and n_ft > 0:
-            print(f"  [Phase 5c] Optional encoder FT ({n_ft} steps) ...")
-            encoder.train()
-            projector.train()
-            for step in range(n_ft):
-                encoder_opt.zero_grad(set_to_none=True)
-                projector_opt.zero_grad(set_to_none=True)
-                l_geo = infonce_projector_loss(
-                    encoder, projector, obs_tensor,
-                    anchors, positives, hard_neg_map,
-                    batch_size=int(cfg_barrier.geo_batch),
-                    temperature=float(cfg_barrier.geo_temperature),
-                    device=device, rng=rng,
-                    grad_encoder=True,
-                )
-                l_recon = reconstruction_loss(
-                    encoder, decoder, rssm, obs_tensor,
-                    batch_size=int(cfg_barrier.recon_batch),
-                    device=device, rng=rng, cfg=cfg_train,
-                )
-                loss = cfg_barrier.recon_lambda * l_recon + cfg_barrier.geo_lambda * l_geo
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(encoder.parameters(), 5.0)
-                torch.nn.utils.clip_grad_norm_(projector.parameters(), 5.0)
-                encoder_opt.step()
-                projector_opt.step()
-                if (step + 1) % max(1, n_ft // 4) == 0:
-                    print(f"      enc step {step+1}/{n_ft}  L_total={loss.item():.4f}")
+            # L_recon: reconstruction regularization
+            l_recon = reconstruction_loss(
+                encoder, decoder, rssm, obs_tensor,
+                batch_size=cfg_barrier.recon_batch,
+                device=device, rng=rng, cfg=cfg_train,
+            )
+
+            loss = cfg_barrier.recon_lambda * l_recon + cfg_barrier.geo_lambda * l_geo
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), 10.0)
+            encoder_opt.step()
+
+            geo_losses.append(float(l_geo.item()))
+
+            if (step + 1) % max(1, cfg_barrier.geo_train_steps // 5) == 0:
+                print(f"      step {step+1}/{cfg_barrier.geo_train_steps}  "
+                      f"L_geo={l_geo.item():.4f}  L_recon={l_recon.item():.4f}  "
+                      f"L_total={loss.item():.4f}")
 
         mean_geo_loss = float(np.mean(geo_losses)) if geo_losses else 0.0
 
-        print("  [Phase 6] Refresh latent representation ...")
-        latent_np = recompute_latent_repr(encoder, projector, obs_tensor, device)
+        # Phase 6: Re-embed
+        print("  [Phase 6] Recomputing encoder embeddings ...")
         encoder_emb = recompute_embeddings(encoder, obs_tensor, device)
+
+        # Evaluate
         eval_iter = evaluate_encoder_geometry(
-            encoder_emb, pos, geodesic, n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
+            encoder_emb, pos, geodesic,
+            n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
         dt = time.time() - t0
-        print(f"    ARI={topo['adjusted_rand_vs_oracle_rooms']:.4f}  "
-              f"ρ(enc,geo)={eval_iter['spearman_enc_vs_geodesic']:.4f}  ({dt:.1f}s)")
+        print(f"    Spearman ρ (enc vs geodesic) = {eval_iter['spearman_enc_vs_geodesic']:.4f}  "
+              f"({dt:.1f}s)")
 
         history.append({
             "iteration": iteration,
             "n_rooms": n_rooms,
             "room_sizes": room_sizes,
-            "escape_hatch": hatch,
             "n_high_barrier_edges": n_high,
             "barrier_threshold": barrier_thresh,
             "mean_geo_loss": mean_geo_loss,
             "elapsed_s": dt,
             "converged": False,
-            **topo,
             **eval_iter,
         })
 
+    # ---- Final summary ----
     plot_convergence(history, os.path.join(out_dir, "convergence.png"))
 
+    # Save final checkpoint
     final_ckpt = {
         "encoder": encoder.state_dict(),
-        "projector": projector.state_dict(),
         "decoder": decoder.state_dict(),
         "rssm": rssm.state_dict(),
         "reward_model": models["reward_model"].state_dict(),
@@ -1342,10 +1006,11 @@ def run_iterative_barrier_training(
 
     print(f"\n  Results saved to {out_dir}/")
     if history:
+        h0 = history[0]
         hf = history[-1]
-        print(f"    ARI (oracle rooms): {hf.get('adjusted_rand_vs_oracle_rooms', 0.0):.4f}")
-        print(f"    Cut-edge enrichment: {hf.get('cut_edge_enrichment', 0.0):.3f}")
-        print(f"    Rooms: {hf.get('n_rooms', 0)}")
+        print(f"    ρ: {eval0['spearman_enc_vs_geodesic']:.4f} (initial) -> "
+              f"{hf.get('spearman_enc_vs_geodesic', 0.0):.4f} (final)")
+        print(f"    Rooms: {h0['n_rooms']} (iter 0) -> {hf['n_rooms']} (final)")
 
     return history
 
@@ -1378,15 +1043,11 @@ def parse_args():
     p.add_argument("--graph_max", type=int, default=1800)
     p.add_argument("--knn_k", type=int, default=10)
     p.add_argument("--barrier_frac", type=float, default=0.15)
+    p.add_argument("--geo_lr", type=float, default=1e-4)
     p.add_argument("--geo_lambda", type=float, default=0.5)
-    p.add_argument("--projector_steps", type=int, default=200,
-                   help="Projector InfoNCE steps per iteration (alias: was --geo_steps)")
+    p.add_argument("--geo_steps", type=int, default=200)
     p.add_argument("--geo_batch", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.07)
-    p.add_argument("--finetune_encoder", action="store_true",
-                   help="After projector steps, fine-tune encoder (+ recon) for --ft_steps")
-    p.add_argument("--ft_steps", type=int, default=0,
-                   help="Encoder fine-tune steps (requires --finetune_encoder)")
     return p.parse_args()
 
 
@@ -1406,23 +1067,19 @@ def main():
         graph_max=args.graph_max,
         knn_k=args.knn_k,
         barrier_threshold_frac=args.barrier_frac,
+        geo_lr=args.geo_lr,
         geo_lambda=args.geo_lambda,
-        projector_steps=args.projector_steps,
+        geo_train_steps=args.geo_steps,
         geo_batch=args.geo_batch,
         geo_temperature=args.temperature,
         max_iterations=args.max_iter,
-        finetune_encoder=bool(args.finetune_encoder),
-        finetune_encoder_steps=int(args.ft_steps),
     )
 
     if args.quick:
         cfg_barrier.collect_episodes = 20
-        cfg_barrier.projector_steps = 40
-        cfg_barrier.projector_warmup_steps = 30
+        cfg_barrier.geo_train_steps = 50
         cfg_barrier.max_iterations = 3
         cfg_barrier.graph_max = 1200
-        cfg_barrier.detour_max_edges = 800
-        cfg_barrier.route_sample_pairs = 400
         cfg_barrier.eval_n_pairs = 500
         cfg_train.collect_episodes = 20
 
