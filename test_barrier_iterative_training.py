@@ -109,7 +109,10 @@ class BarrierTrainingCfg:
     # Negative mining: bootstrap with graph-distance negatives when ρ is low,
     # then switch to different-room + close-in-encoder once ρ crosses threshold.
     neg_rho_switch_threshold: float = 0.1
-    neg_min_graph_hops: int = 15  # BFS hops strictly greater than this (i.e. > 15)
+    # Target BFS separation; combined with *neg_graph_hops_frac* for path-like graphs
+    # (temporal-only warm-start) where per-anchor eccentricity is often < 15.
+    neg_min_graph_hops: int = 15
+    neg_graph_hops_frac: float = 0.35  # thr = min(min_hops, max(1, floor(frac * d_max)))
 
     # reconstruction regularization (direct MLP head)
     recon_lambda: float = 1.0
@@ -242,15 +245,26 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
                spearman_rho: float,
                rho_switch_threshold: float = 0.1,
                min_graph_hops: int = 15,
+               graph_hops_frac: float = 0.35,
                pos_k: int = 3, n_hard_neg: int = 32,
                rng: np.random.Generator = None):
     """Mine positive pairs (same room + temporally close) and hard negatives.
 
     When *spearman_rho* < *rho_switch_threshold*, negatives are bootstrapped from
-    graph BFS distance: nodes farther than *min_graph_hops* hops on the replay
-    graph are treated as reliable negatives regardless of room labels (breaks the
-    chicken-and-egg when only one room is discovered).  Once ρ is high enough,
-    negatives are *different room* + close in encoder space as before.
+    graph BFS distance on the replay graph.  The hop threshold is adaptive:
+    ``thr = min(min_graph_hops, max(1, floor(graph_hops_frac * d_max)))`` where
+    *d_max* is the longest finite shortest-path distance from the anchor within
+    its connected component.  This keeps path-like temporal graphs (small
+    eccentricity mid-episode) from yielding an empty candidate set when a fixed
+    threshold like 15 is too large.
+
+    Bootstrap mode does **not** apply the encoder ``close_mask`` (which would be
+    ~2e-8 when the encoder has collapsed and *median_dist* is clamped), and
+    instead takes the *n_hard_neg* smallest encoder distances among graph-far
+    nodes — true hard negatives among topologically separated states.
+
+    Once ρ is high enough, negatives are *different room* + close in encoder
+    space as before.
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -313,32 +327,43 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
 
         if use_graph_neg:
             dg = d_graph[int(la)].astype(np.int64)
-            # Unreachable (-1) excluded; require strictly more than min_graph_hops
-            cand_mask = (dg > int(min_graph_hops)) & (dg >= 0)
+            finite = dg >= 0
+            if not finite.any():
+                continue
+            d_max = int(np.max(dg[finite]))
+            thr = min(int(min_graph_hops), max(1, int(np.floor(float(graph_hops_frac) * d_max))))
+            cand_mask = (dg > thr) & finite
+            pool = graph_indices[cand_mask]
+            if len(pool) == 0:
+                continue
+            d_pool = np.linalg.norm(encoder_emb[pool] - encoder_emb[a], axis=-1)
+            k = min(n_hard_neg, len(pool))
+            top_k = np.argpartition(d_pool, kth=k - 1)[:k]
+            valid_idx = pool[top_k]
         else:
             cand_mask = np.array([
                 int(global_room[int(g)]) != a_room and int(global_room[int(g)]) >= 0
                 for g in graph_indices
             ], dtype=bool)
 
-        close_mask = dists < 2.0 * median_dist
-        valid = cand_mask & close_mask
-        valid_idx = graph_indices[valid]
+            close_mask = dists < 2.0 * median_dist
+            valid = cand_mask & close_mask
+            valid_idx = graph_indices[valid]
 
-        if len(valid_idx) == 0:
-            pool = graph_indices[cand_mask]
-            if len(pool) > 0:
-                d_pool = np.linalg.norm(encoder_emb[pool] - encoder_emb[a], axis=-1)
-                k = min(n_hard_neg, len(pool))
-                top_k = np.argpartition(d_pool, kth=k - 1)[:k]
-                valid_idx = pool[top_k]
-            else:
-                continue
+            if len(valid_idx) == 0:
+                pool = graph_indices[cand_mask]
+                if len(pool) > 0:
+                    d_pool = np.linalg.norm(encoder_emb[pool] - encoder_emb[a], axis=-1)
+                    k = min(n_hard_neg, len(pool))
+                    top_k = np.argpartition(d_pool, kth=k - 1)[:k]
+                    valid_idx = pool[top_k]
+                else:
+                    continue
 
-        if len(valid_idx) > n_hard_neg:
-            d_valid = np.linalg.norm(encoder_emb[valid_idx] - encoder_emb[a], axis=-1)
-            top_k = np.argpartition(d_valid, kth=n_hard_neg - 1)[:n_hard_neg]
-            valid_idx = valid_idx[top_k]
+            if len(valid_idx) > n_hard_neg:
+                d_valid = np.linalg.norm(encoder_emb[valid_idx] - encoder_emb[a], axis=-1)
+                top_k = np.argpartition(d_valid, kth=n_hard_neg - 1)[:n_hard_neg]
+                valid_idx = valid_idx[top_k]
 
         hard_neg_map[a] = valid_idx
 
@@ -564,7 +589,10 @@ def plot_rooms_on_maze(geodesic: GeodesicComputer, pos: np.ndarray,
 
     valid = room_labels_global >= 0
     n_rooms = int(room_labels_global[valid].max()) + 1 if valid.any() else 0
-    cmap = plt.cm.get_cmap("tab20", max(n_rooms, 1))
+    try:
+        cmap = matplotlib.colormaps["tab20"].resampled(max(n_rooms, 1))
+    except AttributeError:
+        cmap = plt.get_cmap("tab20", max(n_rooms, 1))
 
     if valid.any():
         sc = ax.scatter(pos[valid, 0], pos[valid, 1], c=room_labels_global[valid],
@@ -797,12 +825,14 @@ def run_iterative_barrier_training(
             spearman_rho=current_rho,
             rho_switch_threshold=cfg_barrier.neg_rho_switch_threshold,
             min_graph_hops=cfg_barrier.neg_min_graph_hops,
+            graph_hops_frac=cfg_barrier.neg_graph_hops_frac,
             pos_k=cfg_barrier.pos_k,
             n_hard_neg=cfg_barrier.n_hard_neg,
             rng=rng,
         )
         neg_mode = (
-            f"graph-dist >{cfg_barrier.neg_min_graph_hops} hops (ρ={current_rho:.4f} < "
+            f"graph-dist adaptive (≤{cfg_barrier.neg_min_graph_hops} hops cap, "
+            f"{100 * cfg_barrier.neg_graph_hops_frac:.0f}%·d_max; ρ={current_rho:.4f} < "
             f"{cfg_barrier.neg_rho_switch_threshold})"
             if used_graph_negs
             else f"different-room (ρ={current_rho:.4f} ≥ {cfg_barrier.neg_rho_switch_threshold})"
