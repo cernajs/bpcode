@@ -106,6 +106,11 @@ class BarrierTrainingCfg:
     pos_k: int = 3
     n_hard_neg: int = 32
 
+    # Negative mining: bootstrap with graph-distance negatives when ρ is low,
+    # then switch to different-room + close-in-encoder once ρ crosses threshold.
+    neg_rho_switch_threshold: float = 0.1
+    neg_min_graph_hops: int = 15  # BFS hops strictly greater than this (i.e. > 15)
+
     # reconstruction regularization (direct MLP head)
     recon_lambda: float = 1.0
     recon_batch: int = 16
@@ -232,15 +237,27 @@ def partition_into_rooms(adj_list: list[list[int]], edges: np.ndarray,
 
 def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
                episode_ids: np.ndarray, idx_global: np.ndarray,
+               d_graph: np.ndarray,
+               g2l: dict[int, int],
+               spearman_rho: float,
+               rho_switch_threshold: float = 0.1,
+               min_graph_hops: int = 15,
                pos_k: int = 3, n_hard_neg: int = 32,
                rng: np.random.Generator = None):
-    """Mine positive pairs (same room + temporally close) and hard negatives
-    (different room + close in encoder space)."""
+    """Mine positive pairs (same room + temporally close) and hard negatives.
+
+    When *spearman_rho* < *rho_switch_threshold*, negatives are bootstrapped from
+    graph BFS distance: nodes farther than *min_graph_hops* hops on the replay
+    graph are treated as reliable negatives regardless of room labels (breaks the
+    chicken-and-egg when only one room is discovered).  Once ρ is high enough,
+    negatives are *different room* + close in encoder space as before.
+    """
     if rng is None:
         rng = np.random.default_rng(0)
 
     N = len(encoder_emb)
     m = len(idx_global)
+    use_graph_neg = float(spearman_rho) < float(rho_switch_threshold)
 
     # Global room labels for all replay states (-1 = not in graph)
     global_room = np.full(N, -1, dtype=np.int64)
@@ -259,22 +276,22 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
                 positives.append(int(j))
 
     if len(anchors) == 0:
-        return None, None, None
+        return None, None, None, use_graph_neg
 
     anchors = np.array(anchors, dtype=np.int64)
     positives = np.array(positives, dtype=np.int64)
 
-    # Hard negatives: different room but close in encoder space
+    # Hard negatives: (bootstrap) far in graph BFS, or (mature) different room;
+    # both modes then prefer states close in encoder space (hard negatives).
     graph_indices = idx_global.copy()
     emb_graph = encoder_emb[graph_indices]
     # Sample random pairs to estimate a representative pairwise median distance.
-    # Using emb_graph[:1] would only measure distances from node 0, which is
-    # misleading when the encoder has collapsed (node 0 ≈ equidistant from all).
     _rng_idx = rng.choice(len(emb_graph),
                           size=(min(500, len(emb_graph)), 2), replace=True)
     median_dist = float(np.median(
         np.linalg.norm(emb_graph[_rng_idx[:, 0]] - emb_graph[_rng_idx[:, 1]],
                        axis=-1)))
+    median_dist = max(median_dist, 1e-8)
 
     unique_anchors = np.unique(anchors)
     hard_neg_map: dict[int, np.ndarray] = {}
@@ -288,24 +305,33 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
         a_room = int(global_room[a])
         if a_room < 0:
             continue
+        la = g2l.get(a)
+        if la is None:
+            continue
 
         dists = np.linalg.norm(encoder_emb[graph_indices] - encoder_emb[a], axis=-1)
-        # Candidates: different room, within 2x median distance
-        cand_mask = np.array([
-            int(global_room[int(g)]) != a_room and int(global_room[int(g)]) >= 0
-            for g in graph_indices
-        ], dtype=bool)
+
+        if use_graph_neg:
+            dg = d_graph[int(la)].astype(np.int64)
+            # Unreachable (-1) excluded; require strictly more than min_graph_hops
+            cand_mask = (dg > int(min_graph_hops)) & (dg >= 0)
+        else:
+            cand_mask = np.array([
+                int(global_room[int(g)]) != a_room and int(global_room[int(g)]) >= 0
+                for g in graph_indices
+            ], dtype=bool)
+
         close_mask = dists < 2.0 * median_dist
         valid = cand_mask & close_mask
         valid_idx = graph_indices[valid]
 
         if len(valid_idx) == 0:
-            diff_room = graph_indices[cand_mask]
-            if len(diff_room) > 0:
-                d_diff = np.linalg.norm(encoder_emb[diff_room] - encoder_emb[a], axis=-1)
-                k = min(n_hard_neg, len(diff_room))
-                top_k = np.argpartition(d_diff, kth=k - 1)[:k]
-                valid_idx = diff_room[top_k]
+            pool = graph_indices[cand_mask]
+            if len(pool) > 0:
+                d_pool = np.linalg.norm(encoder_emb[pool] - encoder_emb[a], axis=-1)
+                k = min(n_hard_neg, len(pool))
+                top_k = np.argpartition(d_pool, kth=k - 1)[:k]
+                valid_idx = pool[top_k]
             else:
                 continue
 
@@ -316,7 +342,7 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
 
         hard_neg_map[a] = valid_idx
 
-    return anchors, positives, hard_neg_map
+    return anchors, positives, hard_neg_map, use_graph_neg
 
 
 def infonce_loss(encoder: ConvEncoder, obs_tensor: torch.Tensor,
@@ -643,6 +669,8 @@ def run_iterative_barrier_training(
     eval0 = evaluate_encoder_geometry(encoder_emb, pos, geodesic,
                                       n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
     print(f"    Initial encoder-geodesic Spearman ρ = {eval0['spearman_enc_vs_geodesic']:.4f}")
+    # ρ from last eval drives negative mining (graph bootstrap vs room-based).
+    current_rho = float(eval0["spearman_enc_vs_geodesic"])
 
     # ---- EMA encoder (BYOL-style — positives come from the EMA copy) ----
     ema_encoder = copy.deepcopy(encoder)
@@ -762,18 +790,31 @@ def run_iterative_barrier_training(
 
         # Phase 5: Mine pairs and train encoder
         print("  [Phase 5] Mining hard positives/negatives ...")
-        anchors, positives, hard_neg_map = mine_pairs(
+        anchors, positives, hard_neg_map, used_graph_negs = mine_pairs(
             encoder_emb, room_labels, episode_ids, idx_global,
+            d_graph=d_graph,
+            g2l=g2l,
+            spearman_rho=current_rho,
+            rho_switch_threshold=cfg_barrier.neg_rho_switch_threshold,
+            min_graph_hops=cfg_barrier.neg_min_graph_hops,
             pos_k=cfg_barrier.pos_k,
             n_hard_neg=cfg_barrier.n_hard_neg,
             rng=rng,
         )
+        neg_mode = (
+            f"graph-dist >{cfg_barrier.neg_min_graph_hops} hops (ρ={current_rho:.4f} < "
+            f"{cfg_barrier.neg_rho_switch_threshold})"
+            if used_graph_negs
+            else f"different-room (ρ={current_rho:.4f} ≥ {cfg_barrier.neg_rho_switch_threshold})"
+        )
+        print(f"    Negative mode: {neg_mode}")
 
         if anchors is None or len(anchors) == 0:
             print("    No valid pairs found, skipping training step.")
             eval_iter = evaluate_encoder_geometry(
                 encoder_emb, pos, geodesic,
                 n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
+            current_rho = float(eval_iter["spearman_enc_vs_geodesic"])
             history.append({
                 "iteration": iteration,
                 "n_rooms": n_rooms,
@@ -782,6 +823,7 @@ def run_iterative_barrier_training(
                 "barrier_threshold": barrier_thresh,
                 "mean_geo_loss": 0.0,
                 "converged": False,
+                "neg_mining_graph_bootstrap": used_graph_negs,
                 **eval_iter,
             })
             continue
@@ -843,6 +885,7 @@ def run_iterative_barrier_training(
         eval_iter = evaluate_encoder_geometry(
             encoder_emb, pos, geodesic,
             n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
+        current_rho = float(eval_iter["spearman_enc_vs_geodesic"])
         dt = time.time() - t0
         print(f"    Spearman ρ (enc vs geodesic) = {eval_iter['spearman_enc_vs_geodesic']:.4f}  "
               f"({dt:.1f}s)")
@@ -856,6 +899,7 @@ def run_iterative_barrier_training(
             "mean_geo_loss": mean_geo_loss,
             "elapsed_s": dt,
             "converged": False,
+            "neg_mining_graph_bootstrap": used_graph_negs,
             **eval_iter,
         })
 
