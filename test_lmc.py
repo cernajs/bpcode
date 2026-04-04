@@ -100,15 +100,26 @@ class LMCv2Cfg:
     encoder_lr: float = 1e-5
     proj_lr: float = 3e-4
     weight_decay: float = 1e-5
-    recon_lambda: float = 5.0     # reconstruction weight (high to prevent collapse)
-    rank_lambda: float = 1.0      # ranking loss weight
+    recon_lambda: float = 5.0     # tiny in practice; keeps features tied to pixels
+    rank_lambda: float = 1.0      # projection-space ranking loss
+    encoder_rank_lambda: float = 0.25  # small direct pressure on encoder space
+    var_lambda: float = 0.05      # anti-collapse term; keep small so it does not dominate
     recon_batch: int = 32
     grad_clip: float = 5.0
 
-    # encoder freezing: freeze all layers whose name doesn't match these patterns
-    # empty list = train all layers (with low LR)
-    encoder_trainable_patterns: tuple = ("fc", "linear", "ln")  # typical last-layer names
-    freeze_encoder_frac: float = 0.7  # fallback: freeze first 70% of params by count
+    # encoder freezing: keep the top conv block trainable by default
+    encoder_trainable_patterns: tuple = ("conv4", "fc")
+    freeze_encoder_frac: float = 0.7  # fallback only if pattern match fails
+
+    # adaptive triplet fallback
+    min_triplets_ok: int = 32
+    near_k_min: int = 8
+    far_k_min: int = 16
+    max_triplet_attempt_mult: int = 40
+
+    # latent used to build the pos_boot teacher
+    # options: "auto" | "encoder_e" | "h" | "s" | "h+s"
+    pos_boot_feature: str = "auto"
 
     # evaluation
     eval_interval: int = 200
@@ -164,7 +175,7 @@ class ProjectionHead(nn.Module):
 # =====================================================================
 
 class PositionProbe(nn.Module):
-    """MLP: encoder embedding → (x, y) position prediction."""
+    """MLP: latent feature -> (x, y) position prediction with internal standardization."""
 
     def __init__(self, embed_dim: int, hidden: int = 256):
         super().__init__()
@@ -175,26 +186,52 @@ class PositionProbe(nn.Module):
             nn.ELU(),
             nn.Linear(hidden, 2),
         )
+        self.register_buffer("x_mean", torch.zeros(embed_dim))
+        self.register_buffer("x_std", torch.ones(embed_dim))
+        self.register_buffer("y_mean", torch.zeros(2))
+        self.register_buffer("y_std", torch.ones(2))
+        self.feature_name = "unknown"
+        self.best_r2 = float("-inf")
+
+    def _normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.x_mean) / self.x_std.clamp_min(1e-6)
+
+    def _denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
+        return y * self.y_std.clamp_min(1e-6) + self.y_mean
 
     def forward(self, e: torch.Tensor) -> torch.Tensor:
-        return self.net(e)
+        z = self.net(self._normalize_x(e))
+        return self._denormalize_y(z)
 
 
-def train_position_probe(
-    encoder_emb: np.ndarray,
+def _fit_single_position_probe(
+    features: np.ndarray,
     positions: np.ndarray,
     cfg: LMCv2Cfg,
     device: torch.device,
+    feature_name: str,
 ) -> PositionProbe:
-    """Train MLP to predict (x,y) from frozen encoder embeddings."""
-    N = len(encoder_emb)
-    embed_dim = encoder_emb.shape[1]
+    """Train one standardized probe on a single feature representation."""
+    N = len(features)
+    embed_dim = int(features.shape[1])
 
     probe = PositionProbe(embed_dim, cfg.pos_probe_hidden).to(device)
     opt = torch.optim.Adam(probe.parameters(), lr=cfg.pos_probe_lr)
 
-    e_t = torch.tensor(encoder_emb, dtype=torch.float32, device=device)
-    p_t = torch.tensor(positions, dtype=torch.float32, device=device)
+    x_np = features.astype(np.float32)
+    y_np = positions.astype(np.float32)
+    x_mean = x_np.mean(axis=0)
+    x_std = x_np.std(axis=0) + 1e-6
+    y_mean = y_np.mean(axis=0)
+    y_std = y_np.std(axis=0) + 1e-6
+
+    probe.x_mean.copy_(torch.tensor(x_mean, dtype=torch.float32, device=device))
+    probe.x_std.copy_(torch.tensor(x_std, dtype=torch.float32, device=device))
+    probe.y_mean.copy_(torch.tensor(y_mean, dtype=torch.float32, device=device))
+    probe.y_std.copy_(torch.tensor(y_std, dtype=torch.float32, device=device))
+
+    e_t = torch.tensor(x_np, dtype=torch.float32, device=device)
+    p_t = torch.tensor(y_np, dtype=torch.float32, device=device)
 
     rng = np.random.default_rng(cfg.seed + 777)
     n_val = max(1, int(0.15 * N))
@@ -204,17 +241,20 @@ def train_position_probe(
 
     best_val = float("inf")
     best_state = None
+    batch_size = min(cfg.pos_probe_batch, len(train_idx))
 
     for epoch in range(cfg.pos_probe_epochs):
         probe.train()
-        idx = rng.choice(train_idx, size=min(cfg.pos_probe_batch, len(train_idx)),
-                         replace=False)
-        pred = probe(e_t[idx])
-        loss = F.mse_loss(pred, p_t[idx])
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+        rng.shuffle(train_idx)
+        losses = []
+        for st in range(0, len(train_idx), batch_size):
+            idx = train_idx[st:st + batch_size]
+            pred = probe(e_t[idx])
+            loss = F.mse_loss(pred, p_t[idx])
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            losses.append(float(loss.item()))
 
         if (epoch + 1) % max(1, cfg.pos_probe_epochs // 5) == 0:
             probe.eval()
@@ -223,24 +263,64 @@ def train_position_probe(
                 val_loss = F.mse_loss(val_pred, p_t[val_idx]).item()
             if val_loss < best_val:
                 best_val = val_loss
-                best_state = {k: v.cpu().clone() for k, v in probe.state_dict().items()}
-            print(f"    pos_probe epoch {epoch+1}/{cfg.pos_probe_epochs}  "
-                  f"train={loss.item():.4f}  val={val_loss:.4f}")
+                best_state = {k: v.detach().cpu().clone() for k, v in probe.state_dict().items()}
+            print(
+                f"    pos_probe[{feature_name}] epoch {epoch+1}/{cfg.pos_probe_epochs}  "
+                f"train={np.mean(losses):.4f}  val={val_loss:.4f}"
+            )
 
     if best_state is not None:
         probe.load_state_dict(best_state)
     probe.eval()
 
-    # Report R²
     with torch.no_grad():
         all_pred = probe(e_t).cpu().numpy()
-    residuals = positions - all_pred
-    ss_res = np.sum(residuals ** 2)
-    ss_tot = np.sum((positions - positions.mean(axis=0)) ** 2)
+    residuals = y_np - all_pred
+    ss_res = float(np.sum(residuals ** 2))
+    ss_tot = float(np.sum((y_np - y_np.mean(axis=0, keepdims=True)) ** 2))
     r2 = 1.0 - ss_res / max(ss_tot, 1e-8)
-    print(f"    Position probe: R² = {r2:.4f}  best_val_mse = {best_val:.4f}")
 
+    probe.feature_name = feature_name
+    probe.best_r2 = float(r2)
+    print(
+        f"    Position probe[{feature_name}]: R² = {r2:.4f}  "
+        f"best_val_mse = {best_val:.4f}"
+    )
     return probe
+
+
+def train_position_probe(
+    feature_bank: dict[str, np.ndarray],
+    positions: np.ndarray,
+    cfg: LMCv2Cfg,
+    device: torch.device,
+) -> tuple[PositionProbe, str]:
+    """Train one or more probes and return the best according to R²."""
+    if cfg.pos_boot_feature != "auto":
+        if cfg.pos_boot_feature not in feature_bank:
+            raise KeyError(
+                f"pos_boot_feature={cfg.pos_boot_feature!r} not found; "
+                f"available={sorted(feature_bank.keys())}"
+            )
+        probe = _fit_single_position_probe(
+            feature_bank[cfg.pos_boot_feature], positions, cfg, device, cfg.pos_boot_feature
+        )
+        return probe, cfg.pos_boot_feature
+
+    candidates = ["h", "h+s", "encoder_e", "s"]
+    trained = []
+    for name in candidates:
+        if name not in feature_bank:
+            continue
+        probe = _fit_single_position_probe(feature_bank[name], positions, cfg, device, name)
+        trained.append((float(probe.best_r2), name, probe))
+
+    if not trained:
+        raise RuntimeError("No candidate features available for pos_boot probe.")
+    trained.sort(key=lambda x: x[0], reverse=True)
+    best_r2, best_name, best_probe = trained[0]
+    print(f"    Using pos_boot feature: {best_name}  (best R²={best_r2:.4f})")
+    return best_probe, best_name
 
 
 # =====================================================================
@@ -251,24 +331,18 @@ def compute_pairwise_distances_oracle(
     pos: np.ndarray,
     geodesic: GeodesicComputer,
 ) -> np.ndarray:
-    """Compute oracle geodesic distance for all (cell_i, cell_j) pairs.
-
-    Returns: float32 matrix [n_free, n_free] of geodesic distances.
-    """
+    """Compute oracle geodesic distance for all (cell_i, cell_j) pairs."""
     return geodesic.dist_matrix.astype(np.float32)
 
 
 def compute_pairwise_distances_pos_boot(
-    encoder_emb: np.ndarray,
+    features: np.ndarray,
     pos_probe: PositionProbe,
     geodesic: GeodesicComputer,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Predict positions, then look up geodesic distances via cell mapping.
-
-    Returns: (predicted_positions [N,2], cell_indices [N])
-    """
-    e_t = torch.tensor(encoder_emb, dtype=torch.float32, device=device)
+    """Predict positions, then look up geodesic distances via cell mapping."""
+    e_t = torch.tensor(features, dtype=torch.float32, device=device)
     with torch.no_grad():
         pred_pos = pos_probe(e_t).cpu().numpy().astype(np.float32)
     cell_idx = _positions_to_cell_indices(geodesic, pred_pos)
@@ -279,6 +353,67 @@ def compute_pairwise_distances_pos_boot(
 # Triplet sampling
 # =====================================================================
 
+def _empty_triplets():
+    return (
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.float32),
+        np.zeros(0, dtype=np.float32),
+    )
+
+
+def _select_near_far_candidates(
+    row: np.ndarray,
+    rng: np.random.Generator,
+    close_max: float | None,
+    far_min: float | None,
+    near_k_min: int,
+    far_k_min: int,
+) -> tuple[int, int, float, float] | None:
+    """Choose a near and far index from one distance row with robust fallback."""
+    finite = np.where(np.isfinite(row) & (row > 0))[0]
+    if finite.size < 2:
+        return None
+
+    row_f = row[finite]
+    order = np.argsort(row_f)
+    ordered_idx = finite[order]
+    ordered_dist = row_f[order]
+
+    if close_max is not None:
+        close = ordered_idx[ordered_dist <= close_max]
+    else:
+        close = ordered_idx[:0]
+    if far_min is not None:
+        far = ordered_idx[ordered_dist >= far_min]
+    else:
+        far = ordered_idx[:0]
+
+    if close.size == 0:
+        k = min(max(near_k_min, 1), max(ordered_idx.size - 1, 1))
+        close = ordered_idx[:k]
+
+    if far.size == 0:
+        k = min(max(far_k_min, 1), max(ordered_idx.size - 1, 1))
+        far = ordered_idx[-k:]
+
+    if close.size == 0 or far.size == 0:
+        return None
+
+    j = int(close[rng.integers(len(close))])
+    k = int(far[rng.integers(len(far))])
+    d_j = float(row[j])
+    d_k = float(row[k])
+
+    if not np.isfinite(d_j) or not np.isfinite(d_k) or d_k <= d_j:
+        k = int(ordered_idx[-1])
+        d_k = float(row[k])
+        if d_k <= d_j:
+            return None
+    return j, k, d_j, d_k
+
+
 def sample_triplets_graph(
     d_graph: np.ndarray,
     idx_global: np.ndarray,
@@ -286,41 +421,40 @@ def sample_triplets_graph(
     close_max: int = 3,
     far_min: int = 8,
     n_triplets: int = 512,
+    near_k_min: int = 8,
+    far_k_min: int = 16,
+    max_attempt_mult: int = 40,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Sample (anchor, close, far) triplets from graph BFS distances.
-
-    Returns: (anchor_global, close_global, far_global,
-              d_close_arr, d_far_arr)  — global indices + distance values.
-    """
+    """Sample graph triplets with threshold-first, robust fallback behaviour."""
     m = d_graph.shape[0]
     anchors, closes, fars = [], [], []
     d_close_list, d_far_list = [], []
 
     attempts = 0
-    max_attempts = n_triplets * 10
+    max_attempts = max(n_triplets * max_attempt_mult, n_triplets + 1)
 
     while len(anchors) < n_triplets and attempts < max_attempts:
         attempts += 1
         i = int(rng.integers(0, m))
-
-        row = d_graph[i]
-        close_cands = np.where((row > 0) & (row <= close_max))[0]
-        far_cands = np.where(row >= far_min)[0]
-
-        if len(close_cands) == 0 or len(far_cands) == 0:
+        picked = _select_near_far_candidates(
+            d_graph[i], rng,
+            close_max=close_max,
+            far_min=far_min,
+            near_k_min=near_k_min,
+            far_k_min=far_k_min,
+        )
+        if picked is None:
             continue
-
-        j = int(close_cands[rng.integers(len(close_cands))])
-        k = int(far_cands[rng.integers(len(far_cands))])
+        j, k, d_j, d_k = picked
 
         anchors.append(int(idx_global[i]))
         closes.append(int(idx_global[j]))
         fars.append(int(idx_global[k]))
-        d_close_list.append(float(row[j]))
-        d_far_list.append(float(row[k]))
+        d_close_list.append(d_j)
+        d_far_list.append(d_k)
 
     if not anchors:
-        return (np.zeros(0, dtype=np.int64),) * 3 + (np.zeros(0, dtype=np.float32),) * 2
+        return _empty_triplets()
 
     return (
         np.array(anchors, dtype=np.int64),
@@ -338,57 +472,39 @@ def sample_triplets_geodesic(
     close_max: float = 2.5,
     far_min: float = 6.0,
     n_triplets: int = 512,
+    near_k_min: int = 8,
+    far_k_min: int = 16,
+    max_attempt_mult: int = 40,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Sample triplets from geodesic distances (oracle or position-bootstrapped).
-
-    cell_indices: [N] — cell index for each replay state.
-    dist_matrix: [n_free, n_free] — pairwise geodesic distances between cells.
-
-    Returns: (anchor_idx, close_idx, far_idx, d_close, d_far)
-        All indices are into the replay buffer (not cell indices).
-    """
+    """Sample triplets from geodesic distances with robust fallback."""
     N = len(cell_indices)
     anchors, closes, fars = [], [], []
     d_close_list, d_far_list = [], []
 
-    # Precompute: for each cell, which replay indices belong to it
-    n_free = dist_matrix.shape[0]
     cell_to_replay: dict[int, list[int]] = {}
     for i, c in enumerate(cell_indices.tolist()):
         cell_to_replay.setdefault(int(c), []).append(i)
 
-    # For each cell, find close and far cells
-    cell_close: dict[int, list[int]] = {}
-    cell_far: dict[int, list[int]] = {}
-    for c in range(n_free):
-        row = dist_matrix[c]
-        finite = np.isfinite(row) & (row > 0)
-        close_cells = np.where(finite & (row <= close_max))[0]
-        far_cells = np.where(finite & (row >= far_min))[0]
-        cell_close[c] = close_cells.tolist()
-        cell_far[c] = far_cells.tolist()
-
     attempts = 0
-    max_attempts = n_triplets * 10
+    max_attempts = max(n_triplets * max_attempt_mult, n_triplets + 1)
     while len(anchors) < n_triplets and attempts < max_attempts:
         attempts += 1
-
-        # Pick random anchor state
         a_idx = int(rng.integers(0, N))
         a_cell = int(cell_indices[a_idx])
 
-        cc = cell_close.get(a_cell, [])
-        fc = cell_far.get(a_cell, [])
-        if not cc or not fc:
+        picked = _select_near_far_candidates(
+            dist_matrix[a_cell], rng,
+            close_max=close_max,
+            far_min=far_min,
+            near_k_min=near_k_min,
+            far_k_min=far_k_min,
+        )
+        if picked is None:
             continue
+        j_cell, k_cell, d_j, d_k = picked
 
-        # Pick a close cell and a far cell
-        j_cell = int(cc[rng.integers(len(cc))])
-        k_cell = int(fc[rng.integers(len(fc))])
-
-        # Pick a replay state from each cell
-        j_pool = cell_to_replay.get(j_cell, [])
-        k_pool = cell_to_replay.get(k_cell, [])
+        j_pool = cell_to_replay.get(int(j_cell), [])
+        k_pool = cell_to_replay.get(int(k_cell), [])
         if not j_pool or not k_pool:
             continue
 
@@ -398,11 +514,11 @@ def sample_triplets_geodesic(
         anchors.append(a_idx)
         closes.append(j_idx)
         fars.append(k_idx)
-        d_close_list.append(float(dist_matrix[a_cell, j_cell]))
-        d_far_list.append(float(dist_matrix[a_cell, k_cell]))
+        d_close_list.append(d_j)
+        d_far_list.append(d_k)
 
     if not anchors:
-        return (np.zeros(0, dtype=np.int64),) * 3 + (np.zeros(0, dtype=np.float32),) * 2
+        return _empty_triplets()
 
     return (
         np.array(anchors, dtype=np.int64),
@@ -427,38 +543,35 @@ def triplet_ranking_loss(
     d_close: torch.Tensor,
     d_far: torch.Tensor,
     margin: float = 1.0,
-) -> torch.Tensor:
-    """L2-based triplet ranking loss with distance-scaled margin.
-
-    Encourages: d_proj(anchor, close) + margin < d_proj(anchor, far)
-    Margin scales with log(d_far / d_close) — pairs with larger
-    geodesic ratio get stricter enforcement.
-    """
-    # Gather unique indices to avoid redundant encoder forward passes
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (projection-space rank loss, encoder-space rank loss)."""
     all_idx = torch.cat([anchor_idx, close_idx, far_idx])
     unique_idx, inverse = torch.unique(all_idx, return_inverse=True)
 
-    # Forward through encoder + projection head
     emb = encoder(obs_tensor[unique_idx])
     proj = proj_head(emb)
 
     n = len(anchor_idx)
+    a_emb = emb[inverse[:n]]
+    c_emb = emb[inverse[n:2*n]]
+    f_emb = emb[inverse[2*n:]]
+
     a_proj = proj[inverse[:n]]
     c_proj = proj[inverse[n:2*n]]
     f_proj = proj[inverse[2*n:]]
 
-    # L2 distances in projection space
-    d_close_proj = torch.norm(a_proj - c_proj, dim=-1)
-    d_far_proj = torch.norm(a_proj - f_proj, dim=-1)
-
-    # Scaled margin: stricter for pairs with large geodesic ratio
     ratio = d_far / torch.clamp(d_close, min=0.5)
     scaled_margin = margin * torch.log1p(ratio)
 
-    # Triplet loss: want d_close_proj + margin < d_far_proj
-    loss = F.relu(d_close_proj - d_far_proj + scaled_margin)
+    d_close_proj = torch.norm(a_proj - c_proj, dim=-1)
+    d_far_proj = torch.norm(a_proj - f_proj, dim=-1)
+    l_proj = F.relu(d_close_proj - d_far_proj + scaled_margin).mean()
 
-    return loss.mean()
+    d_close_emb = torch.norm(a_emb - c_emb, dim=-1)
+    d_far_emb = torch.norm(a_emb - f_emb, dim=-1)
+    l_enc = F.relu(d_close_emb - d_far_emb + scaled_margin).mean()
+
+    return l_proj, l_enc
 
 
 # =====================================================================
@@ -495,7 +608,7 @@ def reconstruction_and_variance_loss(
     # This diverges as var → 0, creating a strong anti-collapse gradient.
     # When var is healthy (~0.5+), it contributes near-zero loss.
     per_dim_var = torch.var(e, dim=0)  # [embed_dim]
-    l_var = -torch.log(per_dim_var + 1e-4).mean()
+    l_var = variance_weight * (-torch.log(per_dim_var + 1e-4).mean())
 
     return l_recon, l_var
 
@@ -590,6 +703,25 @@ def evaluate_encoder_geometry(
     }
 
 
+@torch.no_grad()
+def compute_all_projections(
+    encoder: ConvEncoder,
+    proj_head: ProjectionHead,
+    obs_tensor: torch.Tensor,
+    batch_size: int = 256,
+) -> np.ndarray:
+    encoder.eval()
+    proj_head.eval()
+    N = obs_tensor.shape[0]
+    out = []
+    for st in range(0, N, batch_size):
+        en = min(st + batch_size, N)
+        e = encoder(obs_tensor[st:en])
+        p = proj_head(e)
+        out.append(p.cpu().numpy())
+    return np.concatenate(out, axis=0).astype(np.float32)
+
+
 def evaluate_projection_geometry(
     encoder: ConvEncoder,
     proj_head: ProjectionHead,
@@ -601,49 +733,12 @@ def evaluate_projection_geometry(
     rng: np.random.Generator = None,
 ) -> dict:
     """Spearman correlation for projection head outputs vs geodesic."""
-    if rng is None:
-        rng = np.random.default_rng(0)
-
-    encoder.eval()
-    proj_head.eval()
-    N = obs_tensor.shape[0]
-
-    # Compute all projections
-    all_proj = []
-    with torch.no_grad():
-        for start in range(0, N, 256):
-            end = min(start + 256, N)
-            e = encoder(obs_tensor[start:end])
-            p = proj_head(e)
-            all_proj.append(p.cpu().numpy())
-    proj_emb = np.concatenate(all_proj, axis=0).astype(np.float32)
-
-    n_pairs = min(n_pairs, N * (N - 1) // 2)
-    ii = rng.choice(N, size=n_pairs)
-    jj = rng.choice(N, size=n_pairs)
-    valid = ii != jj
-    ii, jj = ii[valid], jj[valid]
-
-    d_proj = np.linalg.norm(proj_emb[ii] - proj_emb[jj], axis=-1)
-    cell_i = _positions_to_cell_indices(geodesic, pos[ii])
-    cell_j = _positions_to_cell_indices(geodesic, pos[jj])
-    d_geo = np.array([
-        float(geodesic.dist_matrix[int(ci), int(cj)])
-        for ci, cj in zip(cell_i, cell_j)
-    ], dtype=np.float32)
-
-    finite = np.isfinite(d_geo) & (d_geo > 0)
-    if finite.sum() < 10:
-        return {"spearman_proj_vs_geodesic": 0.0}
-
-    rho = _spearman_rho_numpy(
-        d_proj[finite].astype(np.float64),
-        d_geo[finite].astype(np.float64),
-    )
+    proj_emb = compute_all_projections(encoder, proj_head, obs_tensor)
+    res = evaluate_encoder_geometry(proj_emb, pos, geodesic, n_pairs=n_pairs, rng=rng)
     return {
-        "spearman_proj_vs_geodesic": float(rho),
-        "mean_proj_dist": float(np.mean(d_proj[finite])),
-        "std_proj_dist": float(np.std(d_proj[finite])),
+        "spearman_proj_vs_geodesic": float(res["spearman_enc_vs_geodesic"]),
+        "mean_proj_dist": float(res["mean_enc_dist"]),
+        "std_proj_dist": float(res["std_enc_dist"]),
     }
 
 
@@ -726,41 +821,31 @@ def evaluate_room_discovery(
 # =====================================================================
 
 def freeze_encoder_bottom(encoder: ConvEncoder, cfg: LMCv2Cfg):
-    """Freeze bottom layers of encoder, keep top layers trainable.
-
-    Tries to match named parameters against trainable_patterns.
-    Falls back to freezing first freeze_encoder_frac of params by order.
-    """
+    """Freeze lower conv blocks, keep the top block trainable."""
     all_params = list(encoder.named_parameters())
     n_total = len(all_params)
 
-    # Try pattern matching first
     matched = []
-    for name, p in all_params:
-        name_lower = name.lower()
-        if any(pat in name_lower for pat in cfg.encoder_trainable_patterns):
+    for name, _ in all_params:
+        lname = name.lower()
+        if any(pat in lname for pat in cfg.encoder_trainable_patterns):
             matched.append(name)
 
     if matched:
         n_frozen = 0
         for name, p in all_params:
-            if name not in matched:
-                p.requires_grad_(False)
+            trainable = name in matched
+            p.requires_grad_(trainable)
+            if not trainable:
                 n_frozen += 1
-            else:
-                p.requires_grad_(True)
         print(f"    Encoder: {n_frozen}/{n_total} param groups frozen (pattern match)")
         print(f"    Trainable: {matched}")
     else:
-        # Fallback: freeze first N% by order
         n_freeze = int(cfg.freeze_encoder_frac * n_total)
-        for i, (name, p) in enumerate(all_params):
-            if i < n_freeze:
-                p.requires_grad_(False)
-            else:
-                p.requires_grad_(True)
-        print(f"    Encoder: {n_freeze}/{n_total} param groups frozen "
-              f"(first {cfg.freeze_encoder_frac:.0%})")
+        n_freeze = min(max(n_freeze, 0), max(n_total - 1, 0))
+        for i, (_, p) in enumerate(all_params):
+            p.requires_grad_(i >= n_freeze)
+        print(f"    Encoder: {n_freeze}/{n_total} param groups frozen (fallback by order)")
 
     n_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in encoder.parameters())
@@ -878,6 +963,8 @@ def run_lmc_v2(
     cfg_train.collect_episodes = cfg.collect_episodes
     data = collect_data(env, models, cfg_train, device)
     pos = data["pos"]
+    h_data = data["h"]
+    s_data = data["s"]
     episode_ids = data["episode_ids"]
     raw_obs = data["raw_obs"]
     N = len(pos)
@@ -890,10 +977,16 @@ def run_lmc_v2(
                               device=device).permute(0, 3, 1, 2)
     preprocess_img(obs_tensor, depth=cfg_train.bit_depth)
 
-    # ---- Initial encoder embeddings (frozen) ----
+    # ---- Initial frozen feature bank ----
     encoder.eval()
     encoder_emb_frozen = recompute_embeddings(encoder, obs_tensor, device)
     embed_dim = encoder_emb_frozen.shape[1]
+    feature_bank = {
+        "encoder_e": encoder_emb_frozen,
+        "h": h_data.astype(np.float32),
+        "s": s_data.astype(np.float32),
+        "h+s": np.concatenate([h_data, s_data], axis=-1).astype(np.float32),
+    }
 
     # ---- Baseline evaluation ----
     eval_baseline = evaluate_encoder_geometry(
@@ -913,71 +1006,84 @@ def run_lmc_v2(
     if cfg.mode == "oracle":
         print("\n  [2] Mode: ORACLE — using true geodesic distances")
         dist_matrix = geodesic.dist_matrix.astype(np.float32)
-        cell_indices_for_sampling = cell_indices_true
         sample_fn = lambda rng, n: sample_triplets_geodesic(
-            cell_indices_for_sampling, dist_matrix, rng,
+            cell_indices_true, dist_matrix, rng,
             close_max=cfg.close_max_geodesic,
             far_min=cfg.far_min_geodesic,
             n_triplets=n,
+            near_k_min=cfg.near_k_min,
+            far_k_min=cfg.far_k_min,
+            max_attempt_mult=cfg.max_triplet_attempt_mult,
         )
 
     elif cfg.mode == "pos_boot":
         print("\n  [2] Mode: POSITION BOOTSTRAP — training position probe ...")
-        pos_probe = train_position_probe(
-            encoder_emb_frozen, pos, cfg, device,
+        pos_probe, pos_feature_name = train_position_probe(
+            feature_bank, pos, cfg, device,
         )
-        _, cell_indices_pred = compute_pairwise_distances_pos_boot(
-            encoder_emb_frozen, pos_probe, geodesic, device,
+        pred_pos, cell_indices_pred = compute_pairwise_distances_pos_boot(
+            feature_bank[pos_feature_name], pos_probe, geodesic, device,
         )
         dist_matrix = geodesic.dist_matrix.astype(np.float32)
-        cell_indices_for_sampling = cell_indices_pred
         sample_fn = lambda rng, n: sample_triplets_geodesic(
-            cell_indices_for_sampling, dist_matrix, rng,
+            cell_indices_pred, dist_matrix, rng,
             close_max=cfg.close_max_geodesic,
             far_min=cfg.far_min_geodesic,
             n_triplets=n,
+            near_k_min=cfg.near_k_min,
+            far_k_min=cfg.far_k_min,
+            max_attempt_mult=cfg.max_triplet_attempt_mult,
         )
-        # Report how noisy the predicted cells are
         match_frac = float(np.mean(cell_indices_pred == cell_indices_true))
-        print(f"    Cell prediction accuracy: {match_frac:.2%} "
-              f"(exact cell match)")
+        pos_err = float(np.mean(np.linalg.norm(pred_pos - pos, axis=-1)))
+        print(f"    Cell prediction accuracy: {match_frac:.2%} (exact cell match)")
+        print(f"    Mean position error: {pos_err:.4f}")
 
     elif cfg.mode == "graph":
         print("\n  [2] Mode: GRAPH — using BFS shortest path distances")
         print("    Building frozen replay graph ...")
-        idx_global, g2l, adj_list, edges, n_nodes, n_edges = \
-            build_replay_graph(
-                encoder_emb_frozen, episode_ids,
-                n_graph_max=cfg.graph_max, k_knn=cfg.knn_k,
-            )
+        idx_global, g2l, adj_list, edges, n_nodes, n_edges = build_replay_graph(
+            encoder_emb_frozen, episode_ids,
+            n_graph_max=cfg.graph_max, k_knn=cfg.knn_k,
+        )
         print(f"    Graph: {n_nodes} nodes, {n_edges} edges (frozen)")
         print("    Computing all-pairs BFS ...")
         d_graph = _all_pairs_shortest_paths_bfs(adj_list)
+        finite_graph = d_graph[np.isfinite(d_graph) & (d_graph > 0)]
+        if finite_graph.size > 0:
+            print(
+                f"    BFS stats: min={finite_graph.min():.1f}  "
+                f"median={np.median(finite_graph):.1f}  max={finite_graph.max():.1f}"
+            )
         sample_fn = lambda rng, n: sample_triplets_graph(
             d_graph, idx_global, rng,
             close_max=cfg.close_max_hops,
             far_min=cfg.far_min_hops,
             n_triplets=n,
+            near_k_min=cfg.near_k_min,
+            far_k_min=cfg.far_k_min,
+            max_attempt_mult=cfg.max_triplet_attempt_mult,
         )
     else:
         raise ValueError(f"Unknown mode: {cfg.mode}")
 
     # ---- Verify we can sample triplets ----
-    test_triplets = sample_fn(rng, 100)
-    if len(test_triplets[0]) < 10:
-        print(f"    WARNING: only {len(test_triplets[0])} triplets sampled "
-              f"from test batch. Check thresholds.")
-        # Try relaxing thresholds
+    test_triplets = sample_fn(rng, max(100, cfg.batch_triplets // 2))
+    if len(test_triplets[0]) < cfg.min_triplets_ok:
+        print(f"    WARNING: only {len(test_triplets[0])} triplets sampled from test batch.")
         if cfg.mode == "graph":
-            cfg.close_max_hops = min(cfg.close_max_hops + 2, 6)
-            cfg.far_min_hops = max(cfg.far_min_hops - 2, 4)
-            print(f"    Relaxed: close_max={cfg.close_max_hops}, "
-                  f"far_min={cfg.far_min_hops}")
+            cfg.close_max_hops = min(cfg.close_max_hops + 2, 8)
+            cfg.far_min_hops = max(cfg.far_min_hops - 2, cfg.close_max_hops + 1)
+            print(f"    Relaxed: close_max={cfg.close_max_hops}, far_min={cfg.far_min_hops}")
         else:
             cfg.close_max_geodesic *= 1.5
             cfg.far_min_geodesic *= 0.75
-            print(f"    Relaxed: close_max={cfg.close_max_geodesic:.1f}, "
-                  f"far_min={cfg.far_min_geodesic:.1f}")
+            print(
+                f"    Relaxed: close_max={cfg.close_max_geodesic:.1f}, "
+                f"far_min={cfg.far_min_geodesic:.1f}"
+            )
+        test_triplets = sample_fn(rng, max(100, cfg.batch_triplets // 2))
+        print(f"    Re-test triplets: {len(test_triplets[0])}")
 
     # ---- Freeze encoder bottom layers ----
     print("\n  [3] Freezing encoder bottom layers ...")
@@ -1026,7 +1132,7 @@ def run_lmc_v2(
             dc_t = torch.tensor(d_close, dtype=torch.float32, device=device)
             df_t = torch.tensor(d_far, dtype=torch.float32, device=device)
 
-            l_rank = triplet_ranking_loss(
+            l_rank_proj, l_rank_enc = triplet_ranking_loss(
                 encoder, proj_head, obs_tensor,
                 a_t, c_t, f_t, dc_t, df_t,
                 margin=cfg.margin,
@@ -1039,9 +1145,12 @@ def run_lmc_v2(
                 variance_weight=1.0,
             )
 
-            loss = (cfg.rank_lambda * l_rank
-                    + cfg.recon_lambda * l_recon
-                    + 0.5 * l_var)
+            loss = (
+                cfg.rank_lambda * l_rank_proj
+                + cfg.encoder_rank_lambda * l_rank_enc
+                + cfg.recon_lambda * l_recon
+                + cfg.var_lambda * l_var
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(encoder_params) + list(proj_head.parameters())
@@ -1050,13 +1159,14 @@ def run_lmc_v2(
             )
             optimizer.step()
 
-            running_rank_loss += float(l_rank.item())
+            running_rank_loss += float(l_rank_proj.item())
             running_recon_loss += float(l_recon.item())
 
             if step % max(1, cfg.total_steps // 20) == 0:
                 avg_rank = running_rank_loss / max(step, 1)
                 print(f"    step {step:5d}/{cfg.total_steps}  "
-                      f"L_rank={l_rank.item():.4f}  "
+                      f"L_rank_proj={l_rank_proj.item():.4f}  "
+                      f"L_rank_enc={l_rank_enc.item():.4f}  "
                       f"L_recon={l_recon.item():.4f}  "
                       f"L_var={l_var.item():.4f}  "
                       f"L_total={loss.item():.4f}  "
@@ -1075,6 +1185,7 @@ def run_lmc_v2(
                 encoder_emb_current, pos, geodesic,
                 n_pairs=cfg.eval_n_pairs, rng=rng,
             )
+            proj_emb_current = compute_all_projections(encoder, proj_head, obs_tensor)
             eval_proj = evaluate_projection_geometry(
                 encoder, proj_head, obs_tensor, pos, geodesic,
                 device, n_pairs=cfg.eval_n_pairs, rng=rng,
@@ -1083,13 +1194,20 @@ def run_lmc_v2(
                 encoder_emb_current, pos, geodesic,
                 knn_k=cfg.room_knn_k,
             )
+            rooms_proj = evaluate_room_discovery(
+                proj_emb_current, pos, geodesic,
+                knn_k=cfg.room_knn_k,
+            )
 
             record = {
                 "step": step,
                 "mode": cfg.mode,
                 "triplet_ok": trained_this_step,
                 "rank_loss": (
-                    float(l_rank.item()) if trained_this_step else None
+                    float(l_rank_proj.item()) if trained_this_step else None
+                ),
+                "rank_loss_enc": (
+                    float(l_rank_enc.item()) if trained_this_step else None
                 ),
                 "recon_loss": (
                     float(l_recon.item()) if trained_this_step else None
@@ -1097,6 +1215,8 @@ def run_lmc_v2(
                 **eval_enc,
                 **eval_proj,
                 **rooms,
+                "proj_n_rooms_latent": int(rooms_proj["n_rooms_latent"]),
+                "proj_pair_agreement": float(rooms_proj["pair_agreement"]),
             }
             history.append(record)
 
@@ -1107,8 +1227,10 @@ def run_lmc_v2(
             skip_note = "" if trained_this_step else "  [no triplet step]"
             print(f"    ── eval step {step}: "
                   f"ρ_enc={rho_e:.4f}  ρ_proj={rho_p:.4f}  "
-                  f"rooms={nr}/{rooms['n_rooms_oracle']}  "
-                  f"pair_agree={pa:.3f}  "
+                  f"rooms_enc={nr}/{rooms['n_rooms_oracle']}  "
+                  f"rooms_proj={rooms_proj['n_rooms_latent']}/{rooms_proj['n_rooms_oracle']}  "
+                  f"pair_agree_enc={pa:.3f}  "
+                  f"pair_agree_proj={rooms_proj['pair_agreement']:.3f}  "
                   f"mean_d_enc={eval_enc['mean_enc_dist']:.4f}"
                   f"{skip_note}")
 
@@ -1122,12 +1244,16 @@ def run_lmc_v2(
         encoder_emb_final, pos, geodesic,
         n_pairs=cfg.eval_n_pairs, rng=rng,
     )
+    proj_emb_final = compute_all_projections(encoder, proj_head, obs_tensor)
     eval_proj_final = evaluate_projection_geometry(
         encoder, proj_head, obs_tensor, pos, geodesic,
         device, n_pairs=cfg.eval_n_pairs, rng=rng,
     )
     rooms_final = evaluate_room_discovery(
         encoder_emb_final, pos, geodesic, knn_k=cfg.room_knn_k,
+    )
+    rooms_proj_final = evaluate_room_discovery(
+        proj_emb_final, pos, geodesic, knn_k=cfg.room_knn_k,
     )
 
     # ---- Save everything ----
@@ -1143,6 +1269,7 @@ def run_lmc_v2(
         "final_encoder": {**eval_final},
         "final_projection": {**eval_proj_final},
         "final_rooms": {**rooms_final},
+        "final_projection_rooms": {**rooms_proj_final},
         "history": history,
         "config": {
             k: v for k, v in cfg.__dict__.items()
@@ -1169,8 +1296,10 @@ def run_lmc_v2(
     print(f"  Final enc: ρ_enc={eval_final['spearman_enc_vs_geodesic']:.4f}  "
           f"mean_d={eval_final['mean_enc_dist']:.4f}")
     print(f"  Final proj:ρ_proj={eval_proj_final['spearman_proj_vs_geodesic']:.4f}")
-    print(f"  Final rooms: {rooms_final['n_rooms_latent']}/{rooms_final['n_rooms_oracle']}  "
+    print(f"  Final rooms(enc): {rooms_final['n_rooms_latent']}/{rooms_final['n_rooms_oracle']}  "
           f"pair_agree={rooms_final['pair_agreement']:.3f}")
+    print(f"  Final rooms(proj): {rooms_proj_final['n_rooms_latent']}/{rooms_proj_final['n_rooms_oracle']}  "
+          f"pair_agree={rooms_proj_final['pair_agreement']:.3f}")
 
     return summary
 
@@ -1222,7 +1351,11 @@ def parse_args():
     p.add_argument("--proj_lr", type=float, default=3e-4)
     p.add_argument("--eval_interval", type=int, default=200)
     p.add_argument("--freeze_frac", type=float, default=0.7,
-                   help="Fraction of encoder params to freeze (from bottom)")
+                   help="Fallback fraction of encoder params to freeze")
+    p.add_argument("--var_lambda", type=float, default=0.05)
+    p.add_argument("--encoder_rank_lambda", type=float, default=0.25)
+    p.add_argument("--pos_boot_feature", type=str, default="auto",
+                   choices=["auto", "encoder_e", "h", "s", "h+s"])
     return p.parse_args()
 
 
@@ -1247,6 +1380,9 @@ def main():
         proj_lr=args.proj_lr,
         eval_interval=args.eval_interval,
         freeze_encoder_frac=args.freeze_frac,
+        var_lambda=args.var_lambda,
+        encoder_rank_lambda=args.encoder_rank_lambda,
+        pos_boot_feature=args.pos_boot_feature,
     )
 
     if args.quick:
