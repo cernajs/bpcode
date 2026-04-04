@@ -772,13 +772,41 @@ def freeze_encoder_bottom(encoder: ConvEncoder, cfg: LMCv2Cfg):
 # Plotting
 # =====================================================================
 
-def plot_training_curves(history: list[dict], out_path: str):
+def plot_training_curves(
+    history: list[dict], out_path: str, mode: str = "?",
+):
     """Plot key metrics across training."""
+    if not history:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+        ax.text(
+            0.5,
+            0.5,
+            "No evaluation checkpoints recorded.\n"
+            "If training ran, every step may have skipped the optimizer\n"
+            "(len(anchors) < 4 after triplet sampling).",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=11,
+            wrap=True,
+        )
+        ax.axis("off")
+        fig.suptitle(f"LMC v2 training — mode: {mode}", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        return
+
     steps = [h["step"] for h in history]
     rho_enc = [h.get("spearman_enc_vs_geodesic", 0.0) for h in history]
     rho_proj = [h.get("spearman_proj_vs_geodesic", 0.0) for h in history]
     n_rooms = [h.get("n_rooms_latent", 0) for h in history]
-    rank_loss = [h.get("rank_loss", 0.0) for h in history]
+    rank_loss = [
+        float(h["rank_loss"])
+        if h.get("rank_loss") is not None
+        else float("nan")
+        for h in history
+    ]
     mean_enc_dist = [h.get("mean_enc_dist", 0.0) for h in history]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
@@ -814,7 +842,10 @@ def plot_training_curves(history: list[dict], out_path: str):
         ax.set_xlabel("Training step")
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle(f"LMC v2 training — mode: {history[0].get('mode', '?')}", fontsize=14)
+    fig.suptitle(
+        f"LMC v2 training — mode: {history[0].get('mode', mode)}",
+        fontsize=14,
+    )
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -987,58 +1018,51 @@ def run_lmc_v2(
         anchors, closes, fars, d_close, d_far = sample_fn(
             rng, cfg.batch_triplets,
         )
-        if len(anchors) < 4:
-            continue
+        trained_this_step = len(anchors) >= 4
+        if trained_this_step:
+            a_t = torch.tensor(anchors, dtype=torch.long, device=device)
+            c_t = torch.tensor(closes, dtype=torch.long, device=device)
+            f_t = torch.tensor(fars, dtype=torch.long, device=device)
+            dc_t = torch.tensor(d_close, dtype=torch.float32, device=device)
+            df_t = torch.tensor(d_far, dtype=torch.float32, device=device)
 
-        a_t = torch.tensor(anchors, dtype=torch.long, device=device)
-        c_t = torch.tensor(closes, dtype=torch.long, device=device)
-        f_t = torch.tensor(fars, dtype=torch.long, device=device)
-        dc_t = torch.tensor(d_close, dtype=torch.float32, device=device)
-        df_t = torch.tensor(d_far, dtype=torch.float32, device=device)
+            l_rank = triplet_ranking_loss(
+                encoder, proj_head, obs_tensor,
+                a_t, c_t, f_t, dc_t, df_t,
+                margin=cfg.margin,
+            )
 
-        # ---- Ranking loss ----
-        l_rank = triplet_ranking_loss(
-            encoder, proj_head, obs_tensor,
-            a_t, c_t, f_t, dc_t, df_t,
-            margin=cfg.margin,
-        )
+            recon_idx = rng.choice(N, size=min(cfg.recon_batch, N), replace=False)
+            l_recon, l_var = reconstruction_and_variance_loss(
+                encoder, obs_tensor, recon_idx, device,
+                recon_head=recon_head,
+                variance_weight=1.0,
+            )
 
-        # ---- Reconstruction + variance regularization ----
-        recon_idx = rng.choice(N, size=min(cfg.recon_batch, N), replace=False)
-        l_recon, l_var = reconstruction_and_variance_loss(
-            encoder, obs_tensor, recon_idx, device,
-            recon_head=recon_head,
-            variance_weight=1.0,
-        )
+            loss = (cfg.rank_lambda * l_rank
+                    + cfg.recon_lambda * l_recon
+                    + 0.5 * l_var)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder_params) + list(proj_head.parameters())
+                + list(recon_head.parameters()),
+                cfg.grad_clip,
+            )
+            optimizer.step()
 
-        # ---- Total loss ----
-        # L_rank drives geometry, L_recon preserves encoder info,
-        # L_var explicitly prevents representation collapse.
-        loss = (cfg.rank_lambda * l_rank
-                + cfg.recon_lambda * l_recon
-                + 0.5 * l_var)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(encoder_params) + list(proj_head.parameters())
-            + list(recon_head.parameters()),
-            cfg.grad_clip,
-        )
-        optimizer.step()
+            running_rank_loss += float(l_rank.item())
+            running_recon_loss += float(l_recon.item())
 
-        running_rank_loss += float(l_rank.item())
-        running_recon_loss += float(l_recon.item())
+            if step % max(1, cfg.total_steps // 20) == 0:
+                avg_rank = running_rank_loss / max(step, 1)
+                print(f"    step {step:5d}/{cfg.total_steps}  "
+                      f"L_rank={l_rank.item():.4f}  "
+                      f"L_recon={l_recon.item():.4f}  "
+                      f"L_var={l_var.item():.4f}  "
+                      f"L_total={loss.item():.4f}  "
+                      f"(avg_rank={avg_rank:.4f})")
 
-        # ---- Logging ----
-        if step % max(1, cfg.total_steps // 20) == 0:
-            avg_rank = running_rank_loss / step
-            print(f"    step {step:5d}/{cfg.total_steps}  "
-                  f"L_rank={l_rank.item():.4f}  "
-                  f"L_recon={l_recon.item():.4f}  "
-                  f"L_var={l_var.item():.4f}  "
-                  f"L_total={loss.item():.4f}  "
-                  f"(avg_rank={avg_rank:.4f})")
-
-        # ---- Periodic evaluation ----
+        # ---- Periodic evaluation (always; do not skip when triplets missing) ----
         if step % cfg.eval_interval == 0 or step == cfg.total_steps:
             encoder.eval()
             proj_head.eval()
@@ -1063,8 +1087,13 @@ def run_lmc_v2(
             record = {
                 "step": step,
                 "mode": cfg.mode,
-                "rank_loss": float(l_rank.item()),
-                "recon_loss": float(l_recon.item()),
+                "triplet_ok": trained_this_step,
+                "rank_loss": (
+                    float(l_rank.item()) if trained_this_step else None
+                ),
+                "recon_loss": (
+                    float(l_recon.item()) if trained_this_step else None
+                ),
                 **eval_enc,
                 **eval_proj,
                 **rooms,
@@ -1075,11 +1104,13 @@ def run_lmc_v2(
             rho_p = eval_proj["spearman_proj_vs_geodesic"]
             nr = rooms["n_rooms_latent"]
             pa = rooms["pair_agreement"]
+            skip_note = "" if trained_this_step else "  [no triplet step]"
             print(f"    ── eval step {step}: "
                   f"ρ_enc={rho_e:.4f}  ρ_proj={rho_p:.4f}  "
                   f"rooms={nr}/{rooms['n_rooms_oracle']}  "
                   f"pair_agree={pa:.3f}  "
-                  f"mean_d_enc={eval_enc['mean_enc_dist']:.4f}")
+                  f"mean_d_enc={eval_enc['mean_enc_dist']:.4f}"
+                  f"{skip_note}")
 
     # ---- Final evaluation ----
     print("\n  [5] Final evaluation ...")
@@ -1100,7 +1131,9 @@ def run_lmc_v2(
     )
 
     # ---- Save everything ----
-    plot_training_curves(history, os.path.join(out_dir, "training_curves.png"))
+    plot_training_curves(
+        history, os.path.join(out_dir, "training_curves.png"), mode=cfg.mode,
+    )
 
     summary = {
         "mode": cfg.mode,
