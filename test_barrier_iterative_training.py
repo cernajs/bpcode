@@ -128,6 +128,10 @@ class BarrierTrainingCfg:
     # iteration loop
     max_iterations: int = 10
     convergence_patience: int = 2
+    # Do not early-stop on a trivial 1-room partition: it always matches itself
+    # under pairwise agreement, so patience would fire immediately while the maze
+    # still has undiscovered structure.
+    convergence_min_rooms: int = 2
 
     # evaluation
     eval_n_pairs: int = 2000
@@ -792,13 +796,25 @@ def run_iterative_barrier_training(
             title=f"Rooms (iter {iteration})",
         )
 
-        # Convergence check
-        converged = rooms_converged(room_labels, prev_rooms)
-        if converged:
+        # Convergence check: *patience* counts stable *non-trivial* partitions only.
+        # "2/2" below is patience_counter / convergence_patience (consecutive stable
+        # iterations), not the number of physical maze rooms.
+        partition_stable = rooms_converged(room_labels, prev_rooms)
+        trivial = n_rooms < cfg_barrier.convergence_min_rooms
+        if partition_stable and trivial:
+            print(
+                f"    Partition stable but trivial ({n_rooms} room(s) < "
+                f"{cfg_barrier.convergence_min_rooms}); not counting toward early stop"
+            )
+            patience_counter = 0
+        elif partition_stable and not trivial:
             patience_counter += 1
-            print(f"    Rooms converged ({patience_counter}/{cfg_barrier.convergence_patience})")
+            print(
+                f"    Partition stable — patience {patience_counter}/"
+                f"{cfg_barrier.convergence_patience} ({n_rooms} rooms)"
+            )
             if patience_counter >= cfg_barrier.convergence_patience:
-                print("    Converged! Stopping iteration.")
+                print("    Early stop: partition stable across patience window.")
                 eval_final = evaluate_encoder_geometry(
                     encoder_emb, pos, geodesic,
                     n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
