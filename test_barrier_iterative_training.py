@@ -7,6 +7,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+import copy
+
 import cv2
 import gymnasium as gym
 import gymnasium_robotics  # type: ignore
@@ -45,6 +47,35 @@ from pointmaze_large_topo_v2 import (
 
 
 # =====================================================================
+# Direct reconstruction head (encoder collapse prevention)
+# =====================================================================
+
+class DirectReconHead(nn.Module):
+    """Lightweight MLP: embed_dim → pixels, bypassing RSSM entirely.
+
+    The RSSM path (encoder → get_init_state → decoder) provides near-zero
+    gradient back into the encoder because h is zero-initialised and the
+    decoder learns to ignore e.  A direct e → MLP → obs head keeps the
+    encoder gradient healthy regardless of RSSM dynamics.
+    """
+
+    def __init__(self, embed_dim: int, obs_channels: int = 3, img_size: int = 64):
+        super().__init__()
+        out_dim = obs_channels * img_size * img_size
+        self.obs_shape = (obs_channels, img_size, img_size)
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, 512),
+            nn.ELU(),
+            nn.Linear(512, 512),
+            nn.ELU(),
+            nn.Linear(512, out_dim),
+        )
+
+    def forward(self, e: torch.Tensor) -> torch.Tensor:
+        return self.net(e).view(e.shape[0], *self.obs_shape)
+
+
+# =====================================================================
 # Config
 # =====================================================================
 
@@ -75,9 +106,16 @@ class BarrierTrainingCfg:
     pos_k: int = 3
     n_hard_neg: int = 32
 
-    # reconstruction regularization
+    # reconstruction regularization (direct MLP head)
     recon_lambda: float = 1.0
     recon_batch: int = 16
+
+    # EMA encoder (BYOL-style collapse prevention)
+    ema_decay: float = 0.99
+
+    # warm-start: use temporal-only edges for first N iterations to let
+    # the encoder build metric structure before kNN shortcuts are trusted
+    warm_start_iters: int = 3
 
     # iteration loop
     max_iterations: int = 10
@@ -127,9 +165,12 @@ def compute_barrier_scores(encoder_emb: np.ndarray, idx_global: np.ndarray,
     ).astype(np.float64)
 
     d_g = d_graph.astype(np.float64)
-    d_g[d_g < 0] = 0.0  # unreachable -> 0 (won't create high ratio)
-
-    barrier = d_g / np.maximum(d_enc, 1e-8)
+    # Unreachable pairs (d_g < 0) must NOT be treated as zero-barrier neighbors.
+    # Setting them to 0 inflates the safe-pair count, raises the percentile
+    # threshold, and lets real barriers slip through. Mask them out instead.
+    reachable = d_g >= 0
+    barrier = np.zeros_like(d_g)
+    barrier[reachable] = d_g[reachable] / np.maximum(d_enc[reachable], 1e-8)
     np.fill_diagonal(barrier, 0.0)
     return barrier.astype(np.float32)
 
@@ -226,8 +267,14 @@ def mine_pairs(encoder_emb: np.ndarray, room_labels: np.ndarray,
     # Hard negatives: different room but close in encoder space
     graph_indices = idx_global.copy()
     emb_graph = encoder_emb[graph_indices]
-    median_dist = float(np.median(np.linalg.norm(
-        emb_graph[:1] - emb_graph[1:], axis=-1)))
+    # Sample random pairs to estimate a representative pairwise median distance.
+    # Using emb_graph[:1] would only measure distances from node 0, which is
+    # misleading when the encoder has collapsed (node 0 ≈ equidistant from all).
+    _rng_idx = rng.choice(len(emb_graph),
+                          size=(min(500, len(emb_graph)), 2), replace=True)
+    median_dist = float(np.median(
+        np.linalg.norm(emb_graph[_rng_idx[:, 0]] - emb_graph[_rng_idx[:, 1]],
+                       axis=-1)))
 
     unique_anchors = np.unique(anchors)
     hard_neg_map: dict[int, np.ndarray] = {}
@@ -277,27 +324,42 @@ def infonce_loss(encoder: ConvEncoder, obs_tensor: torch.Tensor,
                  neg_idx_map: dict[int, np.ndarray],
                  batch_size: int, temperature: float,
                  device: torch.device, rng: np.random.Generator,
-                 cfg: TrainCfg):
-    """Compute InfoNCE geo-correction loss on a mini-batch."""
+                 cfg: TrainCfg,
+                 ema_encoder: ConvEncoder | None = None):
+    """Compute InfoNCE geo-correction loss on a mini-batch.
+
+    When *ema_encoder* is supplied (BYOL-style), positive embeddings are
+    produced by the EMA encoder under torch.no_grad(), so gradients flow
+    only through anchors and hard-negatives.  This prevents the EMA target
+    from collapsing along with the online encoder.
+    """
     n_pairs = len(anchor_idx)
     batch_idx = rng.choice(n_pairs, size=min(batch_size, n_pairs), replace=False)
 
     batch_anchors = anchor_idx[batch_idx]
     batch_pos = pos_idx[batch_idx]
 
-    all_indices = set()
+    # ---- anchor + negative indices → trainable encoder ----
+    an_neg_indices: set[int] = set()
     for a in batch_anchors.tolist():
-        all_indices.add(int(a))
+        an_neg_indices.add(int(a))
         if int(a) in neg_idx_map:
             for n in neg_idx_map[int(a)].tolist():
-                all_indices.add(int(n))
-    for p in batch_pos.tolist():
-        all_indices.add(int(p))
-    all_indices = sorted(all_indices)
-    idx_to_local = {g: i for i, g in enumerate(all_indices)}
+                an_neg_indices.add(int(n))
+    an_neg_list = sorted(an_neg_indices)
+    an_neg_to_local = {g: i for i, g in enumerate(an_neg_list)}
 
-    obs_batch = obs_tensor[all_indices]
-    emb = encoder(obs_batch)
+    an_neg_emb = encoder(obs_tensor[an_neg_list])
+
+    # ---- positive indices → EMA encoder (no grad) or online encoder ----
+    pos_global_list = sorted(set(int(p) for p in batch_pos.tolist()))
+    pos_to_local = {g: i for i, g in enumerate(pos_global_list)}
+
+    if ema_encoder is not None:
+        with torch.no_grad():
+            pos_emb_all = ema_encoder(obs_tensor[pos_global_list])
+    else:
+        pos_emb_all = encoder(obs_tensor[pos_global_list])
 
     total_loss = torch.tensor(0.0, device=device)
     count = 0
@@ -307,12 +369,12 @@ def infonce_loss(encoder: ConvEncoder, obs_tensor: torch.Tensor,
         if a not in neg_idx_map or len(neg_idx_map[a]) == 0:
             continue
 
-        a_emb = emb[idx_to_local[a]]
-        p_emb = emb[idx_to_local[p]]
+        a_emb = an_neg_emb[an_neg_to_local[a]]
+        p_emb = pos_emb_all[pos_to_local[p]]
 
         neg_globals = neg_idx_map[a]
-        n_embs = emb[[idx_to_local[int(n)] for n in neg_globals.tolist()
-                       if int(n) in idx_to_local]]
+        n_embs = an_neg_emb[[an_neg_to_local[int(n)] for n in neg_globals.tolist()
+                               if int(n) in an_neg_to_local]]
 
         if len(n_embs) == 0:
             continue
@@ -331,22 +393,25 @@ def infonce_loss(encoder: ConvEncoder, obs_tensor: torch.Tensor,
 
 
 # =====================================================================
-# Reconstruction regularization loss
+# Reconstruction regularization loss (direct MLP, no RSSM)
 # =====================================================================
 
-def reconstruction_loss(encoder: ConvEncoder, decoder: ConvDecoder,
-                        rssm: RSSM, obs_tensor: torch.Tensor,
-                        batch_size: int, device: torch.device,
-                        rng: np.random.Generator, cfg: TrainCfg):
-    """Pixel reconstruction loss to prevent encoder from forgetting."""
+def direct_reconstruction_loss(encoder: ConvEncoder,
+                                recon_head: DirectReconHead,
+                                obs_tensor: torch.Tensor,
+                                batch_size: int, device: torch.device,
+                                rng: np.random.Generator) -> torch.Tensor:
+    """Pixel reconstruction via encoder → DirectReconHead → obs.
+
+    Avoids the zero-initialised RSSM h vector that causes near-zero
+    gradient flow back into the encoder from the full decoder path.
+    """
     N = obs_tensor.shape[0]
     idx = rng.choice(N, size=min(batch_size, N), replace=False)
     obs_batch = obs_tensor[idx]
     e = encoder(obs_batch)
-    h, s = rssm.get_init_state(e)
-    recon = decoder(h, s)
-    target = obs_batch
-    return F.mse_loss(recon, target)
+    recon = recon_head(e)
+    return F.mse_loss(recon, obs_batch)
 
 
 # =====================================================================
@@ -579,8 +644,25 @@ def run_iterative_barrier_training(
                                       n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
     print(f"    Initial encoder-geodesic Spearman ρ = {eval0['spearman_enc_vs_geodesic']:.4f}")
 
-    # Optimizer for encoder fine-tuning (low LR to preserve reconstruction)
-    encoder_opt = torch.optim.Adam(encoder.parameters(), lr=cfg_barrier.geo_lr)
+    # ---- EMA encoder (BYOL-style — positives come from the EMA copy) ----
+    ema_encoder = copy.deepcopy(encoder)
+    for _p in ema_encoder.parameters():
+        _p.requires_grad_(False)
+    ema_encoder.eval()
+    print(f"    EMA encoder initialised (decay={cfg_barrier.ema_decay})")
+
+    # ---- Direct reconstruction head (no RSSM gradient path) ----
+    recon_head = DirectReconHead(
+        embed_dim=cfg_train.embed_dim,
+        obs_channels=3,
+        img_size=cfg_train.img_size,
+    ).to(device)
+
+    # Joint optimizer: encoder + recon head
+    encoder_opt = torch.optim.Adam(
+        list(encoder.parameters()) + list(recon_head.parameters()),
+        lr=cfg_barrier.geo_lr,
+    )
 
     history: list[dict] = []
     prev_rooms = None
@@ -593,11 +675,17 @@ def run_iterative_barrier_training(
         print(f"{'='*60}")
 
         # Phase 1: Build replay graph
-        print("  [Phase 1] Building mixed replay graph ...")
+        # Warm-start: use temporal edges only for the first N iterations so the
+        # barrier detector has ground-truth topology even when the encoder is flat.
+        # kNN edges are re-introduced once the encoder gains some metric structure.
+        effective_knn_k = (0 if iteration < cfg_barrier.warm_start_iters
+                           else cfg_barrier.knn_k)
+        print("  [Phase 1] Building mixed replay graph "
+              f"({'temporal-only warm-start' if effective_knn_k == 0 else f'kNN k={effective_knn_k}'}) ...")
         idx_global, g2l, adj_list, edges, n_nodes, n_edges = build_replay_graph(
             encoder_emb, episode_ids,
             n_graph_max=cfg_barrier.graph_max,
-            k_knn=cfg_barrier.knn_k,
+            k_knn=effective_knn_k,
         )
         print(f"    Graph: {n_nodes} nodes, {n_edges} edges")
 
@@ -709,26 +797,34 @@ def run_iterative_barrier_training(
         for step in range(cfg_barrier.geo_train_steps):
             encoder_opt.zero_grad(set_to_none=True)
 
-            # L_geo: InfoNCE contrastive correction
+            # L_geo: InfoNCE contrastive correction; EMA encoder produces positives
             l_geo = infonce_loss(
                 encoder, obs_tensor,
                 anchors, positives, hard_neg_map,
                 batch_size=cfg_barrier.geo_batch,
                 temperature=cfg_barrier.geo_temperature,
                 device=device, rng=rng, cfg=cfg_train,
+                ema_encoder=ema_encoder,
             )
 
-            # L_recon: reconstruction regularization
-            l_recon = reconstruction_loss(
-                encoder, decoder, rssm, obs_tensor,
+            # L_recon: direct encoder → MLP → obs (no RSSM, healthy gradient)
+            l_recon = direct_reconstruction_loss(
+                encoder, recon_head, obs_tensor,
                 batch_size=cfg_barrier.recon_batch,
-                device=device, rng=rng, cfg=cfg_train,
+                device=device, rng=rng,
             )
 
             loss = cfg_barrier.recon_lambda * l_recon + cfg_barrier.geo_lambda * l_geo
             loss.backward()
             torch.nn.utils.clip_grad_norm_(encoder.parameters(), 10.0)
             encoder_opt.step()
+
+            # EMA update: θ_ema ← decay·θ_ema + (1−decay)·θ
+            with torch.no_grad():
+                for p_ema, p_online in zip(ema_encoder.parameters(),
+                                           encoder.parameters()):
+                    p_ema.data.mul_(cfg_barrier.ema_decay).add_(
+                        p_online.data, alpha=1.0 - cfg_barrier.ema_decay)
 
             geo_losses.append(float(l_geo.item()))
 
