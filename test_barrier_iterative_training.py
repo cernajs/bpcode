@@ -6,6 +6,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from math import log
 
 import copy
 
@@ -657,6 +658,111 @@ def plot_convergence(history: list[dict], out_path: str):
 
 
 # =====================================================================
+# Phase 0: Temporal pre-training (bootstrap encoder from ρ ≈ 0)
+# =====================================================================
+
+def temporal_pretrain(
+    encoder: ConvEncoder,
+    obs_tensor: torch.Tensor,
+    episode_ids: np.ndarray,
+    device: torch.device,
+    n_steps: int = 800,
+    lr: float = 3e-4,
+    temperature: float = 0.1,
+    pos_k: int = 5,
+    n_neg: int = 64,
+    batch_size: int = 128,
+    rng: np.random.Generator = None,
+) -> float:
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    episodes = np.unique(episode_ids)
+
+    ep_to_idx: dict[int, np.ndarray] = {}
+    for ep in episodes:
+        ep_to_idx[int(ep)] = np.where(episode_ids == ep)[0]
+
+    opt = torch.optim.Adam(encoder.parameters(), lr=lr)
+    encoder.train()
+    losses = []
+
+    for step in range(n_steps):
+        opt.zero_grad(set_to_none=True)
+
+        anchor_idx, pos_idx, neg_idx = [], [], []
+        for _ in range(batch_size):
+            ep = int(rng.choice(episodes))
+            idx = ep_to_idx[ep]
+            if len(idx) < 2:
+                continue
+            t = int(rng.choice(len(idx)))
+            lo = max(0, t - pos_k)
+            hi = min(len(idx) - 1, t + pos_k)
+            choices = [x for x in range(lo, hi + 1) if x != t]
+            if not choices:
+                continue
+            tp = int(rng.choice(choices))
+            anchor_idx.append(int(idx[t]))
+            pos_idx.append(int(idx[tp]))
+
+            other_eps = [e for e in episodes if e != ep]
+            if not other_eps:
+                continue
+            neg_eps = rng.choice(other_eps,
+                                  size=min(n_neg, len(other_eps)), replace=False)
+            neg_states = []
+            for ne in neg_eps:
+                ni = ep_to_idx[int(ne)]
+                neg_states.append(int(rng.choice(ni)))
+            while len(neg_states) < n_neg:
+                ne = int(rng.choice(other_eps))
+                neg_states.append(int(rng.choice(ep_to_idx[ne])))
+            neg_idx.append(neg_states[:n_neg])
+
+        if not anchor_idx:
+            continue
+
+        all_idx = sorted(set(anchor_idx) | set(pos_idx) |
+                         {n for negs in neg_idx for n in negs})
+        idx_to_local = {g: i for i, g in enumerate(all_idx)}
+        emb = encoder(obs_tensor[all_idx])
+
+        total = torch.tensor(0.0, device=device)
+        count = 0
+        for bi in range(len(anchor_idx)):
+            a_emb = emb[idx_to_local[anchor_idx[bi]]]
+            p_emb = emb[idx_to_local[pos_idx[bi]]]
+            n_embs = torch.stack([emb[idx_to_local[n]] for n in neg_idx[bi]])
+
+            pos_sim = F.cosine_similarity(
+                a_emb.unsqueeze(0), p_emb.unsqueeze(0)) / temperature
+            neg_sim = F.cosine_similarity(
+                a_emb.unsqueeze(0).expand_as(n_embs), n_embs) / temperature
+
+            logits = torch.cat([pos_sim, neg_sim])
+            label = torch.zeros(1, dtype=torch.long, device=device)
+            total = total + F.cross_entropy(logits.unsqueeze(0), label)
+            count += 1
+
+        if count == 0:
+            continue
+        loss = total / count
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(encoder.parameters(), 5.0)
+        opt.step()
+        losses.append(float(loss.item()))
+
+        if (step + 1) % 100 == 0:
+            print(f"    [Phase 0] step {step+1}/{n_steps}  "
+                  f"L={np.mean(losses[-50:]):.4f}  "
+                  f"(max={log(n_neg+1):.2f})")
+
+    encoder.eval()
+    return float(np.mean(losses[-100:])) if losses else 0.0
+
+
+# =====================================================================
 # Phase 6: Full iterative training loop
 # =====================================================================
 
@@ -697,10 +803,24 @@ def run_iterative_barrier_training(
     # Initial encoder embeddings
     encoder_emb = recompute_embeddings(encoder, obs_tensor, device)
 
-    # Initial evaluation
+    # Initial evaluation (pre-Phase-0)
+    eval_pre = evaluate_encoder_geometry(encoder_emb, pos, geodesic,
+                                         n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
+    print(f"    Pre-Phase-0 encoder-geodesic Spearman ρ = {eval_pre['spearman_enc_vs_geodesic']:.4f}")
+
+    # Phase 0: temporal pre-training with random cross-episode negatives.
+    # Gives the encoder just enough spatial structure for barrier detection
+    # and hard-negative mining to be self-sustaining from iteration 1.
+    print("\n  [Phase 0] Temporal pre-training (random cross-episode negatives) ...")
+    temporal_pretrain(
+        encoder, obs_tensor, episode_ids, device,
+        n_steps=800, lr=3e-4, temperature=0.1,
+        pos_k=5, n_neg=64, batch_size=128, rng=rng,
+    )
+    encoder_emb = recompute_embeddings(encoder, obs_tensor, device)
     eval0 = evaluate_encoder_geometry(encoder_emb, pos, geodesic,
                                       n_pairs=cfg_barrier.eval_n_pairs, rng=rng)
-    print(f"    Initial encoder-geodesic Spearman ρ = {eval0['spearman_enc_vs_geodesic']:.4f}")
+    print(f"    Post-Phase-0 ρ = {eval0['spearman_enc_vs_geodesic']:.4f}")
     # ρ from last eval drives negative mining (graph bootstrap vs room-based).
     current_rho = float(eval0["spearman_enc_vs_geodesic"])
 
@@ -969,7 +1089,8 @@ def run_iterative_barrier_training(
     if history:
         h0 = history[0]
         hf = history[-1]
-        print(f"    ρ: {eval0['spearman_enc_vs_geodesic']:.4f} (initial) -> "
+        print(f"    ρ: {eval_pre['spearman_enc_vs_geodesic']:.4f} (pre-Phase-0) -> "
+              f"{eval0['spearman_enc_vs_geodesic']:.4f} (post-Phase-0) -> "
               f"{hf.get('spearman_enc_vs_geodesic', 0.0):.4f} (final)")
         print(f"    Rooms: {h0['n_rooms']} (iter 0) -> {hf['n_rooms']} (final)")
 
