@@ -30,15 +30,15 @@ class ConvEncoder(nn.Module):
             hidden = self.act_fn(self.conv2(hidden))
             hidden = self.act_fn(self.conv3(hidden))
             hidden = self.act_fn(self.conv4(hidden))
-            hidden = hidden.view(B * T, -1)
+            hidden = hidden.reshape(B * T, -1)
             hidden = self.fc(hidden)
-            return hidden.view(B, T, -1)
+            return hidden.reshape(B, T, -1)
         else:
             hidden = self.act_fn(self.conv1(observation))
             hidden = self.act_fn(self.conv2(hidden))
             hidden = self.act_fn(self.conv3(hidden))
             hidden = self.act_fn(self.conv4(hidden))
-            hidden = hidden.view(observation.size(0), -1)
+            hidden = hidden.reshape(observation.size(0), -1)
             hidden = self.fc(hidden)
             return hidden
 
