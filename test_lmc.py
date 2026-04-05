@@ -11,14 +11,12 @@ Key changes from v1:
        --mode graph       : graph BFS shortest paths (oracle-free)
        --mode oracle      : true geodesic distances (upper bound)
        --mode pos_boot    : position-predicted geodesic (practical)
-  6. Optional auxiliary latent head on top of frozen latent features
-       --train_target latent_head : learn topology in a separate space
 
 Usage:
   python test_lmc_v2.py --wm_path world_model.pt --mode oracle
   python test_lmc_v2.py --wm_path world_model.pt --mode graph
-  python test_lmc_v2.py --wm_path world_model.pt --mode pos_boot
-  python test_lmc_v2.py --wm_path world_model.pt --mode pos_boot       --train_target latent_head --head_feature h+s
+  python test_lmc_v2.py --wm_path world_model.pt --mode replay --train_target latent_head --head_feature h+s
+  python test_lmc_v2.py --wm_path world_model.pt --mode pos_boot --train_target latent_head --head_feature h+s
 """
 
 import argparse
@@ -125,14 +123,17 @@ class LMCv2Cfg:
     pos_boot_feature: str = "auto"
 
     # training target
-    #   encoder_proj : original experiment, adapt encoder + projection head
-    #   latent_head  : keep encoder fixed, learn a separate metric head over latent features
+    # encoder_proj: adapt encoder + projection head
+    # latent_head : keep backbone frozen and train a separate metric head on frozen latent features
     train_target: str = "encoder_proj"
     head_feature: str = "h+s"
     head_dim: int = 128
     head_hidden: int = 256
     head_lr: float = 3e-4
-    head_var_lambda: float = 0.05
+
+    # replay-only temporal teacher (oracle-free)
+    replay_close_steps: int = 4
+    replay_far_steps: int = 20
 
     # evaluation
     eval_interval: int = 200
@@ -183,33 +184,30 @@ class ProjectionHead(nn.Module):
         return self.net(e)
 
 
-class LatentMetricHead(nn.Module):
-    """Learns a separate topology/metric space on top of frozen latent features."""
+# =====================================================================
+# Position probe (for pos_boot mode)
+# =====================================================================
 
-    def __init__(self, in_dim: int, out_dim: int = 128, hidden_dim: int = 256):
+class LatentMetricHead(nn.Module):
+    """Separate metric head over frozen latent features."""
+
+    def __init__(self, feature_dim: int, head_dim: int = 128, hidden: int = 256):
         super().__init__()
-        mid = max(hidden_dim, out_dim)
         self.net = nn.Sequential(
-            nn.Linear(in_dim, mid),
-            nn.BatchNorm1d(mid),
+            nn.Linear(feature_dim, hidden),
             nn.ELU(),
-            nn.Linear(mid, mid),
-            nn.BatchNorm1d(mid),
+            nn.Linear(hidden, hidden),
             nn.ELU(),
-            nn.Linear(mid, out_dim),
+            nn.Linear(hidden, head_dim),
         )
         for m in self.net.modules():
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.3)
+                nn.init.orthogonal_(m.weight, gain=0.5)
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
-# =====================================================================
-# Position probe (for pos_boot mode)
-# =====================================================================
 
 class PositionProbe(nn.Module):
     """MLP: latent feature -> (x, y) position prediction with internal standardization."""
@@ -570,6 +568,96 @@ def sample_triplets_geodesic(
 # Ranking loss (replaces InfoNCE)
 # =====================================================================
 
+def _build_episode_index(episode_ids: np.ndarray) -> list[np.ndarray]:
+    episodes = []
+    for ep in np.unique(episode_ids):
+        idx = np.where(episode_ids == ep)[0]
+        if idx.size >= 3:
+            episodes.append(idx.astype(np.int64))
+    return episodes
+
+
+def sample_triplets_replay_temporal(
+    episode_indices: list[np.ndarray],
+    rng: np.random.Generator,
+    close_max_steps: int = 4,
+    far_min_steps: int = 20,
+    n_triplets: int = 512,
+    max_attempt_mult: int = 50,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Replay-only temporal teacher.
+
+    Samples near/far states from the same episode using timestep distance only.
+    This is oracle-free and avoids shortcut wormholes from mixed kNN graphs.
+    """
+    if not episode_indices:
+        return _empty_triplets()
+
+    anchors, closes, fars = [], [], []
+    d_close_list, d_far_list = [], []
+    attempts = 0
+    max_attempts = max(n_triplets * max_attempt_mult, n_triplets + 1)
+
+    eligible = [ep for ep in episode_indices if len(ep) >= 3]
+    if not eligible:
+        return _empty_triplets()
+
+    while len(anchors) < n_triplets and attempts < max_attempts:
+        attempts += 1
+        ep_idx = eligible[int(rng.integers(len(eligible)))]
+        T = len(ep_idx)
+        if T < 3:
+            continue
+
+        a_local = int(rng.integers(0, T))
+        deltas = np.abs(np.arange(T) - a_local)
+        valid = deltas > 0
+        if valid.sum() < 2:
+            continue
+
+        close_cands = np.where((deltas <= close_max_steps) & valid)[0]
+        far_cands = np.where(deltas >= far_min_steps)[0]
+
+        if close_cands.size == 0:
+            order = np.argsort(deltas[valid])
+            valid_idx = np.where(valid)[0]
+            close_cands = valid_idx[order[: min(8, len(order))]]
+        if far_cands.size == 0:
+            order = np.argsort(deltas)
+            far_cands = order[-min(8, valid.sum()):]
+            far_cands = far_cands[deltas[far_cands] > 0]
+
+        if close_cands.size == 0 or far_cands.size == 0:
+            continue
+
+        c_local = int(close_cands[int(rng.integers(len(close_cands)))])
+        f_local = int(far_cands[int(rng.integers(len(far_cands)))])
+        dc = float(abs(c_local - a_local))
+        df = float(abs(f_local - a_local))
+        if df <= dc:
+            f_local = int(far_cands[np.argmax(np.abs(far_cands - a_local))])
+            df = float(abs(f_local - a_local))
+            if df <= dc:
+                continue
+
+        anchors.append(int(ep_idx[a_local]))
+        closes.append(int(ep_idx[c_local]))
+        fars.append(int(ep_idx[f_local]))
+        d_close_list.append(dc)
+        d_far_list.append(df)
+
+    if not anchors:
+        return _empty_triplets()
+
+    return (
+        np.array(anchors, dtype=np.int64),
+        np.array(closes, dtype=np.int64),
+        np.array(fars, dtype=np.int64),
+        np.array(d_close_list, dtype=np.float32),
+        np.array(d_far_list, dtype=np.float32),
+    )
+
+
 def triplet_ranking_loss(
     encoder: ConvEncoder,
     proj_head: ProjectionHead,
@@ -609,36 +697,6 @@ def triplet_ranking_loss(
     l_enc = F.relu(d_close_emb - d_far_emb + scaled_margin).mean()
 
     return l_proj, l_enc
-
-
-def triplet_ranking_loss_features(
-    feature_tensor: torch.Tensor,
-    head: nn.Module,
-    anchor_idx: torch.Tensor,
-    close_idx: torch.Tensor,
-    far_idx: torch.Tensor,
-    d_close: torch.Tensor,
-    d_far: torch.Tensor,
-    margin: float = 1.0,
-) -> torch.Tensor:
-    """Triplet ranking loss for a separate head on frozen latent features."""
-    all_idx = torch.cat([anchor_idx, close_idx, far_idx])
-    unique_idx, inverse = torch.unique(all_idx, return_inverse=True)
-
-    base = feature_tensor[unique_idx]
-    mapped = head(base)
-
-    n = len(anchor_idx)
-    a = mapped[inverse[:n]]
-    c = mapped[inverse[n:2*n]]
-    f = mapped[inverse[2*n:]]
-
-    ratio = d_far / torch.clamp(d_close, min=0.5)
-    scaled_margin = margin * torch.log1p(ratio)
-
-    d_close_head = torch.norm(a - c, dim=-1)
-    d_far_head = torch.norm(a - f, dim=-1)
-    return F.relu(d_close_head - d_far_head + scaled_margin).mean()
 
 
 # =====================================================================
@@ -786,22 +844,6 @@ def compute_all_projections(
         e = encoder(obs_tensor[st:en])
         p = proj_head(e)
         out.append(p.cpu().numpy())
-    return np.concatenate(out, axis=0).astype(np.float32)
-
-
-@torch.no_grad()
-def compute_all_head_embeddings(
-    feature_tensor: torch.Tensor,
-    head: nn.Module,
-    batch_size: int = 256,
-) -> np.ndarray:
-    head.eval()
-    N = feature_tensor.shape[0]
-    out = []
-    for st in range(0, N, batch_size):
-        en = min(st + batch_size, N)
-        z = head(feature_tensor[st:en])
-        out.append(z.cpu().numpy())
     return np.concatenate(out, axis=0).astype(np.float32)
 
 
@@ -985,8 +1027,8 @@ def plot_training_curves(
     axes[0, 0].axhline(0, color="gray", linestyle=":", linewidth=0.5)
 
     axes[0, 1].plot(steps, rho_proj, "o-", color="teal", markersize=4)
-    axes[0, 1].set_ylabel("Spearman ρ (auxiliary space vs geodesic)")
-    axes[0, 1].set_title("Projection / head distance correlation")
+    axes[0, 1].set_ylabel("Spearman ρ (projection vs geodesic)")
+    axes[0, 1].set_title("Projection distance correlation")
     axes[0, 1].axhline(0, color="gray", linestyle=":", linewidth=0.5)
 
     axes[0, 2].plot(steps, n_rooms, "D-", color="purple", markersize=4)
@@ -1019,6 +1061,55 @@ def plot_training_curves(
     plt.close(fig)
 
 
+@torch.no_grad()
+def compute_all_head_embeddings(
+    feature_tensor: torch.Tensor,
+    latent_head: LatentMetricHead,
+    batch_size: int = 512,
+) -> np.ndarray:
+    latent_head.eval()
+    N = feature_tensor.shape[0]
+    out = []
+    for st in range(0, N, batch_size):
+        en = min(st + batch_size, N)
+        z = latent_head(feature_tensor[st:en])
+        out.append(z.cpu().numpy())
+    return np.concatenate(out, axis=0).astype(np.float32)
+
+
+def triplet_ranking_loss_head(
+    feature_tensor: torch.Tensor,
+    latent_head: LatentMetricHead,
+    anchor_idx: torch.Tensor,
+    close_idx: torch.Tensor,
+    far_idx: torch.Tensor,
+    d_close: torch.Tensor,
+    d_far: torch.Tensor,
+    margin: float = 1.0,
+) -> torch.Tensor:
+    all_idx = torch.cat([anchor_idx, close_idx, far_idx])
+    unique_idx, inverse = torch.unique(all_idx, return_inverse=True)
+    z = latent_head(feature_tensor[unique_idx])
+
+    n = len(anchor_idx)
+    a = z[inverse[:n]]
+    c = z[inverse[n:2*n]]
+    f = z[inverse[2*n:]]
+
+    ratio = d_far / torch.clamp(d_close, min=0.5)
+    scaled_margin = margin * torch.log1p(ratio)
+
+    d_close_h = torch.norm(a - c, dim=-1)
+    d_far_h = torch.norm(a - f, dim=-1)
+    return F.relu(d_close_h - d_far_h + scaled_margin).mean()
+
+
+def head_variance_loss(feature_tensor: torch.Tensor, latent_head: LatentMetricHead, batch_idx: np.ndarray) -> torch.Tensor:
+    z = latent_head(feature_tensor[torch.as_tensor(batch_idx, dtype=torch.long, device=feature_tensor.device)])
+    per_dim_var = torch.var(z, dim=0)
+    return -torch.log(per_dim_var + 1e-4).mean()
+
+
 # =====================================================================
 # Main training loop
 # =====================================================================
@@ -1030,7 +1121,7 @@ def run_lmc_v2(
     cfg: LMCv2Cfg,
     device: torch.device,
 ):
-    """Main LMC v2 training: either adapt encoder+projection or train a separate latent head."""
+    """Main experiment driver. Supports encoder adaptation or a frozen-backbone latent head."""
     out_dir = cfg.output_dir
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1041,7 +1132,6 @@ def run_lmc_v2(
 
     rng = np.random.default_rng(cfg.seed)
 
-    # ---- Collect replay data ----
     print("\n  [1] Collecting replay data ...")
     cfg_train.collect_episodes = cfg.collect_episodes
     data = collect_data(env, models, cfg_train, device)
@@ -1058,7 +1148,6 @@ def run_lmc_v2(
     obs_tensor = torch.tensor(obs_images, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
     preprocess_img(obs_tensor, depth=cfg_train.bit_depth)
 
-    # ---- Initial frozen feature bank ----
     encoder.eval()
     encoder_emb_frozen = recompute_embeddings(encoder, obs_tensor, device)
     embed_dim = encoder_emb_frozen.shape[1]
@@ -1070,7 +1159,8 @@ def run_lmc_v2(
     }
 
     eval_baseline = evaluate_encoder_geometry(
-        encoder_emb_frozen, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng,
+        encoder_emb_frozen, pos, geodesic,
+        n_pairs=cfg.eval_n_pairs, rng=rng,
     )
     rooms_baseline = evaluate_room_discovery(
         encoder_emb_frozen, pos, geodesic, knn_k=cfg.room_knn_k,
@@ -1085,8 +1175,8 @@ def run_lmc_v2(
     if cfg.mode == "oracle":
         print("\n  [2] Mode: ORACLE — using true geodesic distances")
         dist_matrix = geodesic.dist_matrix.astype(np.float32)
-        sample_fn = lambda rng, n: sample_triplets_geodesic(
-            cell_indices_true, dist_matrix, rng,
+        sample_fn = lambda rng_, n: sample_triplets_geodesic(
+            cell_indices_true, dist_matrix, rng_,
             close_max=cfg.close_max_geodesic,
             far_min=cfg.far_min_geodesic,
             n_triplets=n,
@@ -1094,7 +1184,6 @@ def run_lmc_v2(
             far_k_min=cfg.far_k_min,
             max_attempt_mult=cfg.max_triplet_attempt_mult,
         )
-
     elif cfg.mode == "pos_boot":
         print("\n  [2] Mode: POSITION BOOTSTRAP — training position probe ...")
         pos_probe, pos_feature_name = train_position_probe(feature_bank, pos, cfg, device)
@@ -1102,8 +1191,8 @@ def run_lmc_v2(
             feature_bank[pos_feature_name], pos_probe, geodesic, device,
         )
         dist_matrix = geodesic.dist_matrix.astype(np.float32)
-        sample_fn = lambda rng, n: sample_triplets_geodesic(
-            cell_indices_pred, dist_matrix, rng,
+        sample_fn = lambda rng_, n: sample_triplets_geodesic(
+            cell_indices_pred, dist_matrix, rng_,
             close_max=cfg.close_max_geodesic,
             far_min=cfg.far_min_geodesic,
             n_triplets=n,
@@ -1113,19 +1202,19 @@ def run_lmc_v2(
         )
         match_frac = float(np.mean(cell_indices_pred == cell_indices_true))
         pos_err = float(np.mean(np.linalg.norm(pred_pos - pos, axis=-1)))
-        pos_boot_meta = {
-            "feature": pos_feature_name,
-            "cell_accuracy": match_frac,
-            "mean_position_error": pos_err,
-        }
         print(f"    Cell prediction accuracy: {match_frac:.2%} (exact cell match)")
         print(f"    Mean position error: {pos_err:.4f}")
-
+        pos_boot_meta = {
+            "feature": pos_feature_name,
+            "cell_match": match_frac,
+            "mean_position_error": pos_err,
+        }
     elif cfg.mode == "graph":
         print("\n  [2] Mode: GRAPH — using BFS shortest path distances")
         print("    Building frozen replay graph ...")
         idx_global, g2l, adj_list, edges, n_nodes, n_edges = build_replay_graph(
-            encoder_emb_frozen, episode_ids, n_graph_max=cfg.graph_max, k_knn=cfg.knn_k,
+            encoder_emb_frozen, episode_ids,
+            n_graph_max=cfg.graph_max, k_knn=cfg.knn_k,
         )
         print(f"    Graph: {n_nodes} nodes, {n_edges} edges (frozen)")
         print("    Computing all-pairs BFS ...")
@@ -1136,13 +1225,26 @@ def run_lmc_v2(
                 f"    BFS stats: min={finite_graph.min():.1f}  "
                 f"median={np.median(finite_graph):.1f}  max={finite_graph.max():.1f}"
             )
-        sample_fn = lambda rng, n: sample_triplets_graph(
-            d_graph, idx_global, rng,
+        sample_fn = lambda rng_, n: sample_triplets_graph(
+            d_graph, idx_global, rng_,
             close_max=cfg.close_max_hops,
             far_min=cfg.far_min_hops,
             n_triplets=n,
             near_k_min=cfg.near_k_min,
             far_k_min=cfg.far_k_min,
+            max_attempt_mult=cfg.max_triplet_attempt_mult,
+        )
+    elif cfg.mode == "replay":
+        print("\n  [2] Mode: REPLAY — using same-episode temporal distances (oracle-free)")
+        episode_index = _build_episode_index(episode_ids)
+        ep_lens = np.array([len(x) for x in episode_index], dtype=np.int64)
+        if ep_lens.size > 0:
+            print(f"    Replay stats: episodes={len(ep_lens)}  min_len={ep_lens.min()}  median_len={int(np.median(ep_lens))}  max_len={ep_lens.max()}")
+        sample_fn = lambda rng_, n: sample_triplets_replay_temporal(
+            episode_index, rng_,
+            close_max_steps=cfg.replay_close_steps,
+            far_min_steps=cfg.replay_far_steps,
+            n_triplets=n,
             max_attempt_mult=cfg.max_triplet_attempt_mult,
         )
     else:
@@ -1155,23 +1257,18 @@ def run_lmc_v2(
             cfg.close_max_hops = min(cfg.close_max_hops + 2, 8)
             cfg.far_min_hops = max(cfg.far_min_hops - 2, cfg.close_max_hops + 1)
             print(f"    Relaxed: close_max={cfg.close_max_hops}, far_min={cfg.far_min_hops}")
+        elif cfg.mode == "replay":
+            cfg.replay_close_steps = max(2, cfg.replay_close_steps + 2)
+            cfg.replay_far_steps = max(cfg.replay_close_steps + 2, cfg.replay_far_steps - 4)
+            print(f"    Relaxed replay: close_max={cfg.replay_close_steps}, far_min={cfg.replay_far_steps}")
         else:
             cfg.close_max_geodesic *= 1.5
             cfg.far_min_geodesic *= 0.75
-            print(
-                f"    Relaxed: close_max={cfg.close_max_geodesic:.1f}, "
-                f"far_min={cfg.far_min_geodesic:.1f}"
-            )
+            print(f"    Relaxed: close_max={cfg.close_max_geodesic:.1f}, far_min={cfg.far_min_geodesic:.1f}")
         test_triplets = sample_fn(rng, max(100, cfg.batch_triplets // 2))
         print(f"    Re-test triplets: {len(test_triplets[0])}")
 
-    latent_head = None
-    proj_head = None
-    recon_head = None
-    optimizer = None
-    encoder_params = []
-    feature_tensor = None
-    aux_label = "proj"
+    history = []
 
     if cfg.train_target == "encoder_proj":
         print("\n  [3] Freezing encoder bottom layers ...")
@@ -1186,57 +1283,28 @@ def run_lmc_v2(
 
         proj_head = ProjectionHead(embed_dim, cfg.proj_dim).to(device)
         recon_head = DirectReconHead(embed_dim, obs_channels=3, img_size=cfg_train.img_size).to(device)
+
         encoder_params = [p for p in encoder.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam([
             {"params": encoder_params, "lr": cfg.encoder_lr},
             {"params": proj_head.parameters(), "lr": cfg.proj_lr},
             {"params": recon_head.parameters(), "lr": cfg.proj_lr},
         ], weight_decay=cfg.weight_decay)
-        train_desc = f"encoder+projection for {cfg.total_steps} steps"
-        aux_label = "proj"
-    elif cfg.train_target == "latent_head":
-        print("\n  [3] Auxiliary latent-head mode ...")
-        if cfg.head_feature not in feature_bank:
-            raise KeyError(
-                f"head_feature={cfg.head_feature!r} not found; available={sorted(feature_bank.keys())}"
-            )
-        for p in encoder.parameters():
-            p.requires_grad_(False)
-        decoder.eval(); rssm.eval(); encoder.eval()
-        feature_tensor = torch.tensor(feature_bank[cfg.head_feature], dtype=torch.float32, device=device)
-        latent_head = LatentMetricHead(feature_tensor.shape[1], cfg.head_dim, cfg.head_hidden).to(device)
-        optimizer = torch.optim.Adam(latent_head.parameters(), lr=cfg.head_lr, weight_decay=cfg.weight_decay)
-        print(f"    Frozen backbone; training separate head on feature: {cfg.head_feature}")
-        print(f"    Feature dim: {feature_tensor.shape[1]}  head dim: {cfg.head_dim}")
-        train_desc = f"latent head for {cfg.total_steps} steps"
-        aux_label = "head"
-    else:
-        raise ValueError(f"Unknown train_target: {cfg.train_target}")
 
-    print(f"\n  [4] Training {train_desc} (mode={cfg.mode}) ...")
-    history = []
-    running_rank_loss = 0.0
-    running_recon_loss = 0.0
+        print(f"\n  [4] Training encoder/projection for {cfg.total_steps} steps (mode={cfg.mode}) ...")
+        running_rank_loss = 0.0
+        for step in range(1, cfg.total_steps + 1):
+            encoder.train(); proj_head.train()
+            optimizer.zero_grad(set_to_none=True)
+            anchors, closes, fars, d_close, d_far = sample_fn(rng, cfg.batch_triplets)
+            trained_this_step = len(anchors) >= 4
+            if trained_this_step:
+                a_t = torch.tensor(anchors, dtype=torch.long, device=device)
+                c_t = torch.tensor(closes, dtype=torch.long, device=device)
+                f_t = torch.tensor(fars, dtype=torch.long, device=device)
+                dc_t = torch.tensor(d_close, dtype=torch.float32, device=device)
+                df_t = torch.tensor(d_far, dtype=torch.float32, device=device)
 
-    for step in range(1, cfg.total_steps + 1):
-        if proj_head is not None:
-            encoder.train()
-            proj_head.train()
-            recon_head.train()
-        if latent_head is not None:
-            latent_head.train()
-        optimizer.zero_grad(set_to_none=True)
-
-        anchors, closes, fars, d_close, d_far = sample_fn(rng, cfg.batch_triplets)
-        trained_this_step = len(anchors) >= 4
-        if trained_this_step:
-            a_t = torch.tensor(anchors, dtype=torch.long, device=device)
-            c_t = torch.tensor(closes, dtype=torch.long, device=device)
-            f_t = torch.tensor(fars, dtype=torch.long, device=device)
-            dc_t = torch.tensor(d_close, dtype=torch.float32, device=device)
-            df_t = torch.tensor(d_far, dtype=torch.float32, device=device)
-
-            if cfg.train_target == "encoder_proj":
                 l_rank_proj, l_rank_enc = triplet_ranking_loss(
                     encoder, proj_head, obs_tensor, a_t, c_t, f_t, dc_t, df_t, margin=cfg.margin,
                 )
@@ -1250,34 +1318,13 @@ def run_lmc_v2(
                     + cfg.recon_lambda * l_recon
                     + cfg.var_lambda * l_var
                 )
-            else:
-                l_rank_head = triplet_ranking_loss_features(
-                    feature_tensor, latent_head, a_t, c_t, f_t, dc_t, df_t, margin=cfg.margin,
-                )
-                var_idx = rng.choice(N, size=min(cfg.recon_batch, N), replace=False)
-                z = latent_head(feature_tensor[torch.tensor(var_idx, dtype=torch.long, device=device)])
-                per_dim_var = torch.var(z, dim=0)
-                l_var = -torch.log(per_dim_var + 1e-4).mean()
-                l_recon = torch.tensor(0.0, device=device)
-                l_rank_enc = torch.tensor(0.0, device=device)
-                l_rank_proj = l_rank_head
-                loss = cfg.rank_lambda * l_rank_head + cfg.head_var_lambda * l_var
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(list(encoder_params) + list(proj_head.parameters()) + list(recon_head.parameters()), cfg.grad_clip)
+                optimizer.step()
+                running_rank_loss += float(l_rank_proj.item())
 
-            loss.backward()
-            params_for_clip = []
-            if cfg.train_target == "encoder_proj":
-                params_for_clip = list(encoder_params) + list(proj_head.parameters()) + list(recon_head.parameters())
-            else:
-                params_for_clip = list(latent_head.parameters())
-            torch.nn.utils.clip_grad_norm_(params_for_clip, cfg.grad_clip)
-            optimizer.step()
-
-            running_rank_loss += float(l_rank_proj.item())
-            running_recon_loss += float(l_recon.item())
-
-            if step % max(1, cfg.total_steps // 20) == 0:
-                avg_rank = running_rank_loss / max(step, 1)
-                if cfg.train_target == "encoder_proj":
+                if step % max(1, cfg.total_steps // 20) == 0:
+                    avg_rank = running_rank_loss / max(step, 1)
                     print(f"    step {step:5d}/{cfg.total_steps}  "
                           f"L_rank_proj={l_rank_proj.item():.4f}  "
                           f"L_rank_enc={l_rank_enc.item():.4f}  "
@@ -1285,135 +1332,193 @@ def run_lmc_v2(
                           f"L_var={l_var.item():.4f}  "
                           f"L_total={loss.item():.4f}  "
                           f"(avg_rank={avg_rank:.4f})")
-                else:
-                    print(f"    step {step:5d}/{cfg.total_steps}  "
-                          f"L_rank_head={l_rank_proj.item():.4f}  "
-                          f"L_var={l_var.item():.4f}  "
-                          f"L_total={loss.item():.4f}  "
-                          f"(avg_rank={avg_rank:.4f})")
 
-        if step % cfg.eval_interval == 0 or step == cfg.total_steps:
-            if cfg.train_target == "encoder_proj":
+            if step % cfg.eval_interval == 0 or step == cfg.total_steps:
                 encoder.eval(); proj_head.eval()
                 encoder_emb_current = recompute_embeddings(encoder, obs_tensor, device)
-                aux_emb_current = compute_all_projections(encoder, proj_head, obs_tensor)
                 eval_enc = evaluate_encoder_geometry(encoder_emb_current, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
-                eval_aux = evaluate_encoder_geometry(aux_emb_current, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
-                eval_aux = {
-                    "spearman_proj_vs_geodesic": float(eval_aux["spearman_enc_vs_geodesic"]),
-                    "mean_proj_dist": float(eval_aux["mean_enc_dist"]),
-                    "std_proj_dist": float(eval_aux["std_enc_dist"]),
+                proj_emb_current = compute_all_projections(encoder, proj_head, obs_tensor)
+                eval_aux = evaluate_encoder_geometry(proj_emb_current, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
+                rooms_enc = evaluate_room_discovery(encoder_emb_current, pos, geodesic, knn_k=cfg.room_knn_k)
+                rooms_aux = evaluate_room_discovery(proj_emb_current, pos, geodesic, knn_k=cfg.room_knn_k)
+                record = {
+                    "step": step, "mode": cfg.mode, "train_target": cfg.train_target,
+                    "triplet_ok": trained_this_step,
+                    "rank_loss": float(l_rank_proj.item()) if trained_this_step else None,
+                    **eval_enc,
+                    "spearman_aux_vs_geodesic": float(eval_aux["spearman_enc_vs_geodesic"]),
+                    **rooms_enc,
+                    "aux_n_rooms_latent": int(rooms_aux["n_rooms_latent"]),
+                    "aux_pair_agreement": float(rooms_aux["pair_agreement"]),
                 }
-            else:
-                encoder_emb_current = encoder_emb_frozen
-                aux_emb_current = compute_all_head_embeddings(feature_tensor, latent_head)
-                eval_enc = evaluate_encoder_geometry(encoder_emb_current, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
-                eval_aux_raw = evaluate_encoder_geometry(aux_emb_current, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
-                eval_aux = {
-                    "spearman_proj_vs_geodesic": float(eval_aux_raw["spearman_enc_vs_geodesic"]),
-                    "mean_proj_dist": float(eval_aux_raw["mean_enc_dist"]),
-                    "std_proj_dist": float(eval_aux_raw["std_enc_dist"]),
-                }
+                history.append(record)
+                skip_note = "" if trained_this_step else "  [no triplet step]"
+                print(f"    ── eval step {step}: ρ_enc={eval_enc['spearman_enc_vs_geodesic']:.4f}  "
+                      f"ρ_proj={eval_aux['spearman_enc_vs_geodesic']:.4f}  "
+                      f"rooms_enc={rooms_enc['n_rooms_latent']}/{rooms_enc['n_rooms_oracle']}  "
+                      f"rooms_proj={rooms_aux['n_rooms_latent']}/{rooms_aux['n_rooms_oracle']}  "
+                      f"pair_agree_enc={rooms_enc['pair_agreement']:.3f}  "
+                      f"pair_agree_proj={rooms_aux['pair_agreement']:.3f}  "
+                      f"mean_d_enc={eval_enc['mean_enc_dist']:.4f}{skip_note}")
 
-            rooms = evaluate_room_discovery(encoder_emb_current, pos, geodesic, knn_k=cfg.room_knn_k)
-            rooms_aux = evaluate_room_discovery(aux_emb_current, pos, geodesic, knn_k=cfg.room_knn_k)
-
-            record = {
-                "step": step,
-                "mode": cfg.mode,
-                "train_target": cfg.train_target,
-                "aux_label": aux_label,
-                "triplet_ok": trained_this_step,
-                "rank_loss": float(l_rank_proj.item()) if trained_this_step else None,
-                "rank_loss_enc": float(l_rank_enc.item()) if trained_this_step else None,
-                "recon_loss": float(l_recon.item()) if trained_this_step else None,
-                **eval_enc,
-                **eval_aux,
-                **rooms,
-                "proj_n_rooms_latent": int(rooms_aux["n_rooms_latent"]),
-                "proj_pair_agreement": float(rooms_aux["pair_agreement"]),
-            }
-            history.append(record)
-
-            rho_e = eval_enc["spearman_enc_vs_geodesic"]
-            rho_aux = eval_aux["spearman_proj_vs_geodesic"]
-            nr = rooms["n_rooms_latent"]
-            pa = rooms["pair_agreement"]
-            skip_note = "" if trained_this_step else "  [no triplet step]"
-            print(f"    ── eval step {step}: "
-                  f"ρ_enc={rho_e:.4f}  ρ_{aux_label}={rho_aux:.4f}  "
-                  f"rooms_enc={nr}/{rooms['n_rooms_oracle']}  "
-                  f"rooms_{aux_label}={rooms_aux['n_rooms_latent']}/{rooms_aux['n_rooms_oracle']}  "
-                  f"pair_agree_enc={pa:.3f}  "
-                  f"pair_agree_{aux_label}={rooms_aux['pair_agreement']:.3f}  "
-                  f"mean_d_enc={eval_enc['mean_enc_dist']:.4f}"
-                  f"{skip_note}")
-
-    print("\n  [5] Final evaluation ...")
-    if cfg.train_target == "encoder_proj":
+        print("\n  [5] Final evaluation ...")
         encoder.eval(); proj_head.eval()
         encoder_emb_final = recompute_embeddings(encoder, obs_tensor, device)
-        aux_emb_final = compute_all_projections(encoder, proj_head, obs_tensor)
-    else:
+        eval_final = evaluate_encoder_geometry(encoder_emb_final, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
+        proj_emb_final = compute_all_projections(encoder, proj_head, obs_tensor)
+        eval_aux_final = evaluate_encoder_geometry(proj_emb_final, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
+        rooms_final = evaluate_room_discovery(encoder_emb_final, pos, geodesic, knn_k=cfg.room_knn_k)
+        rooms_aux_final = evaluate_room_discovery(proj_emb_final, pos, geodesic, knn_k=cfg.room_knn_k)
+
+        summary = {
+            "mode": cfg.mode,
+            "train_target": cfg.train_target,
+            "seed": cfg.seed,
+            "total_steps": cfg.total_steps,
+            "baseline": {**eval_baseline, **rooms_baseline},
+            "final_encoder": {**eval_final},
+            "final_aux": {**eval_aux_final},
+            "final_rooms": {**rooms_final},
+            "final_aux_rooms": {**rooms_aux_final},
+            "history": history,
+            "pos_boot": pos_boot_meta,
+            "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
+        }
+
+        with open(os.path.join(out_dir, "results.json"), "w") as f:
+            json.dump(summary, f, indent=2, default=_json_default)
+        plot_training_curves(history, os.path.join(out_dir, "training_curves.png"), mode=cfg.mode)
+        torch.save({
+            "encoder": encoder.state_dict(),
+            "proj_head": proj_head.state_dict(),
+            "decoder": decoder.state_dict(),
+            "rssm": rssm.state_dict(),
+        }, os.path.join(out_dir, "checkpoint.pt"))
+
+        print(f"\n  ── SUMMARY ({cfg.mode}, {cfg.train_target}) ──")
+        print(f"  Baseline:  ρ_enc={eval_baseline['spearman_enc_vs_geodesic']:.4f}  rooms={rooms_baseline['n_rooms_latent']}/{rooms_baseline['n_rooms_oracle']}  pair_agree={rooms_baseline['pair_agreement']:.3f}")
+        print(f"  Final enc: ρ_enc={eval_final['spearman_enc_vs_geodesic']:.4f}  mean_d={eval_final['mean_enc_dist']:.4f}")
+        print(f"  Final proj:ρ_proj={eval_aux_final['spearman_enc_vs_geodesic']:.4f}")
+        print(f"  Final rooms(enc): {rooms_final['n_rooms_latent']}/{rooms_final['n_rooms_oracle']}  pair_agree={rooms_final['pair_agreement']:.3f}")
+        print(f"  Final rooms(proj): {rooms_aux_final['n_rooms_latent']}/{rooms_aux_final['n_rooms_oracle']}  pair_agree={rooms_aux_final['pair_agreement']:.3f}")
+        return summary
+
+    elif cfg.train_target == "latent_head":
+        print("\n  [3] Auxiliary latent-head mode ...")
+        for p in encoder.parameters():
+            p.requires_grad_(False)
+        for p in decoder.parameters():
+            p.requires_grad_(False)
+        for p in rssm.parameters():
+            p.requires_grad_(False)
+        encoder.eval(); decoder.eval(); rssm.eval()
+
+        if cfg.head_feature not in feature_bank:
+            raise KeyError(f"Unknown head_feature={cfg.head_feature!r}; available={sorted(feature_bank)}")
+        feature_np = feature_bank[cfg.head_feature].astype(np.float32)
+        feature_tensor = torch.tensor(feature_np, dtype=torch.float32, device=device)
+        latent_head = LatentMetricHead(feature_tensor.shape[1], cfg.head_dim, cfg.head_hidden).to(device)
+        optimizer = torch.optim.Adam(latent_head.parameters(), lr=cfg.head_lr, weight_decay=cfg.weight_decay)
+
+        print(f"    Frozen backbone; training separate head on feature: {cfg.head_feature}")
+        print(f"    Feature dim: {feature_tensor.shape[1]}  head dim: {cfg.head_dim}")
+        print(f"\n  [4] Training latent head for {cfg.total_steps} steps (mode={cfg.mode}) ...")
+        running_rank_loss = 0.0
+        for step in range(1, cfg.total_steps + 1):
+            latent_head.train()
+            optimizer.zero_grad(set_to_none=True)
+            anchors, closes, fars, d_close, d_far = sample_fn(rng, cfg.batch_triplets)
+            trained_this_step = len(anchors) >= 4
+            if trained_this_step:
+                a_t = torch.tensor(anchors, dtype=torch.long, device=device)
+                c_t = torch.tensor(closes, dtype=torch.long, device=device)
+                f_t = torch.tensor(fars, dtype=torch.long, device=device)
+                dc_t = torch.tensor(d_close, dtype=torch.float32, device=device)
+                df_t = torch.tensor(d_far, dtype=torch.float32, device=device)
+                l_rank_head = triplet_ranking_loss_head(feature_tensor, latent_head, a_t, c_t, f_t, dc_t, df_t, margin=cfg.margin)
+                var_idx = rng.choice(N, size=min(cfg.recon_batch, N), replace=False)
+                l_var = head_variance_loss(feature_tensor, latent_head, var_idx)
+                loss = cfg.rank_lambda * l_rank_head + cfg.var_lambda * l_var
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(list(latent_head.parameters()), cfg.grad_clip)
+                optimizer.step()
+                running_rank_loss += float(l_rank_head.item())
+
+                if step % max(1, cfg.total_steps // 20) == 0:
+                    avg_rank = running_rank_loss / max(step, 1)
+                    print(f"    step {step:5d}/{cfg.total_steps}  L_rank_head={l_rank_head.item():.4f}  L_var={l_var.item():.4f}  L_total={loss.item():.4f}  (avg_rank={avg_rank:.4f})")
+
+            if step % cfg.eval_interval == 0 or step == cfg.total_steps:
+                encoder.eval(); latent_head.eval()
+                encoder_emb_current = encoder_emb_frozen
+                eval_enc = evaluate_encoder_geometry(encoder_emb_current, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
+                head_emb_current = compute_all_head_embeddings(feature_tensor, latent_head)
+                eval_aux = evaluate_encoder_geometry(head_emb_current, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
+                rooms_enc = evaluate_room_discovery(encoder_emb_current, pos, geodesic, knn_k=cfg.room_knn_k)
+                rooms_aux = evaluate_room_discovery(head_emb_current, pos, geodesic, knn_k=cfg.room_knn_k)
+                record = {
+                    "step": step, "mode": cfg.mode, "train_target": cfg.train_target,
+                    "triplet_ok": trained_this_step,
+                    "rank_loss": float(l_rank_head.item()) if trained_this_step else None,
+                    **eval_enc,
+                    "spearman_aux_vs_geodesic": float(eval_aux["spearman_enc_vs_geodesic"]),
+                    **rooms_enc,
+                    "aux_n_rooms_latent": int(rooms_aux["n_rooms_latent"]),
+                    "aux_pair_agreement": float(rooms_aux["pair_agreement"]),
+                }
+                history.append(record)
+                skip_note = "" if trained_this_step else "  [no triplet step]"
+                print(f"    ── eval step {step}: ρ_enc={eval_enc['spearman_enc_vs_geodesic']:.4f}  "
+                      f"ρ_head={eval_aux['spearman_enc_vs_geodesic']:.4f}  "
+                      f"rooms_enc={rooms_enc['n_rooms_latent']}/{rooms_enc['n_rooms_oracle']}  "
+                      f"rooms_head={rooms_aux['n_rooms_latent']}/{rooms_aux['n_rooms_oracle']}  "
+                      f"pair_agree_enc={rooms_enc['pair_agreement']:.3f}  "
+                      f"pair_agree_head={rooms_aux['pair_agreement']:.3f}  "
+                      f"mean_d_enc={eval_enc['mean_enc_dist']:.4f}{skip_note}")
+
+        print("\n  [5] Final evaluation ...")
         encoder_emb_final = encoder_emb_frozen
-        aux_emb_final = compute_all_head_embeddings(feature_tensor, latent_head)
+        eval_final = evaluate_encoder_geometry(encoder_emb_final, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
+        head_emb_final = compute_all_head_embeddings(feature_tensor, latent_head)
+        eval_aux_final = evaluate_encoder_geometry(head_emb_final, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
+        rooms_final = evaluate_room_discovery(encoder_emb_final, pos, geodesic, knn_k=cfg.room_knn_k)
+        rooms_aux_final = evaluate_room_discovery(head_emb_final, pos, geodesic, knn_k=cfg.room_knn_k)
 
-    eval_final = evaluate_encoder_geometry(encoder_emb_final, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
-    eval_aux_raw = evaluate_encoder_geometry(aux_emb_final, pos, geodesic, n_pairs=cfg.eval_n_pairs, rng=rng)
-    eval_proj_final = {
-        "spearman_proj_vs_geodesic": float(eval_aux_raw["spearman_enc_vs_geodesic"]),
-        "mean_proj_dist": float(eval_aux_raw["mean_enc_dist"]),
-        "std_proj_dist": float(eval_aux_raw["std_enc_dist"]),
-    }
-    rooms_final = evaluate_room_discovery(encoder_emb_final, pos, geodesic, knn_k=cfg.room_knn_k)
-    rooms_proj_final = evaluate_room_discovery(aux_emb_final, pos, geodesic, knn_k=cfg.room_knn_k)
+        summary = {
+            "mode": cfg.mode,
+            "train_target": cfg.train_target,
+            "seed": cfg.seed,
+            "total_steps": cfg.total_steps,
+            "baseline": {**eval_baseline, **rooms_baseline},
+            "final_encoder": {**eval_final},
+            "final_aux": {**eval_aux_final},
+            "final_rooms": {**rooms_final},
+            "final_aux_rooms": {**rooms_aux_final},
+            "history": history,
+            "pos_boot": pos_boot_meta,
+            "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
+        }
 
-    plot_training_curves(history, os.path.join(out_dir, "training_curves.png"), mode=cfg.mode)
+        with open(os.path.join(out_dir, "results.json"), "w") as f:
+            json.dump(summary, f, indent=2, default=_json_default)
+        plot_training_curves(history, os.path.join(out_dir, "training_curves.png"), mode=cfg.mode)
+        torch.save({
+            "encoder": encoder.state_dict(),
+            "latent_head": latent_head.state_dict(),
+            "decoder": decoder.state_dict(),
+            "rssm": rssm.state_dict(),
+        }, os.path.join(out_dir, "checkpoint.pt"))
 
-    summary = {
-        "mode": cfg.mode,
-        "train_target": cfg.train_target,
-        "head_feature": cfg.head_feature if cfg.train_target == "latent_head" else None,
-        "seed": cfg.seed,
-        "total_steps": cfg.total_steps,
-        "baseline": {**eval_baseline, **rooms_baseline},
-        "final_encoder": {**eval_final},
-        "final_projection": {**eval_proj_final},
-        "final_rooms": {**rooms_final},
-        "final_projection_rooms": {**rooms_proj_final},
-        "pos_boot": pos_boot_meta,
-        "history": history,
-        "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
-    }
+        print(f"\n  ── SUMMARY ({cfg.mode}, {cfg.train_target}) ──")
+        print(f"  Baseline:  ρ_enc={eval_baseline['spearman_enc_vs_geodesic']:.4f}  rooms={rooms_baseline['n_rooms_latent']}/{rooms_baseline['n_rooms_oracle']}  pair_agree={rooms_baseline['pair_agreement']:.3f}")
+        print(f"  Final enc: ρ_enc={eval_final['spearman_enc_vs_geodesic']:.4f}  mean_d={eval_final['mean_enc_dist']:.4f}")
+        print(f"  Final head:ρ_head={eval_aux_final['spearman_enc_vs_geodesic']:.4f}")
+        print(f"  Final rooms(enc): {rooms_final['n_rooms_latent']}/{rooms_final['n_rooms_oracle']}  pair_agree={rooms_final['pair_agreement']:.3f}")
+        print(f"  Final rooms(head): {rooms_aux_final['n_rooms_latent']}/{rooms_aux_final['n_rooms_oracle']}  pair_agree={rooms_aux_final['pair_agreement']:.3f}")
+        return summary
 
-    with open(os.path.join(out_dir, "results.json"), "w") as f:
-        json.dump(summary, f, indent=2, default=_json_default)
-
-    ckpt = {
-        "encoder": encoder.state_dict(),
-        "decoder": decoder.state_dict(),
-        "rssm": rssm.state_dict(),
-    }
-    if proj_head is not None:
-        ckpt["proj_head"] = proj_head.state_dict()
-    if latent_head is not None:
-        ckpt["latent_head"] = latent_head.state_dict()
-        ckpt["head_feature"] = cfg.head_feature
-    torch.save(ckpt, os.path.join(out_dir, "checkpoint.pt"))
-
-    print(f"\n  ── SUMMARY ({cfg.mode}, {cfg.train_target}) ──")
-    print(f"  Baseline:  ρ_enc={eval_baseline['spearman_enc_vs_geodesic']:.4f}  "
-          f"rooms={rooms_baseline['n_rooms_latent']}/{rooms_baseline['n_rooms_oracle']}  "
-          f"pair_agree={rooms_baseline['pair_agreement']:.3f}")
-    print(f"  Final enc: ρ_enc={eval_final['spearman_enc_vs_geodesic']:.4f}  "
-          f"mean_d={eval_final['mean_enc_dist']:.4f}")
-    print(f"  Final {aux_label}:ρ_{aux_label}={eval_proj_final['spearman_proj_vs_geodesic']:.4f}")
-    print(f"  Final rooms(enc): {rooms_final['n_rooms_latent']}/{rooms_final['n_rooms_oracle']}  "
-          f"pair_agree={rooms_final['pair_agreement']:.3f}")
-    print(f"  Final rooms({aux_label}): {rooms_proj_final['n_rooms_latent']}/{rooms_proj_final['n_rooms_oracle']}  "
-          f"pair_agree={rooms_proj_final['pair_agreement']:.3f}")
-
-    return summary
+    else:
+        raise ValueError(f"Unknown train_target: {cfg.train_target}")
 
 def build_replay_graph(encoder_emb, episode_ids, n_graph_max=1800, k_knn=10):
     """Build mixed graph. Reused from v1."""
@@ -1443,16 +1548,16 @@ def _json_default(obj):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="LMC v2: Latent Metric Correction via encoder projection or separate latent head",
+        description="LMC v2: Latent Metric Correction via projection head + ranking loss",
     )
     p.add_argument("--wm_path", type=str, default="world_model.pt")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output_dir", type=str, default="lmc_v2_results")
     p.add_argument("--quick", action="store_true")
     p.add_argument("--mode", type=str, default="oracle",
-                   choices=["graph", "oracle", "pos_boot"],
-                   help="Distance target: graph (BFS), oracle (true geodesic), "
-                        "pos_boot (position-predicted geodesic)")
+                   choices=["graph", "replay", "oracle", "pos_boot"],
+                   help="Distance target: graph (mixed replay BFS), replay (same-episode temporal, oracle-free), "
+                        "oracle (true geodesic), pos_boot (position-predicted geodesic)")
     p.add_argument("--total_steps", type=int, default=3000)
     p.add_argument("--collect_episodes", type=int, default=60)
     p.add_argument("--margin", type=float, default=1.0)
@@ -1469,14 +1574,15 @@ def parse_args():
                    choices=["auto", "encoder_e", "h", "s", "h+s"])
     p.add_argument("--train_target", type=str, default="encoder_proj",
                    choices=["encoder_proj", "latent_head"],
-                   help="encoder_proj: adapt encoder + projection head; latent_head: keep encoder fixed and learn a separate head")
+                   help="encoder_proj: adapt encoder + projection head; latent_head: freeze backbone and train a separate head")
     p.add_argument("--head_feature", type=str, default="h+s",
                    choices=["encoder_e", "h", "s", "h+s"],
                    help="Frozen latent feature used when --train_target latent_head")
     p.add_argument("--head_dim", type=int, default=128)
     p.add_argument("--head_hidden", type=int, default=256)
     p.add_argument("--head_lr", type=float, default=3e-4)
-    p.add_argument("--head_var_lambda", type=float, default=0.05)
+    p.add_argument("--replay_close_steps", type=int, default=4)
+    p.add_argument("--replay_far_steps", type=int, default=20)
     return p.parse_args()
 
 
@@ -1509,7 +1615,8 @@ def main():
         head_dim=args.head_dim,
         head_hidden=args.head_hidden,
         head_lr=args.head_lr,
-        head_var_lambda=args.head_var_lambda,
+        replay_close_steps=args.replay_close_steps,
+        replay_far_steps=args.replay_far_steps,
     )
 
     if args.quick:
@@ -1520,8 +1627,8 @@ def main():
         cfg.pos_probe_epochs = 100
         cfg_train.collect_episodes = 20
 
-    # Append mode to output dir
-    cfg.output_dir = os.path.join(args.output_dir, cfg.mode)
+    # Append mode + target to output dir
+    cfg.output_dir = os.path.join(args.output_dir, f"{cfg.mode}_{cfg.train_target}")
 
     print(f"Device: {device}")
     print(f"Mode: {cfg.mode}")
