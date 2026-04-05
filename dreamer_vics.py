@@ -95,10 +95,10 @@ def vicreg_loss(
     cov_weight: float = 1.0,
     target_std: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """VICReg loss on encoder embeddings.
+    """VICReg loss on latent states.
 
-    z:     [B, D] — anchor embeddings (e.g. e_t)
-    z_pos: [B, D] — positive embeddings (e.g. e_{t+1} from same episode)
+    z:     [B, D] — anchor latents (e.g. z_t = [h_t, s_t])
+    z_pos: [B, D] — positive latents (e.g. z_{t+1} from same episode)
 
     Returns (total_loss, {component scalars for logging}).
 
@@ -200,6 +200,11 @@ def straightness_loss(
     return l_straight_norm, info
 
 
+def rssm_latent(h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """Concatenate deterministic and stochastic Dreamer state into one latent."""
+    return torch.cat([h, s], dim=-1)
+
+
 def latent_coverage_bonus(
     z_current: torch.Tensor,
     z_memory: torch.Tensor,
@@ -230,37 +235,34 @@ def latent_coverage_bonus(
 
 
 @torch.no_grad()
-def compute_encoder_diagnostics(
-    encoder: ConvEncoder,
-    obs_tensor: torch.Tensor,
-    device: torch.device,
+def compute_latent_diagnostics(
+    z: torch.Tensor,
+    prefix: str = "latent",
     max_samples: int = 2048,
 ) -> dict[str, float]:
-    """Compute latent space health metrics from a batch of observations."""
-    encoder.eval()
-    N = obs_tensor.shape[0]
+    """Compute latent space health metrics from precomputed embeddings."""
+    N = z.shape[0]
     idx = np.random.choice(N, size=min(max_samples, N), replace=False)
-    e = encoder(obs_tensor[idx])
+    z = z[idx]
 
     # Pairwise L2 distances
-    dm = torch.cdist(e, e)
+    dm = torch.cdist(z, z)
     triu_mask = torch.triu(torch.ones_like(dm, dtype=torch.bool), diagonal=1)
     dists = dm[triu_mask]
 
     # Per-dimension statistics
-    per_dim_std = e.std(dim=0)
-    per_dim_mean = e.mean(dim=0)
+    per_dim_std = z.std(dim=0)
 
     # Covariance off-diagonal magnitude
-    e_c = e - e.mean(dim=0)
-    cov = (e_c.T @ e_c) / max(e.shape[0] - 1, 1)
+    z_c = z - z.mean(dim=0)
+    cov = (z_c.T @ z_c) / max(z.shape[0] - 1, 1)
     diag = cov.diagonal()
     off_diag_sq = cov.pow(2).sum() - diag.pow(2).sum()
     off_diag_norm = (off_diag_sq / max(cov.shape[0] ** 2 - cov.shape[0], 1)).sqrt()
 
     # Effective rank approximation via singular values
     try:
-        s = torch.linalg.svdvals(e_c)
+        s = torch.linalg.svdvals(z_c)
         s_norm = s / s.sum().clamp(min=1e-8)
         entropy = -(s_norm * torch.log(s_norm + 1e-10)).sum()
         eff_rank = torch.exp(entropy)
@@ -268,23 +270,24 @@ def compute_encoder_diagnostics(
         eff_rank = torch.tensor(0.0)
 
     return {
-        "encoder/mean_pairwise_dist": float(dists.mean().item()),
-        "encoder/std_pairwise_dist": float(dists.std().item()),
-        "encoder/min_pairwise_dist": float(dists.min().item()),
-        "encoder/median_pairwise_dist": float(dists.median().item()),
-        "encoder/mean_per_dim_std": float(per_dim_std.mean().item()),
-        "encoder/min_per_dim_std": float(per_dim_std.min().item()),
-        "encoder/max_per_dim_std": float(per_dim_std.max().item()),
-        "encoder/num_dead_dims": float((per_dim_std < 0.01).sum().item()),
-        "encoder/off_diag_cov": float(off_diag_norm.item()),
-        "encoder/effective_rank": float(eff_rank.item()),
-        "encoder/mean_norm": float(e.norm(dim=-1).mean().item()),
+        f"{prefix}/mean_pairwise_dist": float(dists.mean().item()),
+        f"{prefix}/std_pairwise_dist": float(dists.std().item()),
+        f"{prefix}/min_pairwise_dist": float(dists.min().item()),
+        f"{prefix}/median_pairwise_dist": float(dists.median().item()),
+        f"{prefix}/mean_per_dim_std": float(per_dim_std.mean().item()),
+        f"{prefix}/min_per_dim_std": float(per_dim_std.min().item()),
+        f"{prefix}/max_per_dim_std": float(per_dim_std.max().item()),
+        f"{prefix}/num_dead_dims": float((per_dim_std < 0.01).sum().item()),
+        f"{prefix}/off_diag_cov": float(off_diag_norm.item()),
+        f"{prefix}/effective_rank": float(eff_rank.item()),
+        f"{prefix}/mean_norm": float(z.norm(dim=-1).mean().item()),
     }
 
 
 @torch.no_grad()
-def compute_geodesic_correlation(
+def compute_hs_geodesic_correlation(
     encoder: ConvEncoder,
+    rssm: RSSM,
     obs_buffer,
     pos_buffer: np.ndarray,
     geodesic,
@@ -292,13 +295,13 @@ def compute_geodesic_correlation(
     bit_depth: int,
     n_pairs: int = 2000,
 ) -> dict[str, float]:
-    """Spearman correlation: encoder L2 distance vs geodesic distance."""
+    """Spearman correlation: Dreamer h+s latent distance vs geodesic distance."""
     from scipy.stats import spearmanr
 
-    encoder.eval()
+    encoder.eval(); rssm.eval()
     N = len(pos_buffer)
     if N < 20:
-        return {"geo/spearman_enc": 0.0, "geo/n_pairs": 0}
+        return {"geo_hs/spearman": 0.0, "geo_hs/n_pairs": 0}
 
     rng = np.random.default_rng(42)
     n_pairs = min(n_pairs, N * (N - 1) // 2)
@@ -307,9 +310,9 @@ def compute_geodesic_correlation(
     valid = ii != jj
     ii, jj = ii[valid], jj[valid]
 
-    # Encode observations
+    # Encode observations into Dreamer state latents z=[h,s]
     def encode_batch(indices):
-        embs = []
+        latents = []
         for start in range(0, len(indices), 256):
             end = min(start + 256, len(indices))
             batch_idx = indices[start:end]
@@ -317,12 +320,15 @@ def compute_geodesic_correlation(
                 obs_buffer[batch_idx], dtype=torch.float32, device=device
             ).permute(0, 3, 1, 2)
             preprocess_img(obs_batch, depth=bit_depth)
-            embs.append(encoder(obs_batch).cpu().numpy())
-        return np.concatenate(embs, axis=0)
+            e_batch = encoder(obs_batch)
+            h_batch, s_batch = rssm.get_init_state(e_batch)
+            z_batch = rssm_latent(h_batch, s_batch)
+            latents.append(z_batch.cpu().numpy())
+        return np.concatenate(latents, axis=0)
 
-    e_i = encode_batch(ii)
-    e_j = encode_batch(jj)
-    d_enc = np.linalg.norm(e_i - e_j, axis=-1)
+    z_i = encode_batch(ii)
+    z_j = encode_batch(jj)
+    d_hs = np.linalg.norm(z_i - z_j, axis=-1)
 
     cell_i = _positions_to_cell_indices(geodesic, pos_buffer[ii])
     cell_j = _positions_to_cell_indices(geodesic, pos_buffer[jj])
@@ -331,19 +337,19 @@ def compute_geodesic_correlation(
         for ci, cj in zip(cell_i, cell_j)
     ], dtype=np.float32)
 
-    finite = np.isfinite(d_geo) & (d_geo > 0) & np.isfinite(d_enc) & (d_enc > 0)
+    finite = np.isfinite(d_geo) & (d_geo > 0) & np.isfinite(d_hs) & (d_hs > 0)
     if finite.sum() < 10:
-        return {"geo/spearman_enc": 0.0, "geo/n_pairs": 0}
+        return {"geo_hs/spearman": 0.0, "geo_hs/n_pairs": 0}
 
-    rho = spearmanr(d_enc[finite], d_geo[finite]).correlation
+    rho = spearmanr(d_hs[finite], d_geo[finite]).correlation
     if rho is None or not np.isfinite(rho):
         rho = 0.0
 
     return {
-        "geo/spearman_enc": float(rho),
-        "geo/n_pairs": int(finite.sum()),
-        "geo/mean_enc_dist": float(np.mean(d_enc[finite])),
-        "geo/mean_geo_dist": float(np.mean(d_geo[finite])),
+        "geo_hs/spearman": float(rho),
+        "geo_hs/n_pairs": int(finite.sum()),
+        "geo_hs/mean_latent_dist": float(np.mean(d_hs[finite])),
+        "geo_hs/mean_geo_dist": float(np.mean(d_geo[finite])),
     }
 
 
@@ -534,7 +540,7 @@ def build_parser():
 
     # Diagnostics
     p.add_argument("--diag_interval", type=int, default=40,
-                   help="Run encoder diagnostics every N training episodes")
+                   help="Run h+s latent diagnostics every N training episodes")
     p.add_argument("--geo_corr_interval", type=int, default=80,
                    help="Run geodesic correlation eval every N episodes (expensive)")
 
@@ -779,23 +785,24 @@ def main(args):
 
                     model_loss = rec_loss + args.kl_weight * kld + rew_loss + cont_loss
 
-                    # ---- VICReg loss ----
+                    # ---- VICReg loss on Dreamer state z=[h,s] ----
                     l_vicreg = torch.tensor(0.0, device=device)
                     if use_vicreg:
-                        # Temporal pairs: e_t and e_{t+1}
-                        e_anchor = e_t[:, :-1].reshape(-1, e_t.shape[-1])
-                        e_positive = e_t[:, 1:].reshape(-1, e_t.shape[-1])
+                        z_seq = rssm_latent(h_seq, s_seq)
+                        z_anchor = z_seq[:, :-1].reshape(-1, z_seq.shape[-1])
+                        z_positive = z_seq[:, 1:].reshape(-1, z_seq.shape[-1])
                         # Subsample to keep cost bounded
-                        n_vic = min(512, e_anchor.shape[0])
-                        vic_idx = torch.randperm(e_anchor.shape[0], device=device)[:n_vic]
+                        n_vic = min(512, z_anchor.shape[0])
+                        vic_idx = torch.randperm(z_anchor.shape[0], device=device)[:n_vic]
                         l_vicreg, vic_info = vicreg_loss(
-                            e_anchor[vic_idx], e_positive[vic_idx],
+                            z_anchor[vic_idx], z_positive[vic_idx],
                             var_weight=args.vicreg_var_w,
                             inv_weight=args.vicreg_inv_w,
                             cov_weight=args.vicreg_cov_w,
                             target_std=args.vicreg_target_std,
                         )
                         model_loss = model_loss + args.vicreg_weight * l_vicreg
+                        vic_info = {k.replace("vicreg/", "vicreg_hs/"): v for k, v in vic_info.items()}
                         for k, v in vic_info.items():
                             vicreg_info_accum[k] = vicreg_info_accum.get(k, 0.0) + v
 
@@ -856,20 +863,20 @@ def main(args):
                     # ---- Coverage intrinsic reward ----
                     if use_coverage:
                         with torch.no_grad():
-                            # Encode imagined states for coverage bonus
-                            e_imag_flat = torch.cat([h_imag[:, 1:].reshape(-1, Dh),
-                                                      s_imag[:, 1:].reshape(-1, Ds)], dim=-1)
+                            # Dreamer state latents for coverage bonus
+                            z_imag_flat = rssm_latent(h_imag[:, 1:].reshape(-1, Dh),
+                                                      s_imag[:, 1:].reshape(-1, Ds))
                             if coverage_memory is None:
-                                coverage_memory = e_imag_flat[:args.coverage_memory_size].clone()
-                                coverage_ptr = min(len(e_imag_flat), args.coverage_memory_size)
+                                coverage_memory = z_imag_flat[:args.coverage_memory_size].clone()
+                                coverage_ptr = min(len(z_imag_flat), args.coverage_memory_size)
                             cov_bonus = latent_coverage_bonus(
-                                e_imag_flat, coverage_memory, k=args.coverage_knn_k
+                                z_imag_flat, coverage_memory, k=args.coverage_knn_k
                             ).reshape(rewards_imag.shape)
                             # Normalize to comparable scale with extrinsic reward
                             cov_bonus = cov_bonus / (cov_bonus.std().clamp(min=1e-4))
                             # Update memory with recent states
-                            n_new = min(len(e_imag_flat), args.coverage_memory_size)
-                            new_states = e_imag_flat[:n_new]
+                            n_new = min(len(z_imag_flat), args.coverage_memory_size)
+                            new_states = z_imag_flat[:n_new]
                             for i in range(n_new):
                                 coverage_memory[coverage_ptr % args.coverage_memory_size] = new_states[i]
                                 coverage_ptr += 1
@@ -955,32 +962,35 @@ def main(args):
         print(f"  Ep {episode+1}/{args.max_episodes}  ret={ep_ret:.2f}  steps={ep_steps}  "
               f"cells={len(ep_cells)}  total={total_steps}  episode_success={ep_success}")
 
-        # ---- Encoder diagnostics ----
+        # ---- h+s latent diagnostics ----
         if args.diag_interval > 0 and (episode + 1) % args.diag_interval == 0:
             # Grab a batch of recent observations for diagnostics
             if replay.size > 256:
                 diag_batch = replay.sample_sequences(min(64, args.batch_size), 1)
                 diag_obs = torch.tensor(diag_batch.obs[:, 0], dtype=torch.float32, device=device).permute(0, 3, 1, 2)
                 preprocess_img(diag_obs, depth=args.bit_depth)
-                diags = compute_encoder_diagnostics(encoder, diag_obs, device)
+                diag_e = encoder(diag_obs)
+                diag_h, diag_s = rssm.get_init_state(diag_e)
+                diag_z = rssm_latent(diag_h, diag_s)
+                diags = compute_latent_diagnostics(diag_z, prefix="latent_hs")
                 for k, v in diags.items():
                     writer.add_scalar(k, v, total_steps)
-                print(f"    [diag] mean_d={diags['encoder/mean_pairwise_dist']:.4f}  "
-                      f"eff_rank={diags['encoder/effective_rank']:.1f}  "
-                      f"mean_std={diags['encoder/mean_per_dim_std']:.4f}  "
-                      f"dead_dims={diags['encoder/num_dead_dims']:.0f}")
+                print(f"    [diag h+s] mean_d={diags['latent_hs/mean_pairwise_dist']:.4f}  "
+                      f"eff_rank={diags['latent_hs/effective_rank']:.1f}  "
+                      f"mean_std={diags['latent_hs/mean_per_dim_std']:.4f}  "
+                      f"dead_dims={diags['latent_hs/num_dead_dims']:.0f}")
 
-        # ---- Geodesic correlation ----
+        # ---- Geodesic correlation in h+s latent ----
         if args.geo_corr_interval > 0 and (episode + 1) % args.geo_corr_interval == 0:
             if len(obs_geo_buffer) >= 100:
                 obs_arr = np.stack(obs_geo_buffer, axis=0)
                 pos_arr = np.stack(pos_geo_buffer, axis=0)
-                geo_corr = compute_geodesic_correlation(
-                    encoder, obs_arr, pos_arr, geodesic, device, args.bit_depth, n_pairs=2000)
+                geo_corr = compute_hs_geodesic_correlation(
+                    encoder, rssm, obs_arr, pos_arr, geodesic, device, args.bit_depth, n_pairs=2000)
                 for k, v in geo_corr.items():
                     writer.add_scalar(k, v, total_steps)
-                print(f"    [geo] ρ_enc={geo_corr['geo/spearman_enc']:.4f}  "
-                      f"mean_d_enc={geo_corr.get('geo/mean_enc_dist', 0):.4f}")
+                print(f"    [geo h+s] ρ={geo_corr['geo_hs/spearman']:.4f}  "
+                      f"mean_d={geo_corr.get('geo_hs/mean_latent_dist', 0):.4f}")
 
         # ---- Periodic eval ----
         if args.eval_interval > 0 and (episode + 1) % args.eval_interval == 0:
