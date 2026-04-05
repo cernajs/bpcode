@@ -108,15 +108,46 @@ def _spearman_rho_numpy(x: np.ndarray, y: np.ndarray) -> float:
     return float(rho)
 
 
-def _adj_from_distmat(dist_matrix: np.ndarray) -> List[List[int]]:
+def _adj_from_distmat(dist_matrix: np.ndarray, local_max: float | None = None) -> List[List[int]]:
+    """Build adjacency from a distance matrix.
+
+    When ``local_max`` is provided, only distances <= ``local_max`` become
+    edges.  This is crucial for room discovery: using all finite geodesic
+    distances collapses the oracle graph into a clique.
+    """
     n = dist_matrix.shape[0]
     adj = [[] for _ in range(n)]
     finite = np.isfinite(dist_matrix)
     for i in range(n):
         for j in range(i + 1, n):
-            if finite[i, j] and dist_matrix[i, j] > 0:
-                adj[i].append(j)
-                adj[j].append(i)
+            if not finite[i, j]:
+                continue
+            dij = float(dist_matrix[i, j])
+            if dij <= 0:
+                continue
+            if local_max is not None and dij > local_max:
+                continue
+            adj[i].append(j)
+            adj[j].append(i)
+    return adj
+
+
+def _oracle_local_adj(geodesic, include_diagonals: bool = True) -> List[List[int]]:
+    """Immediate free-space neighbours for oracle room decomposition."""
+    if include_diagonals:
+        dirs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    else:
+        dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    n = geodesic.n_free
+    adj = [[] for _ in range(n)]
+    for i, (r, c) in enumerate(geodesic.idx_to_cell):
+        neigh = []
+        for dr, dc in dirs:
+            j = geodesic.cell_to_idx.get((r + dr, c + dc))
+            if j is not None:
+                neigh.append(int(j))
+        adj[i] = sorted(set(neigh))
     return adj
 
 
@@ -418,47 +449,69 @@ def build_replay_graph_teacher(features: np.ndarray, episode_ids: np.ndarray, cf
     t_sel = t_all[idx_global].astype(np.int64)
     M = len(idx_global)
 
-    # Full pairwise distances on selected nodes.
     dm = np.linalg.norm(X[:, None, :] - X[None, :, :], axis=-1).astype(np.float32)
     np.fill_diagonal(dm, np.inf)
 
-    # Weighted undirected graph.
     adj = lil_matrix((M, M), dtype=np.float32)
 
-    # Temporal edges with actual time gaps after subsampling.
+    # (1) Denser temporal backbone: connect a short forward window inside each
+    # subsampled episode.  This preserves replay geometry but avoids a fragile
+    # single chain with almost no branching.
+    temporal_window = 3
+    temporal_dts = []
     temporal_feat_d = []
-    for i in range(M - 1):
-        if ep_sel[i] == ep_sel[i + 1]:
-            dt = float(max(1, int(t_sel[i + 1] - t_sel[i])))
-            adj[i, i + 1] = dt
-            adj[i + 1, i] = dt
-            temporal_feat_d.append(float(dm[i, i + 1]))
+    for i in range(M):
+        for step_ahead in range(1, temporal_window + 1):
+            j = i + step_ahead
+            if j >= M or ep_sel[i] != ep_sel[j]:
+                break
+            dt = float(max(1, int(t_sel[j] - t_sel[i])))
+            if dt <= 0:
+                continue
+            if adj[i, j] == 0 or dt < float(adj[i, j]):
+                adj[i, j] = dt
+                adj[j, i] = dt
+            temporal_dts.append(dt)
+            temporal_feat_d.append(float(dm[i, j]))
 
     if temporal_feat_d:
-        local_scale = float(np.median(temporal_feat_d))
-        radius = float(np.quantile(np.asarray(temporal_feat_d), 0.90) * cfg.replay_knn_radius_mult)
+        temporal_feat_d_np = np.asarray(temporal_feat_d, dtype=np.float32)
+        local_scale = float(np.median(temporal_feat_d_np))
+        radius = float(np.quantile(temporal_feat_d_np, 0.90) * cfg.replay_knn_radius_mult)
     else:
-        finite = dm[np.isfinite(dm)]
-        local_scale = float(np.median(finite)) if finite.size else 1.0
-        radius = float(np.quantile(finite, 0.10)) if finite.size else 1.0
+        finite0 = dm[np.isfinite(dm)]
+        local_scale = float(np.median(finite0)) if finite0.size else 1.0
+        radius = float(np.quantile(finite0, 0.10)) if finite0.size else 1.0
     local_scale = max(local_scale, 1e-6)
     radius = max(radius, 1e-6)
 
-    # Conservative cross-episode mutual kNN edges only.
-    k = min(cfg.knn_k, M - 1)
-    if k >= 1:
-        knn = np.argsort(dm, axis=1)[:, :k]
+    if temporal_dts:
+        same_episode_min_gap = float(max(4.0, np.median(np.asarray(temporal_dts)) * 1.5))
+    else:
+        same_episode_min_gap = 4.0
+
+    # (2) Conservative latent shortcut edges.
+    #  - cross-episode: reciprocal kNN within radius
+    #  - same-episode: only long-gap revisit-like edges, and stricter radius
+    k_use = min(max(4, cfg.knn_k), M - 1)
+    if k_use >= 1:
+        knn = np.argsort(dm, axis=1)[:, :k_use]
         for i in range(M):
             for j in knn[i]:
                 j = int(j)
-                if ep_sel[i] == ep_sel[j]:
-                    continue
-                # mutual kNN
-                if i not in knn[j]:
+                if i == j:
                     continue
                 d = float(dm[i, j])
-                if d > radius:
+                if not np.isfinite(d) or d > radius:
                     continue
+                if ep_sel[i] == ep_sel[j]:
+                    if abs(int(t_sel[i]) - int(t_sel[j])) < same_episode_min_gap:
+                        continue
+                    if d > 0.85 * radius:
+                        continue
+                else:
+                    if i not in knn[j]:
+                        continue
                 w = max(1.0, d / local_scale)
                 if adj[i, j] == 0 or w < float(adj[i, j]):
                     adj[i, j] = w
@@ -470,23 +523,20 @@ def build_replay_graph_teacher(features: np.ndarray, episode_ids: np.ndarray, cf
         close_thr = 1.0
         far_thr = 2.0
     else:
-        close_thr = float(np.quantile(finite, cfg.replay_close_quantile))
-        far_thr = float(np.quantile(finite, cfg.replay_far_quantile))
+        # Broader quantiles than before so the sampler has many more usable
+        # positives and negatives.
+        close_thr = float(np.quantile(finite, 0.15))
+        far_thr = float(np.quantile(finite, 0.85))
         if far_thr <= close_thr:
             far_thr = close_thr + 1.0
 
-    n_temporal = int((adj.count_nonzero() // 2))
-    print(f"    Replay-graph nodes={M}  edges={n_temporal}  local_scale={local_scale:.4f}  radius={radius:.4f}")
+    n_edges = int(adj.count_nonzero() // 2)
+    print(f"    Replay-graph nodes={M}  edges={n_edges}  local_scale={local_scale:.4f}  radius={radius:.4f}")
     if finite.size:
         print(f"    Replay shortest-path stats: min={finite.min():.2f}  median={np.median(finite):.2f}  max={finite.max():.2f}")
-        print(f"    Replay thresholds: close≤{close_thr:.2f}  far≥{far_thr:.2f}")
+        print(f"    Replay thresholds: close≤{close_thr:.2f}  far≥{far_thr:.2f}  same_ep_gap≥{same_episode_min_gap:.1f}")
 
     return idx_global, dist, close_thr, far_thr
-
-
-# =====================================================================
-# Triplet sampling
-# =====================================================================
 
 
 def _empty_triplets():
@@ -631,10 +681,12 @@ def evaluate_room_discovery(emb: np.ndarray, pos: np.ndarray, geodesic, knn_k: i
     valid = counts > 0
     if valid.sum() < 4:
         return {"n_rooms_latent": 0, "n_rooms_oracle": 0, "pair_agreement": 0.0}
+
     idx_cells = np.where(valid)[0]
     Fv = cell_feats[idx_cells] / counts[idx_cells, None]
     n_cells = len(idx_cells)
-    k = min(knn_k, n_cells - 1)
+
+    k = min(max(3, knn_k), n_cells - 1)
     dm = np.linalg.norm(Fv[:, None, :] - Fv[None, :, :], axis=-1)
     np.fill_diagonal(dm, np.inf)
     knn = np.argsort(dm, axis=1)[:, :k]
@@ -650,12 +702,16 @@ def evaluate_room_discovery(emb: np.ndarray, pos: np.ndarray, geodesic, knn_k: i
                 adj_lat[j].append(i)
     bridges_lat = _find_bridges(adj_lat)
     comp_lat, n_rooms_lat = _components_without_bridges(adj_lat, bridges_lat)
-    adj_oracle = _adj_from_distmat(geodesic.dist_matrix)
+
+    # Oracle rooms from *local* maze adjacency only.
+    adj_oracle = _oracle_local_adj(geodesic, include_diagonals=True)
     bridges_oracle = _find_bridges(adj_oracle)
     comp_oracle, n_rooms_oracle = _components_without_bridges(adj_oracle, bridges_oracle)
+
     comp_lat_full = np.full(n_free, -1, dtype=np.int64)
     for loc, cg in enumerate(idx_cells):
         comp_lat_full[int(cg)] = comp_lat[loc]
+
     agree = 0
     total = 0
     for i in range(len(idx_cells)):
@@ -807,8 +863,9 @@ def run(cfg: Cfg):
     else:
         raise ValueError(f"Unknown mode: {cfg.mode}")
 
-    test_trip = sample_fn(rng, max(100, cfg.batch_triplets // 2))
-    print(f"    Test triplets available: {len(test_trip[0])}")
+    test_trip_target = max(1024, cfg.batch_triplets * 4)
+    test_trip = sample_fn(rng, test_trip_target)
+    print(f"    Test triplets available: {len(test_trip[0])}/{test_trip_target}")
 
     print("\n  [3] Auxiliary latent-head mode ...")
     print(f"    Frozen backbone; training separate head on feature: {cfg.head_feature}")
