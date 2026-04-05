@@ -20,6 +20,69 @@ from utils import ReplayBuffer, bottle, get_device, no_param_grads, preprocess_i
 
 
 # =====================================================================
+# Env: Dreamer-style reset (fixed / subset spawn), not uniform random start
+# =====================================================================
+
+
+class PointMazeLargeDreamerWrapper(PointMazeLargeDiverseGRWrapper):
+    """Large maze with controllable spawn. Default: fixed start cell, random goal elsewhere.
+
+    The base ``PointMazeLargeDiverseGRWrapper`` randomizes both start and goal every episode
+    for coverage; that is closer to an exploration analysis setup than a typical Dreamer run.
+    """
+
+    def __init__(
+        self,
+        img_size: int = 64,
+        *,
+        reset_mode: str = "fixed_start",
+        fixed_start_cell: tuple[int, int] | None = None,
+        start_cells: list[tuple[int, int]] | None = None,
+    ):
+        super().__init__(img_size=img_size)
+        self.reset_mode = str(reset_mode)
+        self.fixed_start_cell = fixed_start_cell
+        self.start_cells = list(start_cells) if start_cells else []
+
+        if self.reset_mode == "fixed_start" and self.fixed_start_cell is None:
+            self.fixed_start_cell = tuple(self._free_cells[0]) if self._free_cells else (1, 1)
+        if self.reset_mode == "start_subset" and not self.start_cells:
+            if self._free_cells:
+                self.start_cells = [tuple(self._free_cells[i]) for i in range(min(3, len(self._free_cells)))]
+            else:
+                self.start_cells = [(1, 1)]
+
+    def _sample_goal_cell(self, sr: int, sc: int) -> np.ndarray:
+        cells = self._free_cells
+        if not cells:
+            return np.array([sr, sc], dtype=np.int64)
+        candidates = [c for c in cells if c != (sr, sc)]
+        if not candidates:
+            return np.array([sr, sc], dtype=np.int64)
+        gr, gc = candidates[int(np.random.randint(0, len(candidates)))]
+        return np.array([gr, gc], dtype=np.int64)
+
+    def reset(self, **kwargs):
+        if self.reset_mode == "random":
+            return super().reset(**kwargs)
+        opts = dict(kwargs.get("options") or {})
+        if self.reset_mode == "fixed_start":
+            r, c = self.fixed_start_cell  # type: ignore[misc]
+        elif self.reset_mode == "start_subset":
+            r, c = self.start_cells[int(np.random.randint(0, len(self.start_cells)))]
+        else:
+            raise ValueError(f"Unknown reset_mode {self.reset_mode!r}")
+        opts["reset_cell"] = np.array([r, c], dtype=np.int64)
+        opts["goal_cell"] = self._sample_goal_cell(int(r), int(c))
+        kwargs = dict(kwargs)
+        kwargs["options"] = opts
+        obs_dict, info = self._env.reset(**kwargs)
+        self._update_agent_pos(obs_dict)
+        frame = self._resize_frame(self._env.render()).astype(np.uint8)
+        return frame, info
+
+
+# =====================================================================
 # Geometric losses
 # =====================================================================
 
@@ -423,6 +486,32 @@ def build_parser():
     p.add_argument("--expl_decay", type=float, default=0.0)
     p.add_argument("--expl_min", type=float, default=0.0)
     p.add_argument("--actor_entropy_scale", type=float, default=1e-3)
+    p.add_argument(
+        "--reset_mode",
+        type=str,
+        default="fixed_start",
+        choices=["fixed_start", "start_subset", "random"],
+        help="fixed_start / start_subset: fixed spawn + random goal (typical Dreamer); "
+        "random: uniform start+goal on all free cells (old behavior).",
+    )
+    p.add_argument(
+        "--fixed_start_row",
+        type=int,
+        default=-1,
+        help="With fixed_start: spawn row; -1 uses first free cell from geodesic.",
+    )
+    p.add_argument(
+        "--fixed_start_col",
+        type=int,
+        default=-1,
+        help="With fixed_start: spawn col; -1 uses first free cell from geodesic.",
+    )
+    p.add_argument(
+        "--start_subset",
+        type=str,
+        default="",
+        help="For start_subset: semicolon-separated row,col pairs, e.g. '1,1;5,3'. Empty = first 3 free cells.",
+    )
     p.add_argument("--eval_interval", type=int, default=20)
     p.add_argument("--eval_episodes", type=int, default=5)
 
@@ -476,9 +565,36 @@ def main(args):
     print(f"  Straightness: {use_straight} (weight={args.straight_weight})")
     print(f"  Coverage bonus: {use_coverage} (weight={args.coverage_weight})")
 
-    env = PointMazeLargeDiverseGRWrapper(img_size=args.img_size)
+    start_cells: list[tuple[int, int]] | None = None
+    if args.reset_mode == "start_subset" and args.start_subset.strip():
+        start_cells = []
+        for part in args.start_subset.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            r, c = part.split(",")
+            start_cells.append((int(r.strip()), int(c.strip())))
+
+    fixed_cell: tuple[int, int] | None = None
+    if args.reset_mode == "fixed_start":
+        if args.fixed_start_row >= 0 and args.fixed_start_col >= 0:
+            fixed_cell = (args.fixed_start_row, args.fixed_start_col)
+
+    env = PointMazeLargeDreamerWrapper(
+        img_size=args.img_size,
+        reset_mode=args.reset_mode,
+        fixed_start_cell=fixed_cell,
+        start_cells=start_cells,
+    )
     geodesic = env.geodesic
     print(f"  Maze: PointMaze_Large  grid={env.grid_h}x{env.grid_w}  free_cells={geodesic.n_free}")
+    print(f"  Reset: {args.reset_mode}", end="")
+    if args.reset_mode == "fixed_start":
+        print(f"  spawn={env.fixed_start_cell}  (random goal on other free cells)")
+    elif args.reset_mode == "start_subset":
+        print(f"  |start_subset|={len(env.start_cells)}")
+    else:
+        print("  (uniform random start+goal)")
 
     H, W, C = env.observation_space.shape
     act_dim = env.action_space.shape[0]
@@ -837,7 +953,7 @@ def main(args):
                               float(_bridge_crossing_count(geodesic, np.stack(ep_pos_traj))), episode)
 
         print(f"  Ep {episode+1}/{args.max_episodes}  ret={ep_ret:.2f}  steps={ep_steps}  "
-              f"cells={len(ep_cells)}  total={total_steps}  mode={args.geo_mode}")
+              f"cells={len(ep_cells)}  total={total_steps}  episode_success={ep_success}")
 
         # ---- Encoder diagnostics ----
         if args.diag_interval > 0 and (episode + 1) % args.diag_interval == 0:
