@@ -2478,7 +2478,7 @@ def parse_args():
     p.add_argument(
         "--seeds",
         type=str,
-        default="1,2",
+        default="0,1,2",
         help="Comma-separated seeds (default 3 seeds for mean±std)",
     )
     p.add_argument("--output_dir", default="pointmaze_large_gr_results")
