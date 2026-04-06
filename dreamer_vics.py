@@ -624,6 +624,8 @@ def build_parser():
                    help="InfoNCE temperature for k-step reachability")
     p.add_argument("--kstep_max_anchors", type=int, default=256,
                    help="Max anchor-positive pairs per batch for k-step reachability")
+    p.add_argument("--kstep_min_steps", type=int, default=50_000,
+                   help="For kstep/k_step: env steps before applying k-step loss (WM trains without it until then)")
 
     # Diagnostics
     p.add_argument("--diag_interval", type=int, default=40,
@@ -659,6 +661,8 @@ def main(args):
     print(f"  Straightness: {use_straight} (weight={args.straight_weight})")
     print(f"  Coverage bonus: {use_coverage} (weight={args.coverage_weight})")
     print(f"  K-step InfoNCE: {use_kstep} (weight={args.kstep_weight})")
+    if use_kstep:
+        print(f"  K-step starts after {args.kstep_min_steps} env steps (WM warmup without k-step loss)")
 
     start_cells: list[tuple[int, int]] | None = None
     if args.reset_mode == "start_subset" and args.start_subset.strip():
@@ -911,7 +915,7 @@ def main(args):
 
                     # ---- K-step reachability InfoNCE on Dreamer state z=[h,s] ----
                     l_kstep = torch.tensor(0.0, device=device)
-                    if use_kstep:
+                    if use_kstep and total_steps >= args.kstep_min_steps:
                         z_seq = rssm_latent(h_seq, s_seq)
                         l_kstep, kstep_info = kstep_reachability_nce_loss(
                             z_seq,
@@ -1034,6 +1038,12 @@ def main(args):
                 writer.add_scalar("loss/value", sum_value / n_ts, total_steps)
                 writer.add_scalar("imag/reward_mean", sum_imag_r / n_ts, total_steps)
                 writer.add_scalar("train/exploration_noise", expl_amount, total_steps)
+                if use_kstep:
+                    writer.add_scalar(
+                        "train/kstep_loss_enabled",
+                        1.0 if total_steps >= args.kstep_min_steps else 0.0,
+                        total_steps,
+                    )
 
                 if use_vicreg:
                     writer.add_scalar("loss/vicreg_total", sum_vicreg / n_ts, total_steps)
