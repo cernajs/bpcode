@@ -925,7 +925,10 @@ def main(args):
                             temperature=args.kstep_temperature,
                             max_anchors=args.kstep_max_anchors,
                         )
-                        model_loss = model_loss + args.kstep_weight * l_kstep
+                        # linear interpolate kstep_weight from 0 to args.kstep_weight from 50,000 to 60,000 steps
+                        kstep_weight = args.kstep_weight * ((total_steps - 50000) / 10_000) if total_steps < 60000 else args.kstep_weight
+
+                        model_loss = model_loss + kstep_weight * l_kstep
                         for k, v in kstep_info.items():
                             kstep_info_accum[k] = kstep_info_accum.get(k, 0.0) + v
 
