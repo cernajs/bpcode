@@ -200,6 +200,82 @@ def straightness_loss(
     return l_straight_norm, info
 
 
+
+
+def kstep_reachability_nce_loss(
+    z_seq: torch.Tensor,
+    done_seq: torch.Tensor | None = None,
+    *,
+    k_max: int = 5,
+    n_neg: int = 64,
+    temperature: float = 0.1,
+    max_anchors: int = 256,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """InfoNCE reachability loss on z=[h,s].
+
+    Anchors z_t are pulled toward a randomly sampled positive inside [t+1, t+k_max]
+    from the same sequence, and pushed away from random negatives from the full batch.
+    This is an auxiliary objective added to the Dreamer world-model loss.
+    """
+    B, T, D = z_seq.shape
+    if T < 2:
+        zero = z_seq.new_zeros(())
+        return zero, {"kstep/loss": 0.0, "kstep/n_pairs": 0.0, "kstep/pos_sim": 0.0, "kstep/neg_sim": 0.0}
+
+    z = F.normalize(z_seq, dim=-1)
+    flat = z.reshape(B * T, D)
+
+    pairs: list[tuple[int, int]] = []
+    max_anchors = max(1, int(max_anchors))
+    for b in range(B):
+        for t in range(T - 1):
+            max_delta = min(int(k_max), T - 1 - t)
+            if max_delta < 1:
+                continue
+            valid_deltas = []
+            for d in range(1, max_delta + 1):
+                if done_seq is not None:
+                    seg = done_seq[b, t : t + d]
+                    if torch.any(seg > 0.5):
+                        break
+                valid_deltas.append(d)
+            if not valid_deltas:
+                continue
+            d = valid_deltas[int(torch.randint(0, len(valid_deltas), (1,), device=z_seq.device).item())]
+            pairs.append((b * T + t, b * T + t + d))
+
+    if not pairs:
+        zero = z_seq.new_zeros(())
+        return zero, {"kstep/loss": 0.0, "kstep/n_pairs": 0.0, "kstep/pos_sim": 0.0, "kstep/neg_sim": 0.0}
+
+    if len(pairs) > max_anchors:
+        perm = torch.randperm(len(pairs), device=z_seq.device)[:max_anchors].tolist()
+        pairs = [pairs[i] for i in perm]
+
+    anchor_idx = torch.tensor([p[0] for p in pairs], dtype=torch.long, device=z_seq.device)
+    pos_idx = torch.tensor([p[1] for p in pairs], dtype=torch.long, device=z_seq.device)
+
+    anchors = flat[anchor_idx]
+    positives = flat[pos_idx]
+
+    n_neg = max(1, int(n_neg))
+    neg_idx = torch.randint(0, flat.size(0), (anchors.size(0), n_neg), device=z_seq.device)
+    negatives = flat[neg_idx]
+
+    pos_logits = torch.sum(anchors * positives, dim=-1, keepdim=True) / max(float(temperature), 1e-6)
+    neg_logits = torch.einsum("bd,bnd->bn", anchors, negatives) / max(float(temperature), 1e-6)
+    logits = torch.cat([pos_logits, neg_logits], dim=1)
+    targets = torch.zeros(anchors.size(0), dtype=torch.long, device=z_seq.device)
+    loss = F.cross_entropy(logits, targets)
+
+    info = {
+        "kstep/loss": float(loss.item()),
+        "kstep/n_pairs": float(anchors.size(0)),
+        "kstep/pos_sim": float(torch.sum(anchors * positives, dim=-1).mean().item()),
+        "kstep/neg_sim": float(torch.einsum("bd,bnd->bn", anchors, negatives).mean().item()),
+    }
+    return loss, info
+
 def rssm_latent(h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """Concatenate deterministic and stochastic Dreamer state into one latent."""
     return torch.cat([h, s], dim=-1)
@@ -523,8 +599,8 @@ def build_parser():
 
     # Geometric regularization
     p.add_argument("--geo_mode", type=str, default="baseline",
-                   choices=["baseline", "vicreg", "straight", "georeg", "georeg_cov"],
-                   help="baseline | vicreg | straight | georeg (both) | georeg_cov (both + coverage)")
+                   choices=["baseline", "vicreg", "straight", "georeg", "georeg_cov", "kstep"],
+                   help="baseline | vicreg | straight | georeg (both) | georeg_cov (both + coverage) | kstep (InfoNCE reachability)")
     p.add_argument("--vicreg_weight", type=float, default=0.1,
                    help="Weight of VICReg loss added to world model loss")
     p.add_argument("--vicreg_var_w", type=float, default=25.0)
@@ -537,6 +613,17 @@ def build_parser():
                    help="Weight of latent coverage intrinsic reward")
     p.add_argument("--coverage_memory_size", type=int, default=4096)
     p.add_argument("--coverage_knn_k", type=int, default=5)
+
+    p.add_argument("--kstep_weight", type=float, default=0.1,
+                   help="Weight of k-step InfoNCE reachability loss")
+    p.add_argument("--kstep_max_k", type=int, default=5,
+                   help="Positive window size for k-step reachability")
+    p.add_argument("--kstep_negatives", type=int, default=64,
+                   help="Number of negatives per anchor for k-step reachability")
+    p.add_argument("--kstep_temperature", type=float, default=0.1,
+                   help="InfoNCE temperature for k-step reachability")
+    p.add_argument("--kstep_max_anchors", type=int, default=256,
+                   help="Max anchor-positive pairs per batch for k-step reachability")
 
     # Diagnostics
     p.add_argument("--diag_interval", type=int, default=40,
@@ -564,12 +651,14 @@ def main(args):
     use_vicreg = args.geo_mode in ("vicreg", "georeg", "georeg_cov")
     use_straight = args.geo_mode in ("straight", "georeg", "georeg_cov")
     use_coverage = args.geo_mode == "georeg_cov"
+    use_kstep = args.geo_mode == "kstep"
 
     print(f"Device: {device}")
     print(f"Geo mode: {args.geo_mode}")
     print(f"  VICReg: {use_vicreg} (weight={args.vicreg_weight})")
     print(f"  Straightness: {use_straight} (weight={args.straight_weight})")
     print(f"  Coverage bonus: {use_coverage} (weight={args.coverage_weight})")
+    print(f"  K-step InfoNCE: {use_kstep} (weight={args.kstep_weight})")
 
     start_cells: list[tuple[int, int]] | None = None
     if args.reset_mode == "start_subset" and args.start_subset.strip():
@@ -734,9 +823,10 @@ def main(args):
 
                 sum_rec = sum_kld = sum_rew = sum_cont = sum_model = 0.0
                 sum_actor = sum_value = sum_imag_r = 0.0
-                sum_vicreg = sum_straight = sum_coverage = 0.0
+                sum_vicreg = sum_straight = sum_coverage = sum_kstep = 0.0
                 vicreg_info_accum: dict[str, float] = {}
                 straight_info_accum: dict[str, float] = {}
+                kstep_info_accum: dict[str, float] = {}
 
                 for _ in range(args.train_steps):
                     batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
@@ -819,6 +909,22 @@ def main(args):
                         for k, v in str_info.items():
                             straight_info_accum[k] = straight_info_accum.get(k, 0.0) + v
 
+                    # ---- K-step reachability InfoNCE on Dreamer state z=[h,s] ----
+                    l_kstep = torch.tensor(0.0, device=device)
+                    if use_kstep:
+                        z_seq = rssm_latent(h_seq, s_seq)
+                        l_kstep, kstep_info = kstep_reachability_nce_loss(
+                            z_seq,
+                            done_seq=done_seq[:, :T],
+                            k_max=args.kstep_max_k,
+                            n_neg=args.kstep_negatives,
+                            temperature=args.kstep_temperature,
+                            max_anchors=args.kstep_max_anchors,
+                        )
+                        model_loss = model_loss + args.kstep_weight * l_kstep
+                        for k, v in kstep_info.items():
+                            kstep_info_accum[k] = kstep_info_accum.get(k, 0.0) + v
+
                     model_opt.zero_grad(set_to_none=True)
                     model_loss.backward()
                     torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip)
@@ -831,6 +937,7 @@ def main(args):
                     sum_model += float(model_loss.item())
                     sum_vicreg += float(l_vicreg.item())
                     sum_straight += float(l_straight.item())
+                    sum_kstep += float(l_kstep.item())
 
                     # ---- Actor-critic (imagination) ----
                     B_seq, T_seq, Dh = h_seq.shape
@@ -937,6 +1044,11 @@ def main(args):
                     writer.add_scalar("loss/straight_total", sum_straight / n_ts, total_steps)
                     writer.add_scalar("loss/straight_weighted", args.straight_weight * sum_straight / n_ts, total_steps)
                     for k, v in straight_info_accum.items():
+                        writer.add_scalar(f"loss/{k}", v / n_ts, total_steps)
+                if use_kstep:
+                    writer.add_scalar("loss/kstep_total", sum_kstep / n_ts, total_steps)
+                    writer.add_scalar("loss/kstep_weighted", args.kstep_weight * sum_kstep / n_ts, total_steps)
+                    for k, v in kstep_info_accum.items():
                         writer.add_scalar(f"loss/{k}", v / n_ts, total_steps)
                 if use_coverage:
                     writer.add_scalar("loss/coverage_bonus_mean", sum_coverage / n_ts, total_steps)
