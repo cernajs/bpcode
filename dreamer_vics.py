@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections import Counter, defaultdict, deque
 
 import numpy as np
 import torch
@@ -12,9 +13,12 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
 from torch.utils.tensorboard import SummaryWriter
+from scipy.sparse import lil_matrix
+from scipy.sparse.csgraph import shortest_path
 
 from maze_geometry_test import _positions_to_cell_indices
 from models import RSSM, Actor, ContinueModel, ConvDecoder, ConvEncoder, RewardModel, ValueModel
+from geom_head import GeoEncoder, temporal_reachability_loss
 from pointmaze_large_topo_v2 import PointMazeLargeDiverseGRWrapper
 from utils import ReplayBuffer, bottle, get_device, no_param_grads, preprocess_img, set_seed
 
@@ -200,82 +204,6 @@ def straightness_loss(
     return l_straight_norm, info
 
 
-
-
-def kstep_reachability_nce_loss(
-    z_seq: torch.Tensor,
-    done_seq: torch.Tensor | None = None,
-    *,
-    k_max: int = 5,
-    n_neg: int = 64,
-    temperature: float = 0.1,
-    max_anchors: int = 256,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """InfoNCE reachability loss on z=[h,s].
-
-    Anchors z_t are pulled toward a randomly sampled positive inside [t+1, t+k_max]
-    from the same sequence, and pushed away from random negatives from the full batch.
-    This is an auxiliary objective added to the Dreamer world-model loss.
-    """
-    B, T, D = z_seq.shape
-    if T < 2:
-        zero = z_seq.new_zeros(())
-        return zero, {"kstep/loss": 0.0, "kstep/n_pairs": 0.0, "kstep/pos_sim": 0.0, "kstep/neg_sim": 0.0}
-
-    z = F.normalize(z_seq, dim=-1)
-    flat = z.reshape(B * T, D)
-
-    pairs: list[tuple[int, int]] = []
-    max_anchors = max(1, int(max_anchors))
-    for b in range(B):
-        for t in range(T - 1):
-            max_delta = min(int(k_max), T - 1 - t)
-            if max_delta < 1:
-                continue
-            valid_deltas = []
-            for d in range(1, max_delta + 1):
-                if done_seq is not None:
-                    seg = done_seq[b, t : t + d]
-                    if torch.any(seg > 0.5):
-                        break
-                valid_deltas.append(d)
-            if not valid_deltas:
-                continue
-            d = valid_deltas[int(torch.randint(0, len(valid_deltas), (1,), device=z_seq.device).item())]
-            pairs.append((b * T + t, b * T + t + d))
-
-    if not pairs:
-        zero = z_seq.new_zeros(())
-        return zero, {"kstep/loss": 0.0, "kstep/n_pairs": 0.0, "kstep/pos_sim": 0.0, "kstep/neg_sim": 0.0}
-
-    if len(pairs) > max_anchors:
-        perm = torch.randperm(len(pairs), device=z_seq.device)[:max_anchors].tolist()
-        pairs = [pairs[i] for i in perm]
-
-    anchor_idx = torch.tensor([p[0] for p in pairs], dtype=torch.long, device=z_seq.device)
-    pos_idx = torch.tensor([p[1] for p in pairs], dtype=torch.long, device=z_seq.device)
-
-    anchors = flat[anchor_idx]
-    positives = flat[pos_idx]
-
-    n_neg = max(1, int(n_neg))
-    neg_idx = torch.randint(0, flat.size(0), (anchors.size(0), n_neg), device=z_seq.device)
-    negatives = flat[neg_idx]
-
-    pos_logits = torch.sum(anchors * positives, dim=-1, keepdim=True) / max(float(temperature), 1e-6)
-    neg_logits = torch.einsum("bd,bnd->bn", anchors, negatives) / max(float(temperature), 1e-6)
-    logits = torch.cat([pos_logits, neg_logits], dim=1)
-    targets = torch.zeros(anchors.size(0), dtype=torch.long, device=z_seq.device)
-    loss = F.cross_entropy(logits, targets)
-
-    info = {
-        "kstep/loss": float(loss.item()),
-        "kstep/n_pairs": float(anchors.size(0)),
-        "kstep/pos_sim": float(torch.sum(anchors * positives, dim=-1).mean().item()),
-        "kstep/neg_sim": float(torch.einsum("bd,bnd->bn", anchors, negatives).mean().item()),
-    }
-    return loss, info
-
 def rssm_latent(h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """Concatenate deterministic and stochastic Dreamer state into one latent."""
     return torch.cat([h, s], dim=-1)
@@ -303,6 +231,540 @@ def latent_coverage_bonus(
     knn_dists, _ = torch.topk(dists, k_actual + 1, dim=1, largest=False)
     bonus = knn_dists[:, -1]  # k-th distance (skip self if self is in memory)
     return bonus
+
+
+# =====================================================================
+#  Teacher replay-graph + structured exploration module
+# =====================================================================
+
+
+def _standardize_features(x: np.ndarray) -> np.ndarray:
+    mu = x.mean(axis=0, keepdims=True)
+    sd = x.std(axis=0, keepdims=True) + 1e-6
+    return (x - mu) / sd
+
+
+def _safe_spearman(x: np.ndarray, y: np.ndarray) -> float:
+    try:
+        from scipy.stats import spearmanr
+        rho = spearmanr(x, y).correlation
+        if rho is None or not np.isfinite(rho):
+            return 0.0
+        return float(rho)
+    except Exception:
+        return 0.0
+
+
+def _set_env_mode(env: PointMazeLargeDreamerWrapper, mode: str, subset_size: int):
+    old = (env.reset_mode, env.fixed_start_cell, list(env.start_cells))
+    if mode == "random_reset":
+        env.reset_mode = "random"
+    elif mode == "start_subset":
+        env.reset_mode = "start_subset"
+        if not env.start_cells:
+            cells = [tuple(env._free_cells[i]) for i in range(min(max(1, subset_size), len(env._free_cells)))]
+            env.start_cells = cells
+    elif mode == "fixed_start":
+        env.reset_mode = "fixed_start"
+    else:
+        raise ValueError(f"Unknown teacher mode {mode!r}")
+    return old
+
+
+def _restore_env_mode(env: PointMazeLargeDreamerWrapper, old):
+    env.reset_mode, env.fixed_start_cell, start_cells = old
+    env.start_cells = list(start_cells)
+
+
+@torch.no_grad()
+def collect_teacher_data_with_quotas(
+    env: PointMazeLargeDreamerWrapper,
+    encoder: ConvEncoder,
+    rssm: RSSM,
+    actor: Actor | None,
+    device: torch.device,
+    bit_depth: int,
+    teacher_collect_episodes: int,
+    max_nodes: int,
+    teacher_high_noise: float,
+    teacher_random_fraction: float,
+    teacher_subset_fraction: float,
+    teacher_start_subset_size: int,
+    state_stride: int,
+):
+    frac_random = float(np.clip(teacher_random_fraction, 0.0, 1.0))
+    frac_subset = float(np.clip(teacher_subset_fraction, 0.0, 1.0 - frac_random))
+    frac_fixed = max(0.0, 1.0 - frac_random - frac_subset)
+    quotas = {
+        "random_reset": max(1, int(round(max_nodes * max(frac_random, 1e-6)))) if frac_random > 0 else 0,
+        "start_subset": max(1, int(round(max_nodes * max(frac_subset, 1e-6)))) if frac_subset > 0 else 0,
+        "fixed_start": max(1, max_nodes - (max(1, int(round(max_nodes * max(frac_random, 1e-6)))) if frac_random > 0 else 0) - (max(1, int(round(max_nodes * max(frac_subset, 1e-6)))) if frac_subset > 0 else 0)),
+    }
+    if frac_random == 0: quotas["random_reset"] = 0
+    if frac_subset == 0: quotas["start_subset"] = 0
+    if frac_fixed == 0: quotas["fixed_start"] = 0
+
+    obs_list=[]; pos_list=[]; cell_list=[]; ep_list=[]; t_list=[]; h_list=[]; s_list=[]; z_list=[]; e_list=[]; r_list=[]; succ_list=[]
+    mode_hist = Counter()
+    geodesic = env.geodesic
+    ep_ctr = 0
+    total_kept = 0
+    modes = [m for m in ["random_reset", "start_subset", "fixed_start"] if quotas[m] > 0]
+    if not modes:
+        modes = ["fixed_start"]
+        quotas["fixed_start"] = max_nodes
+
+    for mode in modes:
+        old = _set_env_mode(env, mode, teacher_start_subset_size)
+        kept_mode = 0
+        max_ep_mode = max(1, int(round(teacher_collect_episodes * (quotas[mode] / max(max_nodes, 1)))))
+        for _ in range(max_ep_mode):
+            if kept_mode >= quotas[mode] or total_kept >= max_nodes:
+                break
+            obs, _ = env.reset()
+            x = torch.tensor(np.ascontiguousarray(obs), dtype=torch.float32, device=device).permute(2,0,1).unsqueeze(0)
+            preprocess_img(x, depth=bit_depth)
+            e = encoder(x)
+            h, s = rssm.get_init_state(e, mean=True)
+            done = False
+            t_env = 0
+            while not done:
+                keep = (t_env % max(1, state_stride) == 0)
+                if keep:
+                    pos = env.agent_pos.copy().astype(np.float32)
+                    cell = int(geodesic.cell_to_idx[geodesic.pos_to_cell(float(pos[0]), float(pos[1]))])
+                    obs_list.append(np.ascontiguousarray(obs, dtype=np.uint8))
+                    pos_list.append(pos)
+                    cell_list.append(cell)
+                    ep_list.append(ep_ctr)
+                    t_list.append(t_env)
+                    h_np = h.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                    s_np = s.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                    e_np = e.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                    z_np = np.concatenate([h_np, s_np], axis=-1).astype(np.float32)
+                    h_list.append(h_np); s_list.append(s_np); e_list.append(e_np); z_list.append(z_np)
+                    r_list.append(0.0); succ_list.append(0.0)
+                    total_kept += 1; kept_mode += 1; mode_hist[mode] += 1
+                    if total_kept >= max_nodes or kept_mode >= quotas[mode]:
+                        done = True
+                        break
+
+                if actor is None:
+                    action = env.action_space.sample().astype(np.float32)
+                    a_t = torch.tensor(action, dtype=torch.float32, device=device).unsqueeze(0)
+                else:
+                    a_t, _ = actor.get_action(h, s, deterministic=False)
+                    noise = teacher_high_noise if mode != "fixed_start" else max(0.15, teacher_high_noise * 0.5)
+                    if noise > 0:
+                        a_t = torch.clamp(a_t + noise * torch.randn_like(a_t), -1.0, 1.0)
+                    action = a_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+                next_obs, r, term, trunc, info = env.step(action, repeat=1)
+                done = bool(term or trunc)
+                t_env += 1
+                x = torch.tensor(np.ascontiguousarray(next_obs), dtype=torch.float32, device=device).permute(2,0,1).unsqueeze(0)
+                preprocess_img(x, depth=bit_depth)
+                e = encoder(x)
+                h, s, _, _ = rssm.observe_step(e, a_t, h, s, sample=False)
+                obs = next_obs
+                if keep and total_kept > 0:
+                    r_list[-1] = float(r)
+                    succ_list[-1] = 1.0 if info.get("success", False) or info.get("is_success", False) else 0.0
+            ep_ctr += 1
+        _restore_env_mode(env, old)
+
+    if not obs_list:
+        raise RuntimeError("No teacher states collected.")
+
+    return {
+        "obs": np.stack(obs_list, axis=0),
+        "pos": np.stack(pos_list, axis=0),
+        "cell_idx": np.asarray(cell_list, dtype=np.int64),
+        "episode_id": np.asarray(ep_list, dtype=np.int64),
+        "t_in_ep": np.asarray(t_list, dtype=np.int64),
+        "h": np.stack(h_list, axis=0),
+        "s": np.stack(s_list, axis=0),
+        "z": np.stack(z_list, axis=0),
+        "enc_e": np.stack(e_list, axis=0),
+        "reward": np.asarray(r_list, dtype=np.float32),
+        "success": np.asarray(succ_list, dtype=np.float32),
+    }, dict(mode_hist)
+
+
+def _connected_components(adj):
+    n = len(adj)
+    comp = -np.ones(n, dtype=np.int64)
+    groups = []
+    cid = 0
+    for i in range(n):
+        if comp[i] != -1:
+            continue
+        q = deque([i])
+        comp[i] = cid
+        group = []
+        while q:
+            u = q.popleft()
+            group.append(u)
+            for v in adj[u]:
+                if comp[v] == -1:
+                    comp[v] = cid
+                    q.append(v)
+        groups.append(group)
+        cid += 1
+    return comp, groups
+
+
+def build_multiview_replay_graph(data, graph_views, graph_knn_k, graph_knn_weight, graph_temporal_weight, graph_knn_max_percentile, graph_same_ep_gap, max_graph_nodes, graph_min_view_votes):
+    rng = np.random.default_rng(0)
+    n_total = data["z"].shape[0]
+    keep = np.sort(rng.choice(n_total, size=max_graph_nodes, replace=False)) if n_total > max_graph_nodes else np.arange(n_total, dtype=np.int64)
+    ep = data["episode_id"][keep]
+    tt = data["t_in_ep"][keep]
+    n = len(keep)
+    edge_w = {}
+    temporal_edges = 0
+    for e_id in np.unique(ep):
+        loc = np.where(ep == e_id)[0]
+        if len(loc) < 2:
+            continue
+        order = np.argsort(tt[loc]); loc = loc[order]
+        for a,b in zip(loc[:-1], loc[1:]):
+            dt = int(tt[b] - tt[a])
+            w = float(max(1, dt) * graph_temporal_weight)
+            key = (int(min(a,b)), int(max(a,b)))
+            edge_w[key] = min(edge_w.get(key, 1e9), w)
+            temporal_edges += 1
+
+    view_votes = defaultdict(int)
+    view_list = list(graph_views) if graph_views else ["encoder", "z"]
+    for view in view_list:
+        if view == "encoder": basis = data["enc_e"][keep]
+        elif view == "h": basis = data["h"][keep]
+        elif view == "s": basis = data["s"][keep]
+        else: basis = data["z"][keep]
+        basis = _standardize_features(basis.astype(np.float32))
+        if n < 4:
+            continue
+        dmat = np.linalg.norm(basis[:,None,:] - basis[None,:,:], axis=-1)
+        np.fill_diagonal(dmat, np.inf)
+        if graph_same_ep_gap > 0:
+            same_ep = ep[:,None] == ep[None,:]
+            gap = np.abs(tt[:,None] - tt[None,:])
+            dmat[same_ep & (gap <= graph_same_ep_gap)] = np.inf
+        nbrs = np.argsort(dmat, axis=1)[:, :graph_knn_k]
+        cand = []
+        seen = set()
+        cand_d = []
+        for i in range(n):
+            for j in nbrs[i]:
+                if not np.isfinite(dmat[i,j]):
+                    continue
+                if i in nbrs[j]:
+                    a,b = (int(i),int(j)) if i<j else (int(j),int(i))
+                    if (a,b) not in seen:
+                        seen.add((a,b)); cand.append((a,b,float(dmat[a,b]))); cand_d.append(float(dmat[a,b]))
+        if cand_d:
+            max_d = float(np.percentile(np.asarray(cand_d, dtype=np.float32), graph_knn_max_percentile))
+            for a,b,dij in cand:
+                if dij <= max_d:
+                    view_votes[(a,b)] += 1
+
+    knn_edges = 0
+    vote_strength = np.zeros(n, dtype=np.float32)
+    for (a,b), votes in view_votes.items():
+        if votes >= max(1, int(graph_min_view_votes)):
+            edge_w[(a,b)] = min(edge_w.get((a,b), 1e9), float(graph_knn_weight))
+            knn_edges += 1
+            vote_strength[a] += votes / max(len(view_list),1)
+            vote_strength[b] += votes / max(len(view_list),1)
+
+    mat = lil_matrix((n,n), dtype=np.float32)
+    adj = [[] for _ in range(n)]
+    for (u,v),w in edge_w.items():
+        mat[u,v] = float(w); mat[v,u] = float(w)
+        adj[u].append(v); adj[v].append(u)
+    dist = shortest_path(mat.tocsr(), method="D", directed=False, unweighted=False)
+    comp_id, groups = _connected_components(adj)
+    giant = max(groups, key=len) if groups else []
+    giant_local = np.asarray(sorted(giant), dtype=np.int64)
+    giant_global = keep[giant_local] if len(giant_local) else np.zeros((0,), dtype=np.int64)
+    deg = np.asarray([len(a) for a in adj], dtype=np.float32)
+    node_conf = vote_strength / np.maximum(deg, 1.0)
+    stats = {
+        "n_nodes_total": int(n),
+        "n_edges_total": int(mat.nnz // 2),
+        "n_temporal_edges": int(temporal_edges),
+        "n_knn_edges": int(knn_edges),
+        "n_components": int(len(groups)),
+        "giant_component_size": int(len(giant_local)),
+        "giant_component_fraction": float(len(giant_local) / max(n,1)),
+    }
+    return {
+        "node_indices": keep,
+        "dist_mat": np.asarray(dist, dtype=np.float32),
+        "adj": adj,
+        "comp_id": comp_id,
+        "giant_nodes_local": giant_local,
+        "giant_nodes_global": giant_global,
+        "node_conf": node_conf.astype(np.float32),
+        "stats": stats,
+    }
+
+
+def _sample_pairs_by_bins(dist_mat, node_ids, n_pairs, seed):
+    rng = np.random.default_rng(seed)
+    node_ids = np.asarray(node_ids, dtype=np.int64)
+    bins = {"short": [], "mid": [], "long": []}
+    max_scan = min(80000, len(node_ids) * max(len(node_ids),1))
+    for _ in range(max_scan):
+        i = int(rng.choice(node_ids)); j = int(rng.choice(node_ids))
+        if i == j:
+            continue
+        d = float(dist_mat[i,j])
+        if not np.isfinite(d) or d <= 0:
+            continue
+        if d <= 3: bins["short"].append((i,j,d))
+        elif d <= 8: bins["mid"].append((i,j,d))
+        else: bins["long"].append((i,j,d))
+        if sum(len(v) for v in bins.values()) >= max(4*n_pairs, 2000):
+            break
+    out = []
+    per_bin = max(1, n_pairs // 3)
+    for name in ["short","mid","long"]:
+        pool = bins[name]
+        if not pool: continue
+        choose = min(per_bin, len(pool))
+        idx = rng.choice(len(pool), size=choose, replace=False)
+        out.extend([pool[k] for k in idx])
+    flat = bins["short"] + bins["mid"] + bins["long"]
+    if len(out) < n_pairs and flat:
+        need = min(n_pairs - len(out), len(flat))
+        idx = rng.choice(len(flat), size=need, replace=False)
+        out.extend([flat[k] for k in idx])
+    ii = np.asarray([x[0] for x in out], dtype=np.int64)
+    jj = np.asarray([x[1] for x in out], dtype=np.int64)
+    dd = np.asarray([x[2] for x in out], dtype=np.float32)
+    return ii,jj,dd
+
+
+def _episode_sequences(node_ids, episode_id, t_in_ep):
+    groups = defaultdict(list)
+    for gid in np.asarray(node_ids, dtype=np.int64).tolist():
+        groups[int(episode_id[gid])].append((int(t_in_ep[gid]), int(gid)))
+    out = []
+    for _, arr in groups.items():
+        arr.sort(key=lambda x: x[0])
+        out.append(np.asarray([x[1] for x in arr], dtype=np.int64))
+    return out
+
+
+def train_replay_metric_head(h, s, replay_dist, node_ids, geo_dim, hidden_dim, lr, epochs, batch_pairs, device, seed, canon_weight=0.0):
+    rng = np.random.default_rng(seed)
+    model = GeoEncoder(h.shape[1], s.shape[1], geo_dim=geo_dim, hidden_dim=hidden_dim).to(device)
+    scale = torch.nn.Parameter(torch.tensor(0.1, device=device))
+    opt = torch.optim.Adam(list(model.parameters()) + [scale], lr=lr)
+    h_t = torch.tensor(h, dtype=torch.float32, device=device)
+    s_t = torch.tensor(s, dtype=torch.float32, device=device)
+    node_ids = np.asarray(node_ids, dtype=np.int64)
+    for _ in range(int(epochs)):
+        ii,jj,d_np = _sample_pairs_by_bins(replay_dist, node_ids, batch_pairs, int(rng.integers(1<<31)))
+        if len(ii) < 8:
+            continue
+        g_i = model(h_t[ii], s_t[ii])
+        g_j = model(h_t[jj], s_t[jj])
+        d_lat = torch.norm(g_i-g_j, dim=-1)
+        d_t = torch.tensor(d_np, dtype=torch.float32, device=device)
+        w = 1.0 / torch.sqrt(d_t + 1.0)
+        loss_metric = (w * (d_lat - scale.clamp(min=1e-4) * d_t).pow(2)).mean()
+        g_pair = torch.cat([g_i, g_j], dim=0)
+        sq = torch.cdist(g_pair, g_pair).pow(2)
+        sq = sq.masked_fill(torch.eye(sq.size(0), device=device, dtype=torch.bool), 1e9)
+        loss_uni = torch.logsumexp(-2.0 * sq, dim=1).mean()
+        loss = loss_metric + 0.05 * loss_uni
+        if canon_weight > 0:
+            pos_idx = jj
+            d_ap = torch.norm(g_i - model(h_t[pos_idx], s_t[pos_idx]), dim=-1)
+            loss = loss + float(canon_weight) * d_ap.mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    model.eval()
+    return model, float(scale.detach().cpu().item())
+
+
+def train_temporal_head(h, s, episode_id, t_in_ep, node_ids, geo_dim, hidden_dim, lr, epochs, batch_size, seq_len, device, seed):
+    rng = np.random.default_rng(seed)
+    model = GeoEncoder(h.shape[1], s.shape[1], geo_dim=geo_dim, hidden_dim=hidden_dim).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    sequences = [seq for seq in _episode_sequences(node_ids, episode_id, t_in_ep) if len(seq) >= max(4, seq_len)]
+    if not sequences:
+        return model
+    h_t = torch.tensor(h, dtype=torch.float32, device=device)
+    s_t = torch.tensor(s, dtype=torch.float32, device=device)
+    for _ in range(int(epochs)):
+        batch_seqs = []
+        for _ in range(int(batch_size)):
+            seq = sequences[int(rng.integers(len(sequences)))]
+            start = 0 if len(seq) == seq_len else int(rng.integers(0, len(seq) - seq_len + 1))
+            batch_seqs.append(seq[start:start+seq_len])
+        idx = np.stack(batch_seqs, axis=0)
+        g_seq = model(h_t[idx], s_t[idx])
+        loss = temporal_reachability_loss(g_seq, pos_k=3, neg_k=min(12, seq_len - 2), margin=0.6)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    model.eval()
+    return model
+
+
+class TeacherStructModule:
+    def __init__(self, deter_dim, stoch_dim, device, args):
+        self.device = device
+        self.args = args
+        self.ready = False
+        self.last_update_step = -10**9
+        self.replay_head = None
+        self.temporal_head = None
+        self.replay_scale = 1.0
+        self.node_replay = None
+        self.node_temp = None
+        self.node_phi = None
+        self.node_conf = None
+        self.graph = None
+        self.teacher_data = None
+        self.mode_hist = {}
+        self.teacher_quality = {}
+
+    @torch.no_grad()
+    def maybe_refresh(self, total_steps, env, encoder, rssm, actor, device, bit_depth):
+        if total_steps - self.last_update_step < self.args.struct_update_interval:
+            return False
+        encoder.eval(); rssm.eval()
+        data, mode_hist = collect_teacher_data_with_quotas(
+            env, encoder, rssm, actor, device, bit_depth,
+            teacher_collect_episodes=self.args.teacher_collect_episodes,
+            max_nodes=self.args.teacher_max_nodes,
+            teacher_high_noise=self.args.teacher_high_noise,
+            teacher_random_fraction=self.args.teacher_random_fraction,
+            teacher_subset_fraction=self.args.teacher_subset_fraction,
+            teacher_start_subset_size=self.args.teacher_start_subset_size,
+            state_stride=self.args.struct_state_stride,
+        )
+        graph = build_multiview_replay_graph(
+            data,
+            graph_views=[x.strip() for x in self.args.graph_views.split(",") if x.strip()],
+            graph_knn_k=self.args.graph_knn_k,
+            graph_knn_weight=self.args.graph_knn_weight,
+            graph_temporal_weight=self.args.graph_temporal_weight,
+            graph_knn_max_percentile=self.args.graph_knn_max_percentile,
+            graph_same_ep_gap=self.args.graph_same_ep_gap,
+            max_graph_nodes=self.args.max_graph_nodes,
+            graph_min_view_votes=self.args.graph_min_view_votes,
+        )
+        gc = graph["giant_nodes_local"]
+        if len(gc) < 32:
+            self.ready = False
+            self.teacher_quality = {"coverage": float(len(np.unique(data["cell_idx"])) / max(int(env.geodesic.n_free),1)), "giant_component_fraction": float(graph["stats"]["giant_component_fraction"]), "geo_vs_replay": {"spearman": 0.0}, "topology_ok": False}
+            self.last_update_step = total_steps
+            return False
+        self.replay_head, self.replay_scale = train_replay_metric_head(
+            h=data["h"][graph["node_indices"]],
+            s=data["s"][graph["node_indices"]],
+            replay_dist=graph["dist_mat"],
+            node_ids=gc,
+            geo_dim=self.args.struct_geo_dim,
+            hidden_dim=self.args.struct_geo_hidden,
+            lr=self.args.struct_geo_lr,
+            epochs=self.args.struct_replay_head_epochs,
+            batch_pairs=self.args.struct_replay_head_batch_pairs,
+            device=self.device,
+            seed=self.args.seed + int(total_steps),
+            canon_weight=self.args.struct_canon_weight,
+        )
+        self.temporal_head = train_temporal_head(
+            h=data["h"], s=data["s"], episode_id=data["episode_id"], t_in_ep=data["t_in_ep"],
+            node_ids=graph["giant_nodes_global"], geo_dim=self.args.struct_geo_dim, hidden_dim=self.args.struct_geo_hidden,
+            lr=self.args.struct_geo_lr, epochs=self.args.struct_temp_head_epochs, batch_size=self.args.struct_temp_head_batch_size,
+            seq_len=self.args.struct_temp_seq_len, device=self.device, seed=self.args.seed + int(total_steps) + 7,
+        )
+        h_t = torch.tensor(data["h"][graph["node_indices"]], dtype=torch.float32, device=self.device)
+        s_t = torch.tensor(data["s"][graph["node_indices"]], dtype=torch.float32, device=self.device)
+        self.node_replay = self.replay_head(h_t, s_t).detach().cpu().numpy().astype(np.float32)
+        self.node_temp = self.temporal_head(h_t, s_t).detach().cpu().numpy().astype(np.float32)
+        conf = graph["node_conf"].copy().astype(np.float32)
+        if conf.max() > 0:
+            conf = conf / max(conf.max(), 1e-6)
+        cell_counts = defaultdict(int)
+        for c in data["cell_idx"][graph["node_indices"]].tolist():
+            cell_counts[int(c)] += 1
+        frontier = np.asarray([1.0 / np.sqrt(cell_counts[int(c)] + 1.0) for c in data["cell_idx"][graph["node_indices"]]], dtype=np.float32)
+        # disagreement by landmark profiles on giant component
+        gcl = graph["giant_nodes_local"]
+        g_rep = self.node_replay[gcl]
+        g_tmp = self.node_temp[gcl]
+        rng = np.random.default_rng(self.args.seed)
+        lm = [int(rng.integers(len(gcl)))]
+        while len(lm) < min(self.args.struct_n_landmarks, len(gcl)):
+            dmin = np.min(np.linalg.norm(g_rep[:,None,:] - g_rep[np.asarray(lm)][None,:,:], axis=-1), axis=1)
+            cand = int(np.argmax(dmin))
+            if cand in lm: break
+            lm.append(cand)
+        lm = np.asarray(lm, dtype=np.int64)
+        rep_prof = np.linalg.norm(self.node_replay[:,None,:] - self.node_replay[gcl[lm]][None,:,:], axis=-1)
+        tmp_prof = np.linalg.norm(self.node_temp[:,None,:] - self.node_temp[gcl[lm]][None,:,:], axis=-1)
+        rep_prof = (rep_prof - rep_prof.mean(axis=1, keepdims=True)) / (rep_prof.std(axis=1, keepdims=True) + 1e-6)
+        tmp_prof = (tmp_prof - tmp_prof.mean(axis=1, keepdims=True)) / (tmp_prof.std(axis=1, keepdims=True) + 1e-6)
+        disagree = np.mean(np.abs(rep_prof - tmp_prof), axis=1).astype(np.float32)
+        conf_pow = np.power(np.clip(conf, 0.0, 1.0), float(max(self.args.struct_conf_power, 1e-6)))
+        self.node_phi = conf_pow * (self.args.struct_lambda_front * frontier + self.args.struct_lambda_disagree * disagree)
+        self.node_conf = conf
+        self.graph = graph
+        self.teacher_data = data
+        self.mode_hist = mode_hist
+        # diagnostics
+        coverage = float(len(np.unique(data["cell_idx"])) / max(int(env.geodesic.n_free), 1))
+        ii,jj,rd = _sample_pairs_by_bins(graph["dist_mat"], gcl, min(1200, max(200, len(gcl)*2)), seed=self.args.seed + 99)
+        cells = data["cell_idx"][graph["node_indices"]]
+        gd = np.asarray([float(env.geodesic.dist_matrix[int(cells[i]), int(cells[j])]) for i,j in zip(ii,jj)], dtype=np.float32)
+        finite = np.isfinite(gd) & np.isfinite(rd) & (gd > 0) & (rd > 0)
+        rho = _safe_spearman(gd[finite], rd[finite]) if finite.sum() >= 10 else 0.0
+        self.teacher_quality = {
+            "coverage": coverage,
+            "visited_cells": int(len(np.unique(data["cell_idx"]))),
+            "giant_component_fraction": float(graph["stats"]["giant_component_fraction"]),
+            "geo_vs_replay": {"spearman": float(rho), "n": int(finite.sum())},
+            "topology_ok": bool(coverage >= self.args.teacher_min_coverage and graph["stats"]["giant_component_fraction"] >= self.args.teacher_min_giant_fraction and rho >= self.args.teacher_min_geo_replay_spearman),
+        }
+        self.ready = True
+        self.last_update_step = total_steps
+        return True
+
+    @torch.no_grad()
+    def intrinsic_reward_for_imagination(self, h_imag, s_imag):
+        if not self.ready or self.node_replay is None:
+            B = h_imag.size(0)
+            H = h_imag.size(1) - 1
+            return torch.zeros((B, H), dtype=torch.float32, device=h_imag.device), {}
+        B, T1, Dh = h_imag.shape
+        Ds = s_imag.size(-1)
+        g_rep = self.replay_head(h_imag.reshape(-1, Dh), s_imag.reshape(-1, Ds)).detach().cpu().numpy().astype(np.float32)
+        dm = np.linalg.norm(g_rep[:,None,:] - self.node_replay[None,:,:], axis=-1)
+        nn_idx = np.argmin(dm, axis=1)
+        nn_dist = dm[np.arange(dm.shape[0]), nn_idx].reshape(B, T1)
+        nn_idx = nn_idx.reshape(B, T1)
+        phi = self.node_phi[nn_idx]
+        conf = self.node_conf[nn_idx]
+        phi_gain = phi[:,1:] - phi[:,:-1]
+        conf_next = conf[:,1:]
+        r = conf_next * phi_gain - float(self.args.struct_off_weight) * nn_dist[:,1:]
+        stats = {
+            "off_manifold_mean": float(np.mean(nn_dist[:,1:])),
+            "phi_gain_mean": float(np.mean(phi_gain)),
+            "phi_gain_pos_frac": float(np.mean(phi_gain > 0)),
+            "conf_mean": float(np.mean(conf_next)),
+        }
+        return torch.tensor(r, dtype=torch.float32, device=h_imag.device), stats
+
 
 
 # =====================================================================
@@ -599,8 +1061,8 @@ def build_parser():
 
     # Geometric regularization
     p.add_argument("--geo_mode", type=str, default="baseline",
-                   choices=["baseline", "vicreg", "straight", "georeg", "georeg_cov", "kstep"],
-                   help="baseline | vicreg | straight | georeg (both) | georeg_cov (both + coverage) | kstep (InfoNCE reachability)")
+                   choices=["baseline", "vicreg", "straight", "georeg", "georeg_cov"],
+                   help="baseline | vicreg | straight | georeg (both) | georeg_cov (both + coverage)")
     p.add_argument("--vicreg_weight", type=float, default=0.1,
                    help="Weight of VICReg loss added to world model loss")
     p.add_argument("--vicreg_var_w", type=float, default=25.0)
@@ -614,18 +1076,47 @@ def build_parser():
     p.add_argument("--coverage_memory_size", type=int, default=4096)
     p.add_argument("--coverage_knn_k", type=int, default=5)
 
-    p.add_argument("--kstep_weight", type=float, default=0.1,
-                   help="Weight of k-step InfoNCE reachability loss")
-    p.add_argument("--kstep_max_k", type=int, default=5,
-                   help="Positive window size for k-step reachability")
-    p.add_argument("--kstep_negatives", type=int, default=64,
-                   help="Number of negatives per anchor for k-step reachability")
-    p.add_argument("--kstep_temperature", type=float, default=0.1,
-                   help="InfoNCE temperature for k-step reachability")
-    p.add_argument("--kstep_max_anchors", type=int, default=256,
-                   help="Max anchor-positive pairs per batch for k-step reachability")
-    p.add_argument("--kstep_min_steps", type=int, default=50_000,
-                   help="For kstep/k_step: env steps before applying k-step loss (WM trains without it until then)")
+
+
+    # Structured exploration via teacher graph + replay/temporal heads
+    p.add_argument("--struct_geo_weight", type=float, default=0.1,
+                   help="Weight of structured graph bonus in imagination")
+    p.add_argument("--struct_ngu_weight", type=float, default=0.05,
+                   help="Weight of NGU-style novelty bonus alongside structured bonus")
+    p.add_argument("--struct_update_interval", type=int, default=5000,
+                   help="Refresh teacher graph and heads every N env steps")
+    p.add_argument("--teacher_collect_episodes", type=int, default=80)
+    p.add_argument("--teacher_max_nodes", type=int, default=3500)
+    p.add_argument("--teacher_high_noise", type=float, default=0.45)
+    p.add_argument("--teacher_random_fraction", type=float, default=0.4)
+    p.add_argument("--teacher_subset_fraction", type=float, default=0.3)
+    p.add_argument("--teacher_start_subset_size", type=int, default=6)
+    p.add_argument("--teacher_min_coverage", type=float, default=0.45)
+    p.add_argument("--teacher_min_giant_fraction", type=float, default=0.3)
+    p.add_argument("--teacher_min_geo_replay_spearman", type=float, default=0.45)
+    p.add_argument("--struct_state_stride", type=int, default=2)
+    p.add_argument("--graph_views", type=str, default="encoder,z")
+    p.add_argument("--graph_min_view_votes", type=int, default=1)
+    p.add_argument("--graph_knn_k", type=int, default=6)
+    p.add_argument("--graph_knn_weight", type=float, default=1.0)
+    p.add_argument("--graph_temporal_weight", type=float, default=1.0)
+    p.add_argument("--graph_knn_max_percentile", type=float, default=80.0)
+    p.add_argument("--graph_same_ep_gap", type=int, default=2)
+    p.add_argument("--max_graph_nodes", type=int, default=1800)
+    p.add_argument("--struct_geo_dim", type=int, default=32)
+    p.add_argument("--struct_geo_hidden", type=int, default=256)
+    p.add_argument("--struct_geo_lr", type=float, default=3e-4)
+    p.add_argument("--struct_replay_head_epochs", type=int, default=200)
+    p.add_argument("--struct_replay_head_batch_pairs", type=int, default=512)
+    p.add_argument("--struct_temp_head_epochs", type=int, default=200)
+    p.add_argument("--struct_temp_head_batch_size", type=int, default=32)
+    p.add_argument("--struct_temp_seq_len", type=int, default=12)
+    p.add_argument("--struct_canon_weight", type=float, default=0.25)
+    p.add_argument("--struct_lambda_front", type=float, default=1.0)
+    p.add_argument("--struct_lambda_disagree", type=float, default=0.5)
+    p.add_argument("--struct_conf_power", type=float, default=1.0)
+    p.add_argument("--struct_off_weight", type=float, default=0.0)
+    p.add_argument("--struct_n_landmarks", type=int, default=16)
 
     # Diagnostics
     p.add_argument("--diag_interval", type=int, default=40,
@@ -653,16 +1144,12 @@ def main(args):
     use_vicreg = args.geo_mode in ("vicreg", "georeg", "georeg_cov")
     use_straight = args.geo_mode in ("straight", "georeg", "georeg_cov")
     use_coverage = args.geo_mode == "georeg_cov"
-    use_kstep = args.geo_mode == "kstep"
 
     print(f"Device: {device}")
     print(f"Geo mode: {args.geo_mode}")
     print(f"  VICReg: {use_vicreg} (weight={args.vicreg_weight})")
     print(f"  Straightness: {use_straight} (weight={args.straight_weight})")
     print(f"  Coverage bonus: {use_coverage} (weight={args.coverage_weight})")
-    print(f"  K-step InfoNCE: {use_kstep} (weight={args.kstep_weight})")
-    if use_kstep:
-        print(f"  K-step starts after {args.kstep_min_steps} env steps (WM warmup without k-step loss)")
 
     start_cells: list[tuple[int, int]] | None = None
     if args.reset_mode == "start_subset" and args.start_subset.strip():
@@ -737,9 +1224,11 @@ def main(args):
     out_dir = os.path.join(args.log_dir, tag)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Coverage memory bank (for georeg_cov mode)
+    # Coverage memory bank (for novelty bonuses)
     coverage_memory: torch.Tensor | None = None
     coverage_ptr = 0
+
+    struct_module = TeacherStructModule(args.deter_dim, args.stoch_dim, device, args) if use_struct else None
 
     # Observation + position buffers for geodesic correlation eval
     obs_geo_buffer: list[np.ndarray] = []
@@ -821,16 +1310,23 @@ def main(args):
 
             # ---- Training steps ----
             if total_steps % args.collect_interval == 0 and replay.size > (args.seq_len + 2):
+                if use_struct and struct_module is not None:
+                    try:
+                        refreshed = struct_module.maybe_refresh(total_steps, env, encoder, rssm, actor, device, args.bit_depth)
+                        if refreshed:
+                            tq = struct_module.teacher_quality
+                            print(f"    [struct refresh] coverage={tq.get("coverage",0):.2f} giant={tq.get("giant_component_fraction",0):.2f} geo_vs_replay={tq.get("geo_vs_replay",{}).get("spearman",0):.3f}")
+                    except Exception as e:
+                        print(f"    [struct refresh failed] {e}")
                 encoder.train(); decoder.train(); rssm.train()
                 reward_model.train(); cont_model.train()
                 actor.train(); value_model.train()
 
                 sum_rec = sum_kld = sum_rew = sum_cont = sum_model = 0.0
                 sum_actor = sum_value = sum_imag_r = 0.0
-                sum_vicreg = sum_straight = sum_coverage = sum_kstep = 0.0
+                sum_vicreg = sum_straight = sum_coverage = 0.0
                 vicreg_info_accum: dict[str, float] = {}
                 straight_info_accum: dict[str, float] = {}
-                kstep_info_accum: dict[str, float] = {}
 
                 for _ in range(args.train_steps):
                     batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
@@ -913,25 +1409,6 @@ def main(args):
                         for k, v in str_info.items():
                             straight_info_accum[k] = straight_info_accum.get(k, 0.0) + v
 
-                    # ---- K-step reachability InfoNCE on Dreamer state z=[h,s] ----
-                    l_kstep = torch.tensor(0.0, device=device)
-                    if use_kstep and total_steps >= args.kstep_min_steps:
-                        z_seq = rssm_latent(h_seq, s_seq)
-                        l_kstep, kstep_info = kstep_reachability_nce_loss(
-                            z_seq,
-                            done_seq=done_seq[:, :T],
-                            k_max=args.kstep_max_k,
-                            n_neg=args.kstep_negatives,
-                            temperature=args.kstep_temperature,
-                            max_anchors=args.kstep_max_anchors,
-                        )
-                        # linear interpolate kstep_weight from 0 to args.kstep_weight from 50,000 to 60,000 steps
-                        kstep_weight = args.kstep_weight * ((total_steps - 50000) / 10_000) if total_steps < 60000 else args.kstep_weight
-
-                        model_loss = model_loss + kstep_weight * l_kstep
-                        for k, v in kstep_info.items():
-                            kstep_info_accum[k] = kstep_info_accum.get(k, 0.0) + v
-
                     model_opt.zero_grad(set_to_none=True)
                     model_loss.backward()
                     torch.nn.utils.clip_grad_norm_(world_params, args.grad_clip)
@@ -944,7 +1421,6 @@ def main(args):
                     sum_model += float(model_loss.item())
                     sum_vicreg += float(l_vicreg.item())
                     sum_straight += float(l_straight.item())
-                    sum_kstep += float(l_kstep.item())
 
                     # ---- Actor-critic (imagination) ----
                     B_seq, T_seq, Dh = h_seq.shape
@@ -974,30 +1450,37 @@ def main(args):
                         pcont_imag = torch.sigmoid(cont_logits_imag).clamp(0.0, 1.0)
                         discounts_imag = effective_gamma * pcont_imag
 
-                    # ---- Coverage intrinsic reward ----
-                    if use_coverage:
+                    # ---- Structured / novelty intrinsic rewards ----
+                    rewards_total = rewards_imag
+                    z_imag_flat = rssm_latent(h_imag[:, 1:].reshape(-1, Dh),
+                                              s_imag[:, 1:].reshape(-1, Ds))
+                    cov_bonus = None
+                    if use_coverage or use_struct:
                         with torch.no_grad():
-                            # Dreamer state latents for coverage bonus
-                            z_imag_flat = rssm_latent(h_imag[:, 1:].reshape(-1, Dh),
-                                                      s_imag[:, 1:].reshape(-1, Ds))
                             if coverage_memory is None:
-                                coverage_memory = z_imag_flat[:args.coverage_memory_size].clone()
+                                coverage_memory = z_imag_flat[:args.coverage_memory_size].detach().clone()
                                 coverage_ptr = min(len(z_imag_flat), args.coverage_memory_size)
                             cov_bonus = latent_coverage_bonus(
-                                z_imag_flat, coverage_memory, k=args.coverage_knn_k
+                                z_imag_flat.detach(), coverage_memory, k=args.coverage_knn_k
                             ).reshape(rewards_imag.shape)
-                            # Normalize to comparable scale with extrinsic reward
                             cov_bonus = cov_bonus / (cov_bonus.std().clamp(min=1e-4))
-                            # Update memory with recent states
                             n_new = min(len(z_imag_flat), args.coverage_memory_size)
-                            new_states = z_imag_flat[:n_new]
+                            new_states = z_imag_flat.detach()[:n_new]
                             for i in range(n_new):
                                 coverage_memory[coverage_ptr % args.coverage_memory_size] = new_states[i]
                                 coverage_ptr += 1
-                        rewards_total = rewards_imag + args.coverage_weight * cov_bonus
+                    if use_struct and struct_module is not None and struct_module.ready:
+                        struct_bonus, struct_stats = struct_module.intrinsic_reward_for_imagination(h_imag, s_imag)
+                        rewards_total = rewards_total + args.struct_geo_weight * struct_bonus
+                        sum_struct += float(struct_bonus.mean().item())
+                        for k, v in struct_stats.items():
+                            struct_stats_accum[k] = struct_stats_accum.get(k, 0.0) + float(v)
+                        if cov_bonus is not None and args.struct_ngu_weight > 0:
+                            rewards_total = rewards_total + args.struct_ngu_weight * cov_bonus
+                            sum_ngu += float(cov_bonus.mean().item())
+                    elif use_coverage and cov_bonus is not None:
+                        rewards_total = rewards_total + args.coverage_weight * cov_bonus
                         sum_coverage += float(cov_bonus.mean().item())
-                    else:
-                        rewards_total = rewards_imag
 
                     sum_imag_r += float(rewards_imag.mean().item())
 
@@ -1041,12 +1524,6 @@ def main(args):
                 writer.add_scalar("loss/value", sum_value / n_ts, total_steps)
                 writer.add_scalar("imag/reward_mean", sum_imag_r / n_ts, total_steps)
                 writer.add_scalar("train/exploration_noise", expl_amount, total_steps)
-                if use_kstep:
-                    writer.add_scalar(
-                        "train/kstep_loss_enabled",
-                        1.0 if total_steps >= args.kstep_min_steps else 0.0,
-                        total_steps,
-                    )
 
                 if use_vicreg:
                     writer.add_scalar("loss/vicreg_total", sum_vicreg / n_ts, total_steps)
@@ -1058,13 +1535,18 @@ def main(args):
                     writer.add_scalar("loss/straight_weighted", args.straight_weight * sum_straight / n_ts, total_steps)
                     for k, v in straight_info_accum.items():
                         writer.add_scalar(f"loss/{k}", v / n_ts, total_steps)
-                if use_kstep:
-                    writer.add_scalar("loss/kstep_total", sum_kstep / n_ts, total_steps)
-                    writer.add_scalar("loss/kstep_weighted", args.kstep_weight * sum_kstep / n_ts, total_steps)
-                    for k, v in kstep_info_accum.items():
-                        writer.add_scalar(f"loss/{k}", v / n_ts, total_steps)
                 if use_coverage:
                     writer.add_scalar("loss/coverage_bonus_mean", sum_coverage / n_ts, total_steps)
+                if use_struct:
+                    writer.add_scalar("loss/struct_bonus_mean", sum_struct / n_ts, total_steps)
+                    writer.add_scalar("loss/struct_ngu_bonus_mean", sum_ngu / n_ts, total_steps)
+                    if struct_module is not None and struct_module.ready:
+                        tq = struct_module.teacher_quality
+                        writer.add_scalar("struct/teacher_coverage", float(tq.get("coverage", 0.0)), total_steps)
+                        writer.add_scalar("struct/teacher_giant_fraction", float(tq.get("giant_component_fraction", 0.0)), total_steps)
+                        writer.add_scalar("struct/teacher_geo_vs_replay_spearman", float(tq.get("geo_vs_replay", {}).get("spearman", 0.0)), total_steps)
+                        for k, v in struct_stats_accum.items():
+                            writer.add_scalar(f"struct/{k}", v / n_ts, total_steps)
 
         if args.expl_decay > 0:
             expl_amount = max(args.expl_min, expl_amount - args.expl_decay)
