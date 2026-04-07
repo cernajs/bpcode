@@ -1061,8 +1061,8 @@ def build_parser():
 
     # Geometric regularization
     p.add_argument("--geo_mode", type=str, default="baseline",
-                   choices=["baseline", "vicreg", "straight", "georeg", "georeg_cov"],
-                   help="baseline | vicreg | straight | georeg (both) | georeg_cov (both + coverage)")
+                   choices=["baseline", "vicreg", "straight", "georeg", "georeg_cov", "struct_explore"],
+                   help="baseline | vicreg | straight | georeg (both) | georeg_cov (both + coverage) | struct_explore")
     p.add_argument("--vicreg_weight", type=float, default=0.1,
                    help="Weight of VICReg loss added to world model loss")
     p.add_argument("--vicreg_var_w", type=float, default=25.0)
@@ -1144,12 +1144,14 @@ def main(args):
     use_vicreg = args.geo_mode in ("vicreg", "georeg", "georeg_cov")
     use_straight = args.geo_mode in ("straight", "georeg", "georeg_cov")
     use_coverage = args.geo_mode == "georeg_cov"
+    use_struct = args.geo_mode == "struct_explore"
 
     print(f"Device: {device}")
     print(f"Geo mode: {args.geo_mode}")
     print(f"  VICReg: {use_vicreg} (weight={args.vicreg_weight})")
     print(f"  Straightness: {use_straight} (weight={args.straight_weight})")
     print(f"  Coverage bonus: {use_coverage} (weight={args.coverage_weight})")
+    print(f"  Structured explore: {use_struct} (geo={args.struct_geo_weight}, ngu={args.struct_ngu_weight})")
 
     start_cells: list[tuple[int, int]] | None = None
     if args.reset_mode == "start_subset" and args.start_subset.strip():
@@ -1315,7 +1317,7 @@ def main(args):
                         refreshed = struct_module.maybe_refresh(total_steps, env, encoder, rssm, actor, device, args.bit_depth)
                         if refreshed:
                             tq = struct_module.teacher_quality
-                            print(f"    [struct refresh] coverage={tq.get("coverage",0):.2f} giant={tq.get("giant_component_fraction",0):.2f} geo_vs_replay={tq.get("geo_vs_replay",{}).get("spearman",0):.3f}")
+                            print(f"    [struct refresh] coverage={tq.get('coverage', 0):.2f} giant={tq.get('giant_component_fraction', 0):.2f} geo_vs_replay={tq.get('geo_vs_replay', {}).get('spearman', 0):.3f}")
                     except Exception as e:
                         print(f"    [struct refresh failed] {e}")
                 encoder.train(); decoder.train(); rssm.train()
@@ -1325,8 +1327,10 @@ def main(args):
                 sum_rec = sum_kld = sum_rew = sum_cont = sum_model = 0.0
                 sum_actor = sum_value = sum_imag_r = 0.0
                 sum_vicreg = sum_straight = sum_coverage = 0.0
+                sum_struct = sum_ngu = 0.0
                 vicreg_info_accum: dict[str, float] = {}
                 straight_info_accum: dict[str, float] = {}
+                struct_stats_accum: dict[str, float] = {}
 
                 for _ in range(args.train_steps):
                     batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
