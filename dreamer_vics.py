@@ -635,7 +635,6 @@ class TeacherStructModule:
         self.mode_hist = {}
         self.teacher_quality = {}
 
-    @torch.no_grad()
     def maybe_refresh(self, total_steps, env, encoder, rssm, actor, device, bit_depth):
         if total_steps - self.last_update_step < self.args.struct_update_interval:
             return False
@@ -687,10 +686,11 @@ class TeacherStructModule:
             lr=self.args.struct_geo_lr, epochs=self.args.struct_temp_head_epochs, batch_size=self.args.struct_temp_head_batch_size,
             seq_len=self.args.struct_temp_seq_len, device=self.device, seed=self.args.seed + int(total_steps) + 7,
         )
-        h_t = torch.tensor(data["h"][graph["node_indices"]], dtype=torch.float32, device=self.device)
-        s_t = torch.tensor(data["s"][graph["node_indices"]], dtype=torch.float32, device=self.device)
-        self.node_replay = self.replay_head(h_t, s_t).detach().cpu().numpy().astype(np.float32)
-        self.node_temp = self.temporal_head(h_t, s_t).detach().cpu().numpy().astype(np.float32)
+        with torch.no_grad():
+            h_t = torch.tensor(data["h"][graph["node_indices"]], dtype=torch.float32, device=self.device)
+            s_t = torch.tensor(data["s"][graph["node_indices"]], dtype=torch.float32, device=self.device)
+            self.node_replay = self.replay_head(h_t, s_t).detach().cpu().numpy().astype(np.float32)
+            self.node_temp = self.temporal_head(h_t, s_t).detach().cpu().numpy().astype(np.float32)
         conf = graph["node_conf"].copy().astype(np.float32)
         if conf.max() > 0:
             conf = conf / max(conf.max(), 1e-6)
@@ -1461,17 +1461,22 @@ def main(args):
                     cov_bonus = None
                     if use_coverage or use_struct:
                         with torch.no_grad():
+                            buf_len = (
+                                min(len(z_imag_flat), args.coverage_memory_size)
+                                if coverage_memory is None
+                                else coverage_memory.shape[0]
+                            )
                             if coverage_memory is None:
-                                coverage_memory = z_imag_flat[:args.coverage_memory_size].detach().clone()
-                                coverage_ptr = min(len(z_imag_flat), args.coverage_memory_size)
+                                coverage_memory = z_imag_flat[:buf_len].detach().clone()
+                                coverage_ptr = buf_len
                             cov_bonus = latent_coverage_bonus(
                                 z_imag_flat.detach(), coverage_memory, k=args.coverage_knn_k
                             ).reshape(rewards_imag.shape)
                             cov_bonus = cov_bonus / (cov_bonus.std().clamp(min=1e-4))
-                            n_new = min(len(z_imag_flat), args.coverage_memory_size)
+                            n_new = min(len(z_imag_flat), buf_len)
                             new_states = z_imag_flat.detach()[:n_new]
                             for i in range(n_new):
-                                coverage_memory[coverage_ptr % args.coverage_memory_size] = new_states[i]
+                                coverage_memory[coverage_ptr % buf_len] = new_states[i]
                                 coverage_ptr += 1
                     if use_struct and struct_module is not None and struct_module.ready:
                         struct_bonus, struct_stats = struct_module.intrinsic_reward_for_imagination(h_imag, s_imag)
