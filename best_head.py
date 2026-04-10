@@ -222,8 +222,10 @@ def evaluate_best_bundle(args: argparse.Namespace, ckpt_path: str) -> dict[str, 
     # Also compute the exact same direct correlation metric used during training.
     obs_arr = teacher_data.obs
     pos_arr = teacher_data.pos
+    replay_dist = replay_graph.dist_mat
+
     direct_replay = compute_geo_head_correlation(
-        encoder, rssm, geo_head, obs_arr, pos_arr, replay_graph.dist, geodesic,
+        encoder, rssm, geo_head, obs_arr, pos_arr, replay_dist, geodesic,
         prefix="best_geo_head_replay", device=device, bit_depth=args.bit_depth, n_pairs=args.geo_eval_pairs,
     )
     direct_oracle = compute_geo_head_correlation(
