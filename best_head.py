@@ -17,7 +17,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from dreamer_vics import PointMazeLargeDreamerWrapper
-from dreamer_vics_replay import compute_geo_head_correlation
+from dreamer_kstep_replay import compute_geo_head_correlation
 from geom_head import GeoEncoder
 from models import ConvEncoder, RSSM
 from utils import get_device, set_seed
