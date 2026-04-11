@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -212,30 +214,6 @@ def uniformity_loss(g: torch.Tensor) -> torch.Tensor:
 def rssm_latent(h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """Concatenate deterministic and stochastic Dreamer state into one latent."""
     return torch.cat([h, s], dim=-1)
-
-
-def latent_coverage_bonus(
-    z_current: torch.Tensor,
-    z_memory: torch.Tensor,
-    k: int = 5,
-) -> torch.Tensor:
-    """Intrinsic reward: distance to k-th nearest neighbor in latent memory.
-
-    z_current: [B, D] — current step embeddings
-    z_memory:  [M, D] — memory bank of past embeddings
-
-    Returns: [B] intrinsic reward (higher = more novel region).
-    """
-    # Pairwise distances
-    dists = torch.cdist(z_current, z_memory)  # [B, M]
-    k_actual = min(k, dists.shape[1] - 1)
-    if k_actual < 1:
-        return torch.zeros(z_current.shape[0], device=z_current.device)
-
-    # k-th nearest neighbor distance
-    knn_dists, _ = torch.topk(dists, k_actual + 1, dim=1, largest=False)
-    bonus = knn_dists[:, -1]  # k-th distance (skip self if self is in memory)
-    return bonus
 
 
 # =====================================================================
@@ -477,6 +455,80 @@ def _bridge_crossing_count(geodesic, pos_seq):
 
 
 # =====================================================================
+# Intrinsic reward helpers (mirrored from evaluator)
+# =====================================================================
+
+
+INTRINSIC_PRESETS: dict[str, tuple[float, float, float]] = {
+    "baseline": (0.0, 0.0, 0.0),
+    "f_only": (1.0, 0.0, 0.0),
+    "f_d": (1.0, 0.15, 0.0),
+    "f_d_b": (1.0, 0.15, 0.05),
+}
+
+
+def _online_disagreement_step(
+    ep_z: list[np.ndarray],
+    episodic_g: list[np.ndarray],
+    z_np: np.ndarray,
+    g_t: np.ndarray,
+    ema_scale: float,
+    max_landmarks: int = 4,
+) -> tuple[float, float]:
+    """Mean |d_geo - s * d_raw| to a few prior landmarks; EMA scale s matches raw vs geo distances."""
+    if len(ep_z) < 1:
+        return 0.0, ema_scale
+    n_prev = len(ep_z)
+    n_lm = max(1, min(int(max_landmarks), n_prev))
+    idx = np.unique(np.linspace(0, n_prev - 1, num=n_lm, dtype=int))
+    drs: list[float] = []
+    dgs: list[float] = []
+    for j in idx.tolist():
+        dr = float(np.linalg.norm(z_np - ep_z[int(j)]))
+        dg = float(np.linalg.norm(g_t - episodic_g[int(j)]))
+        drs.append(dr)
+        dgs.append(dg)
+    ratios = [dgs[i] / (drs[i] + 1e-6) for i in range(len(drs)) if drs[i] > 1e-6]
+    if ratios:
+        ema_scale = 0.92 * ema_scale + 0.08 * float(np.mean(ratios))
+    Dv = float(np.mean([abs(dgs[i] - ema_scale * drs[i]) for i in range(len(drs))]))
+    return Dv, ema_scale
+
+
+class _EMANormalizer:
+    """Running EMA mean/std normalizer for a scalar signal."""
+
+    def __init__(self, alpha: float = 0.01):
+        self._alpha = alpha
+        self._mean = 0.0
+        self._var = 1.0
+        self._count = 0
+
+    def normalize(self, x: float) -> float:
+        self._count += 1
+        if self._count == 1:
+            self._mean = x
+            self._var = 1.0
+            return 0.0
+        self._mean = (1 - self._alpha) * self._mean + self._alpha * x
+        self._var = (1 - self._alpha) * self._var + self._alpha * (x - self._mean) ** 2
+        std = max(math.sqrt(self._var), 1e-6)
+        return (x - self._mean) / std
+
+
+def _oracle_bridge_edges(geodesic) -> set[tuple[int, int]]:
+    """Precompute bridge edges for the maze graph (oracle topology)."""
+    from maze_geometry_test import _adj_from_distmat, _find_bridges
+    adj = _adj_from_distmat(geodesic.dist_matrix)
+    bridges = _find_bridges(adj)
+    edge_set: set[tuple[int, int]] = set()
+    for u, v in bridges:
+        a, b = (int(u), int(v)) if int(u) < int(v) else (int(v), int(u))
+        edge_set.add((a, b))
+    return edge_set
+
+
+# =====================================================================
 # Periodic evaluation
 # =====================================================================
 
@@ -601,21 +653,8 @@ def build_parser():
 
     # Geometric regularization
     p.add_argument("--geo_mode", type=str, default="baseline",
-                   choices=["baseline", "vicreg", "straight", "georeg", "georeg_cov", "kstep"],
-                   help="baseline | vicreg | straight | georeg (both) | georeg_cov (both + coverage) | kstep (InfoNCE reachability)")
-    p.add_argument("--vicreg_weight", type=float, default=0.1,
-                   help="Weight of VICReg loss added to world model loss")
-    p.add_argument("--vicreg_var_w", type=float, default=25.0)
-    p.add_argument("--vicreg_inv_w", type=float, default=25.0)
-    p.add_argument("--vicreg_cov_w", type=float, default=1.0)
-    p.add_argument("--vicreg_target_std", type=float, default=1.0)
-    p.add_argument("--straight_weight", type=float, default=0.5,
-                   help="Weight of straightness loss added to world model loss")
-    p.add_argument("--coverage_weight", type=float, default=0.01,
-                   help="Weight of latent coverage intrinsic reward")
-    p.add_argument("--coverage_memory_size", type=int, default=4096)
-    p.add_argument("--coverage_knn_k", type=int, default=5)
-
+                   choices=["baseline", "kstep"],
+                   help="baseline | kstep (InfoNCE reachability)")
     p.add_argument("--kstep_weight", type=float, default=0.1,
                    help="Weight of k-step InfoNCE on GeoHead (separate optimizer)")
     p.add_argument("--kstep_max_k", type=int, default=5,
@@ -633,9 +672,28 @@ def build_parser():
     p.add_argument("--geo_dim", type=int, default=32, help="GeoHead output dimension")
     p.add_argument("--geo_bank_size", type=int, default=16384,
                    help="Memory bank size for k-step negatives")
-    p.add_argument("--geo_intrinsic_weight", type=float, default=0.01,
-                   help="Intrinsic reward scale from min distance to geo bank")
     p.add_argument("--geo_lr", type=float, default=3e-4, help="GeoHead AdamW learning rate")
+
+    # Intrinsic reward during training
+    p.add_argument("--intrinsic_ablation", type=str, default="baseline",
+                   choices=["baseline", "f_only", "f_d", "f_d_b"],
+                   help="Intrinsic reward preset: baseline (none), "
+                   "f_only (frontier only), f_d (frontier+disagreement), "
+                   "f_d_b (frontier+disagreement+bridge)")
+    p.add_argument("--int_lambda_f", type=float, default=1.0,
+                   help="Weight on frontier novelty F (overridden by preset)")
+    p.add_argument("--int_lambda_d", type=float, default=0.15,
+                   help="Weight on raw-vs-geo disagreement D (overridden by preset)")
+    p.add_argument("--int_lambda_b", type=float, default=0.05,
+                   help="Weight on bridge crossing B (overridden by preset)")
+    p.add_argument("--intrinsic_scale", type=float, default=0.05,
+                   help="Global scale beta: r_store = r_ext + beta * r_int")
+    p.add_argument("--intrinsic_decay_on_success", type=float, default=0.25,
+                   help="Multiply intrinsic_scale by this factor after first goal success "
+                   "(0 = kill intrinsic entirely; 1 = no decay)")
+    p.add_argument("--intrinsic_normalize", action="store_true",
+                   help="EMA-normalize F and D before mixing (makes lambda ratios "
+                   "reflect effective weight regardless of raw magnitude)")
 
     # Diagnostics
     p.add_argument("--diag_interval", type=int, default=40,
@@ -660,12 +718,19 @@ def main(args):
     set_seed(args.seed)
     device = get_device()
 
-    use_coverage = args.geo_mode == "georeg_cov"
     use_kstep = args.geo_mode == "kstep"
 
+    use_intrinsic = args.intrinsic_ablation != "baseline"
+    int_lf, int_ld, int_lb = INTRINSIC_PRESETS[args.intrinsic_ablation]
+    intrinsic_beta = float(args.intrinsic_scale) if use_intrinsic else 0.0
+
     print(f"Device: {device} Geo mode: {args.geo_mode}")
-    print(f"  Coverage bonus: {use_coverage} (weight={args.coverage_weight})")
     print(f"  K-step InfoNCE: {use_kstep} (weight={args.kstep_weight})")
+    if use_intrinsic:
+        print(f"  Intrinsic: {args.intrinsic_ablation}  λ_f={int_lf} λ_d={int_ld} λ_b={int_lb}  β={intrinsic_beta}")
+        print(f"  Intrinsic decay_on_success={args.intrinsic_decay_on_success}  normalize={args.intrinsic_normalize}")
+        if int_ld > 0 and not use_kstep:
+            print("  WARNING: intrinsic D requires geo_mode=kstep (geo_head). D will be 0.")
     if use_kstep:
         print(
             f"  K-step: GeoHead (dim={args.geo_dim}) + bank={args.geo_bank_size}, "
@@ -764,14 +829,21 @@ def main(args):
     out_dir = os.path.join(args.log_dir, tag)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Coverage memory bank (for georeg_cov mode)
-    coverage_memory: torch.Tensor | None = None
-    coverage_ptr = 0
-
     # Observation + position buffers for geodesic correlation eval
     obs_geo_buffer: list[np.ndarray] = []
     pos_geo_buffer: list[np.ndarray] = []
     GEO_BUFFER_MAX = 8000
+
+    int_visit_count: dict[int, int] = defaultdict(int)
+    int_bridge_edges: set[tuple[int, int]] = set()
+    if use_intrinsic and int_lb > 0:
+        int_bridge_edges = _oracle_bridge_edges(geodesic)
+        print(f"  Bridge topology: {len(int_bridge_edges)} bridge edges (oracle, edge-crossing only)")
+    int_norm_F: _EMANormalizer | None = None
+    int_norm_D: _EMANormalizer | None = None
+    if use_intrinsic and args.intrinsic_normalize:
+        int_norm_F = _EMANormalizer(alpha=0.01)
+        int_norm_D = _EMANormalizer(alpha=0.01)
 
     total_steps = 0
     expl_amount = args.expl_amount
@@ -810,6 +882,12 @@ def main(args):
             e0 = encoder(obs_t)
             h_state, s_state = rssm.get_init_state(e0)
 
+        ep_z_int: list[np.ndarray] = []
+        ep_g_int: list[np.ndarray] = []
+        ep_used_bridge_edges: set[tuple[int, int]] = set()
+        ep_ema_scale = 1.0
+        ep_sum_int = ep_sum_F = ep_sum_D = ep_sum_B = 0.0
+
         while not done:
             encoder.eval(); rssm.eval(); actor.eval()
             with torch.no_grad():
@@ -819,20 +897,65 @@ def main(args):
                     action_t = torch.clamp(action_t, -1.0, 1.0)
                 action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
 
+            # --- Intrinsic: F (frontier) and D (disagreement) before env step ---
+            Fv = Dv = 0.0
+            if use_intrinsic and total_steps >= args.kstep_min_steps:
+                cell_pre = int(_positions_to_cell_indices(
+                    geodesic, env.agent_pos.reshape(1, -1))[0])
+                vc = int_visit_count[cell_pre]
+                Fv = 1.0 / math.sqrt(vc + 1.0)
+                int_visit_count[cell_pre] = vc + 1
+
+                # D is gated: only active after geo head has trained past kstep_min_steps,
+                # then ramps in over 10k steps to avoid noisy random-head disagreement.
+                geo_ready = (
+                    int_ld > 0
+                    and geo_head is not None
+                    #and total_steps >= args.kstep_min_steps
+                )
+                if geo_ready:
+                    with torch.no_grad():
+                        h_np = h_state.squeeze(0).cpu().numpy().astype(np.float32)
+                        s_np = s_state.squeeze(0).cpu().numpy().astype(np.float32)
+                        z_np = np.concatenate([h_np, s_np], axis=-1)
+                        g_t = geo_head(h_state, s_state).squeeze(0).cpu().numpy().astype(np.float32)
+                        if len(ep_z_int) >= 1:
+                            Dv, ep_ema_scale = _online_disagreement_step(
+                                ep_z_int, ep_g_int, z_np, g_t, ep_ema_scale)
+                        ep_z_int.append(z_np.copy())
+                        ep_g_int.append(g_t.copy())
+                    ramp_denom = 10_000.0
+                    d_ramp = min(1.0, (total_steps - args.kstep_min_steps) / ramp_denom)
+                    Dv *= d_ramp
+
             next_obs, r, term, trunc, step_info = env.step(action, repeat=action_repeat)
             done = bool(term or trunc)
-            r_store = float(r)
-            if (
-                use_kstep
-                and geo_head is not None
-                and bank is not None
-                and args.geo_intrinsic_weight > 0.0
-            ):
-                with torch.no_grad():
-                    g_cur = geo_head(h_state, s_state)
-                    bank_sample = bank[torch.randperm(bank.size(0), device=device)[:1024]]
-                    novelty = torch.cdist(g_cur, bank_sample).min(dim=-1).values.item()
-                    r_store += args.geo_intrinsic_weight * min(float(novelty), 2.0)
+
+            # --- Intrinsic: B (bridge edge crossing) after env step ---
+            Bv = 0.0
+            if use_intrinsic and int_lb > 0:
+                cell_post = int(_positions_to_cell_indices(
+                    geodesic, env.agent_pos.reshape(1, -1))[0])
+                if cell_pre != cell_post:
+                    edge = (min(cell_pre, cell_post), max(cell_pre, cell_post))
+                    if edge in int_bridge_edges and edge not in ep_used_bridge_edges:
+                        Bv = 1.0
+                        ep_used_bridge_edges.add(edge)
+
+            # Optional EMA normalization before mixing
+            Fv_mix, Dv_mix = Fv, Dv
+            if int_norm_F is not None and Fv != 0.0:
+                Fv_mix = max(0.0, int_norm_F.normalize(Fv))
+            if int_norm_D is not None and Dv != 0.0:
+                Dv_mix = max(0.0, int_norm_D.normalize(Dv))
+
+            r_int = int_lf * Fv_mix + int_ld * Dv_mix + int_lb * Bv
+            r_store = float(r) + intrinsic_beta * r_int
+            ep_sum_int += r_int
+            ep_sum_F += Fv
+            ep_sum_D += Dv
+            ep_sum_B += Bv
+
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=action,
@@ -873,7 +996,7 @@ def main(args):
 
                 sum_rec = sum_kld = sum_rew = sum_cont = sum_model = 0.0
                 sum_actor = sum_value = sum_imag_r = 0.0
-                sum_coverage = sum_kstep = 0.0
+                sum_kstep = 0.0
                 sum_kstep_unif = sum_geo_total = 0.0
                 sum_kstep_kmax = 0.0
                 kstep_info_accum: dict[str, float] = {}
@@ -1017,32 +1140,8 @@ def main(args):
                         pcont_imag = torch.sigmoid(cont_logits_imag).clamp(0.0, 1.0)
                         discounts_imag = effective_gamma * pcont_imag
 
-                    # ---- Coverage intrinsic reward ----
-                    if use_coverage:
-                        with torch.no_grad():
-                            # Dreamer state latents for coverage bonus
-                            z_imag_flat = rssm_latent(h_imag[:, 1:].reshape(-1, Dh),
-                                                      s_imag[:, 1:].reshape(-1, Ds))
-                            if coverage_memory is None:
-                                coverage_memory = z_imag_flat[:args.coverage_memory_size].clone()
-                                coverage_ptr = min(len(z_imag_flat), args.coverage_memory_size)
-                            cov_bonus = latent_coverage_bonus(
-                                z_imag_flat, coverage_memory, k=args.coverage_knn_k
-                            ).reshape(rewards_imag.shape)
-                            # Normalize to comparable scale with extrinsic reward
-                            cov_bonus = cov_bonus / (cov_bonus.std().clamp(min=1e-4))
-                            # Update memory with recent states
-                            n_new = min(len(z_imag_flat), args.coverage_memory_size)
-                            new_states = z_imag_flat[:n_new]
-                            for i in range(n_new):
-                                coverage_memory[coverage_ptr % args.coverage_memory_size] = new_states[i]
-                                coverage_ptr += 1
-                        rewards_total = rewards_imag + args.coverage_weight * cov_bonus
-                        sum_coverage += float(cov_bonus.mean().item())
-                    else:
                         rewards_total = rewards_imag
-
-                    sum_imag_r += float(rewards_imag.mean().item())
+                        sum_imag_r += float(rewards_total.mean().item())
 
                     with torch.no_grad():
                         values_tgt = bottle(value_model, h_imag, s_imag)
@@ -1098,8 +1197,6 @@ def main(args):
                     writer.add_scalar("kstep/k_max", sum_kstep_kmax / n_ts, total_steps)
                     for k, v in kstep_info_accum.items():
                         writer.add_scalar(f"loss/{k}", v / n_ts, total_steps)
-                if use_coverage:
-                    writer.add_scalar("loss/coverage_bonus_mean", sum_coverage / n_ts, total_steps)
 
         if args.expl_decay > 0:
             expl_amount = max(args.expl_min, expl_amount - args.expl_decay)
@@ -1109,6 +1206,12 @@ def main(args):
             if first_goal_step is None:
                 first_goal_step = total_steps
                 writer.add_scalar("eval/first_goal_env_step", float(first_goal_step), 0)
+            if use_intrinsic and args.intrinsic_decay_on_success < 1.0:
+                old_beta = intrinsic_beta
+                intrinsic_beta *= args.intrinsic_decay_on_success
+                if abs(old_beta - intrinsic_beta) > 1e-8:
+                    print(f"    [intrinsic decay] β {old_beta:.6f} → {intrinsic_beta:.6f} (success #{cumulative_successes})")
+                writer.add_scalar("intrinsic/beta", intrinsic_beta, total_steps)
 
         writer.add_scalar("train/episode_return", ep_ret, episode)
         writer.add_scalar("episode/return_env_step", ep_ret, total_steps)
@@ -1119,8 +1222,20 @@ def main(args):
             writer.add_scalar("eval/bridge_crossings_episode",
                               float(_bridge_crossing_count(geodesic, np.stack(ep_pos_traj))), episode)
 
+        if use_intrinsic and ep_steps > 0:
+            writer.add_scalar("intrinsic/r_int_mean", ep_sum_int / ep_steps, total_steps)
+            writer.add_scalar("intrinsic/F_mean", ep_sum_F / ep_steps, total_steps)
+            writer.add_scalar("intrinsic/D_mean", ep_sum_D / ep_steps, total_steps)
+            writer.add_scalar("intrinsic/B_mean", ep_sum_B / ep_steps, total_steps)
+            writer.add_scalar("intrinsic/r_store_bonus", intrinsic_beta * ep_sum_int / ep_steps, total_steps)
+            writer.add_scalar("intrinsic/beta", intrinsic_beta, total_steps)
+            writer.add_scalar("intrinsic/D_gated", 1.0 if total_steps >= args.kstep_min_steps else 0.0, total_steps)
+
+        int_str = ""
+        if use_intrinsic and ep_steps > 0:
+            int_str = f"  r_int={ep_sum_int/ep_steps:.4f}(F={ep_sum_F/ep_steps:.3f} D={ep_sum_D/ep_steps:.3f} B={ep_sum_B/ep_steps:.3f})"
         print(f"  Ep {episode+1}/{args.max_episodes}  ret={ep_ret:.2f}  steps={ep_steps}  "
-              f"cells={len(ep_cells)}  total={total_steps}  episode_success={ep_success}")
+              f"cells={len(ep_cells)}  total={total_steps}  success={ep_success}{int_str}")
 
         # ---- h+s latent diagnostics ----
         if args.diag_interval > 0 and (episode + 1) % args.diag_interval == 0:

@@ -1,5 +1,6 @@
 torch>=2.4.0
 numpy>=1.21.0
+scipy>=1.10.0
 
 # Environment & Physics
 gymnasium>=0.29.0
@@ -13,3 +14,4 @@ tensorboard>=2.14.0
 # Utilities
 argparse
 typing-extensions
+matplotlib>=3.7.0
