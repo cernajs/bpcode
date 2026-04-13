@@ -1209,6 +1209,7 @@ def main(args):
             if use_intrinsic and args.intrinsic_decay_on_success < 1.0:
                 old_beta = intrinsic_beta
                 intrinsic_beta *= args.intrinsic_decay_on_success
+                intrinsic_beta = max(0.005, intrinsic_beta)
                 if abs(old_beta - intrinsic_beta) > 1e-8:
                     print(f"    [intrinsic decay] β {old_beta:.6f} → {intrinsic_beta:.6f} (success #{cumulative_successes})")
                 writer.add_scalar("intrinsic/beta", intrinsic_beta, total_steps)
