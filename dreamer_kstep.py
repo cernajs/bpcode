@@ -462,9 +462,27 @@ def _bridge_crossing_count(geodesic, pos_seq):
 INTRINSIC_PRESETS: dict[str, tuple[float, float, float]] = {
     "baseline": (0.0, 0.0, 0.0),
     "f_only": (1.0, 0.0, 0.0),
+    "d_only": (0.0, 0.15, 0.0),
     "f_d": (1.0, 0.15, 0.0),
     "f_d_b": (1.0, 0.15, 0.05),
 }
+
+
+def _trapezoid_auc(xs: list[float], ys: list[float]) -> float:
+    """Area under y(x) with x = env steps (trapezoid rule)."""
+    if len(xs) < 2 or len(xs) != len(ys):
+        return 0.0
+    s = 0.0
+    for i in range(len(xs) - 1):
+        s += (xs[i + 1] - xs[i]) * (ys[i] + ys[i + 1]) * 0.5
+    return float(s)
+
+
+def _first_step_at_least(xs: list[float], ys: list[float], thr: float) -> float | None:
+    for x, y in zip(xs, ys):
+        if y >= thr:
+            return float(x)
+    return None
 
 
 def _online_disagreement_step(
@@ -676,18 +694,19 @@ def build_parser():
 
     # Intrinsic reward during training
     p.add_argument("--intrinsic_ablation", type=str, default="baseline",
-                   choices=["baseline", "f_only", "f_d", "f_d_b"],
-                   help="Intrinsic reward preset: baseline (none), "
-                   "f_only (frontier only), f_d (frontier+disagreement), "
-                   "f_d_b (frontier+disagreement+bridge)")
+                   choices=["baseline", "f_only", "d_only", "f_d", "f_d_b"],
+                   help="Intrinsic preset: baseline (none); f_only (F); d_only (D); "
+                   "f_d (F+D); f_d_b (F+D+bridge). D needs --geo_mode kstep.")
     p.add_argument("--int_lambda_f", type=float, default=1.0,
                    help="Weight on frontier novelty F (overridden by preset)")
     p.add_argument("--int_lambda_d", type=float, default=0.15,
                    help="Weight on raw-vs-geo disagreement D (overridden by preset)")
     p.add_argument("--int_lambda_b", type=float, default=0.05,
                    help="Weight on bridge crossing B (overridden by preset)")
-    p.add_argument("--intrinsic_scale", type=float, default=0.05,
-                   help="Global scale beta: r_store = r_ext + beta * r_int")
+    p.add_argument("--intrinsic_scale", type=float, default=0.25,
+                   help="Global scale beta: r_store = r_ext + beta * r_int (sweep with λs for ~0.01–0.05 r_store_bonus)")
+    p.add_argument("--intrinsic_beta_min", type=float, default=0.01,
+                   help="Floor on beta after intrinsic_decay_on_success (stay above ~0.002 noise floor)")
     p.add_argument("--intrinsic_decay_on_success", type=float, default=0.25,
                    help="Multiply intrinsic_scale by this factor after first goal success "
                    "(0 = kill intrinsic entirely; 1 = no decay)")
@@ -700,6 +719,12 @@ def build_parser():
                    help="Run h+s latent diagnostics every N training episodes")
     p.add_argument("--geo_corr_interval", type=int, default=80,
                    help="Run geodesic correlation eval every N episodes (expensive)")
+    p.add_argument("--summary_unique_cells_thr", type=float, default=12.0,
+                   help="Threshold for summary/first_step_unique_cells_mean")
+    p.add_argument("--summary_bridge_thr", type=float, default=1.0,
+                   help="Threshold for summary/first_step_bridge_crossings_mean")
+    p.add_argument("--summary_success_thr", type=float, default=0.4,
+                   help="Threshold for summary/first_step_success_rate")
 
     p.add_argument("--wm_path", type=str, default="")
     p.add_argument("--log_dir", type=str, default="runs")
@@ -863,6 +888,7 @@ def main(args):
 
     first_goal_step = None
     cumulative_successes = 0
+    eval_snapshots: list[dict[str, float]] = []
     print(f"\n  Training {args.max_episodes} episodes (geo_mode={args.geo_mode})")
 
     for episode in range(args.max_episodes):
@@ -899,20 +925,18 @@ def main(args):
 
             # --- Intrinsic: F (frontier) and D (disagreement) before env step ---
             Fv = Dv = 0.0
-            if use_intrinsic and total_steps >= args.kstep_min_steps:
+            cell_pre = 0
+            if use_intrinsic:
                 cell_pre = int(_positions_to_cell_indices(
                     geodesic, env.agent_pos.reshape(1, -1))[0])
-                vc = int_visit_count[cell_pre]
-                Fv = 1.0 / math.sqrt(vc + 1.0)
-                int_visit_count[cell_pre] = vc + 1
+            if use_intrinsic and total_steps >= args.kstep_min_steps:
+                if int_lf > 0:
+                    vc = int_visit_count[cell_pre]
+                    Fv = 1.0 / math.sqrt(vc + 1.0)
+                    int_visit_count[cell_pre] = vc + 1
 
-                # D is gated: only active after geo head has trained past kstep_min_steps,
-                # then ramps in over 10k steps to avoid noisy random-head disagreement.
-                geo_ready = (
-                    int_ld > 0
-                    and geo_head is not None
-                    #and total_steps >= args.kstep_min_steps
-                )
+                # D: ramps in over 10k steps after kstep_min_steps (noisy head early).
+                geo_ready = int_ld > 0 and geo_head is not None
                 if geo_ready:
                     with torch.no_grad():
                         h_np = h_state.squeeze(0).cpu().numpy().astype(np.float32)
@@ -1209,7 +1233,7 @@ def main(args):
             if use_intrinsic and args.intrinsic_decay_on_success < 1.0:
                 old_beta = intrinsic_beta
                 intrinsic_beta *= args.intrinsic_decay_on_success
-                intrinsic_beta = max(0.005, intrinsic_beta)
+                intrinsic_beta = max(float(args.intrinsic_beta_min), intrinsic_beta)
                 if abs(old_beta - intrinsic_beta) > 1e-8:
                     print(f"    [intrinsic decay] β {old_beta:.6f} → {intrinsic_beta:.6f} (success #{cumulative_successes})")
                 writer.add_scalar("intrinsic/beta", intrinsic_beta, total_steps)
@@ -1287,6 +1311,8 @@ def main(args):
         if args.eval_interval > 0 and (episode + 1) % args.eval_interval == 0:
             ev = run_periodic_eval(env, encoder, rssm, actor, device, args.bit_depth,
                                    args.eval_episodes, geodesic, action_repeat)
+            snap = {"env_step": float(total_steps), **{k: float(v) for k, v in ev.items()}}
+            eval_snapshots.append(snap)
             for k, v in ev.items():
                 writer.add_scalar(f"eval/{k}", v, total_steps)
             print(f"    [eval] ret={ev['return_mean']:.2f}±{ev['return_std']:.2f}  "
@@ -1332,6 +1358,64 @@ def main(args):
         final_ckpt["bank"] = bank.detach().cpu()
         final_ckpt["bank_ptr"] = bank_ptr
     torch.save(final_ckpt, os.path.join(out_dir, "world_model_final.pt"))
+
+    # ---- Run-level summary (AUC / max / first crossing on periodic eval curve) ----
+    if eval_snapshots:
+        xs = [s["env_step"] for s in eval_snapshots]
+        uc = [s["unique_cells_mean"] for s in eval_snapshots]
+        br = [s["bridge_crossings_mean"] for s in eval_snapshots]
+        sr = [s["success_rate"] for s in eval_snapshots]
+        ret_m = [s["return_mean"] for s in eval_snapshots]
+
+        def _log_summary(prefix: str, xss: list[float], y_uc: list[float], y_br: list[float], y_sr: list[float]):
+            gstep = int(xss[-1]) if xss else 0
+            writer.add_scalar(f"{prefix}/auc_unique_cells_mean", _trapezoid_auc(xss, y_uc), gstep)
+            writer.add_scalar(f"{prefix}/auc_bridge_crossings_mean", _trapezoid_auc(xss, y_br), gstep)
+            writer.add_scalar(f"{prefix}/auc_success_rate", _trapezoid_auc(xss, y_sr), gstep)
+            writer.add_scalar(f"{prefix}/max_unique_cells_mean", max(y_uc), gstep)
+            writer.add_scalar(f"{prefix}/max_bridge_crossings_mean", max(y_br), gstep)
+            writer.add_scalar(f"{prefix}/max_success_rate", max(y_sr), gstep)
+            uc1 = _first_step_at_least(xss, y_uc, args.summary_unique_cells_thr)
+            br1 = _first_step_at_least(xss, y_br, args.summary_bridge_thr)
+            sr1 = _first_step_at_least(xss, y_sr, args.summary_success_thr)
+            if uc1 is not None:
+                writer.add_scalar(f"{prefix}/first_step_unique_cells_ge_thr", uc1, gstep)
+            if br1 is not None:
+                writer.add_scalar(f"{prefix}/first_step_bridge_ge_thr", br1, gstep)
+            if sr1 is not None:
+                writer.add_scalar(f"{prefix}/first_step_success_ge_thr", sr1, gstep)
+
+        _log_summary("summary", xs, uc, br, sr)
+
+        k0 = int(args.kstep_min_steps)
+        if k0 > 0:
+            filt = [s for s in eval_snapshots if s["env_step"] >= k0]
+            if len(filt) >= 2:
+                xf = [s["env_step"] for s in filt]
+                _log_summary(
+                    "summary_after_kstep",
+                    xf,
+                    [s["unique_cells_mean"] for s in filt],
+                    [s["bridge_crossings_mean"] for s in filt],
+                    [s["success_rate"] for s in filt],
+                )
+
+        writer.add_scalar("summary/auc_return_mean", _trapezoid_auc(xs, ret_m), int(xs[-1]))
+        writer.add_scalar("summary/max_return_mean", max(ret_m), int(xs[-1]))
+
+        print(
+            "\n  [summary eval] "
+            f"AUC cells={_trapezoid_auc(xs, uc):.0f}  bridges={_trapezoid_auc(xs, br):.0f}  "
+            f"AUC success={_trapezoid_auc(xs, sr):.2f}  "
+            f"max cells={max(uc):.1f}  max bridges={max(br):.1f}  max success={max(sr):.2f}"
+        )
+        uc_x = _first_step_at_least(xs, uc, args.summary_unique_cells_thr)
+        br_x = _first_step_at_least(xs, br, args.summary_bridge_thr)
+        if uc_x is not None or br_x is not None:
+            print(
+                f"  [summary first-cross @ thr] cells>={args.summary_unique_cells_thr}: {uc_x}  "
+                f"bridges>={args.summary_bridge_thr}: {br_x}"
+            )
 
     env.close()
     writer.close()
