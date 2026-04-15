@@ -708,8 +708,8 @@ def build_parser():
     p.add_argument("--intrinsic_beta_min", type=float, default=0.01,
                    help="Floor on beta after intrinsic_decay_on_success (stay above ~0.002 noise floor)")
     p.add_argument("--intrinsic_decay_on_success", type=float, default=0.25,
-                   help="Multiply intrinsic_scale by this factor after first goal success "
-                   "(0 = kill intrinsic entirely; 1 = no decay)")
+                   help="After env steps >= kstep_min_steps: multiply β by this on each goal success "
+                   "(0 = kill intrinsic entirely; 1 = no decay). No decay before kstep_min_steps.")
     p.add_argument("--intrinsic_normalize", action="store_true",
                    help="EMA-normalize F and D before mixing (makes lambda ratios "
                    "reflect effective weight regardless of raw magnitude)")
@@ -753,7 +753,10 @@ def main(args):
     print(f"  K-step InfoNCE: {use_kstep} (weight={args.kstep_weight})")
     if use_intrinsic:
         print(f"  Intrinsic: {args.intrinsic_ablation}  λ_f={int_lf} λ_d={int_ld} λ_b={int_lb}  β={intrinsic_beta}")
-        print(f"  Intrinsic decay_on_success={args.intrinsic_decay_on_success}  normalize={args.intrinsic_normalize}")
+        print(
+            f"  Intrinsic decay_on_success={args.intrinsic_decay_on_success} (only after "
+            f"kstep_min_steps={args.kstep_min_steps})  normalize={args.intrinsic_normalize}"
+        )
         if int_ld > 0 and not use_kstep:
             print("  WARNING: intrinsic D requires geo_mode=kstep (geo_head). D will be 0.")
     if use_kstep:
@@ -1230,7 +1233,11 @@ def main(args):
             if first_goal_step is None:
                 first_goal_step = total_steps
                 writer.add_scalar("eval/first_goal_env_step", float(first_goal_step), 0)
-            if use_intrinsic and args.intrinsic_decay_on_success < 1.0:
+            if (
+                use_intrinsic
+                and args.intrinsic_decay_on_success < 1.0
+                and total_steps >= args.kstep_min_steps
+            ):
                 old_beta = intrinsic_beta
                 intrinsic_beta *= args.intrinsic_decay_on_success
                 intrinsic_beta = max(float(args.intrinsic_beta_min), intrinsic_beta)
