@@ -708,8 +708,8 @@ def build_parser():
     p.add_argument("--intrinsic_beta_min", type=float, default=0.01,
                    help="Floor on beta after intrinsic_decay_on_success (stay above ~0.002 noise floor)")
     p.add_argument("--intrinsic_decay_on_success", type=float, default=0.25,
-                   help="After env steps >= kstep_min_steps: multiply β by this on each goal success "
-                   "(0 = kill intrinsic entirely; 1 = no decay). No decay before kstep_min_steps.")
+                   help="Multiply intrinsic_scale by this factor after first goal success "
+                   "(0 = kill intrinsic entirely; 1 = no decay)")
     p.add_argument("--intrinsic_normalize", action="store_true",
                    help="EMA-normalize F and D before mixing (makes lambda ratios "
                    "reflect effective weight regardless of raw magnitude)")
@@ -743,26 +743,20 @@ def main(args):
     set_seed(args.seed)
     device = get_device()
 
-    use_kstep = args.geo_mode == "kstep"
-
     use_intrinsic = args.intrinsic_ablation != "baseline"
     int_lf, int_ld, int_lb = INTRINSIC_PRESETS[args.intrinsic_ablation]
     intrinsic_beta = float(args.intrinsic_scale) if use_intrinsic else 0.0
+    use_geo_head = (args.geo_mode == "kstep") or (use_intrinsic and int_ld > 0)
 
     print(f"Device: {device} Geo mode: {args.geo_mode}")
-    print(f"  K-step InfoNCE: {use_kstep} (weight={args.kstep_weight})")
+    print(f"  K-step InfoNCE on GeoHead: {use_geo_head} (weight={args.kstep_weight})")
     if use_intrinsic:
         print(f"  Intrinsic: {args.intrinsic_ablation}  λ_f={int_lf} λ_d={int_ld} λ_b={int_lb}  β={intrinsic_beta}")
+        print(f"  Intrinsic decay_on_success={args.intrinsic_decay_on_success}  normalize={args.intrinsic_normalize}")
+    if use_geo_head:
         print(
-            f"  Intrinsic decay_on_success={args.intrinsic_decay_on_success} (only after "
-            f"kstep_min_steps={args.kstep_min_steps})  normalize={args.intrinsic_normalize}"
-        )
-        if int_ld > 0 and not use_kstep:
-            print("  WARNING: intrinsic D requires geo_mode=kstep (geo_head). D will be 0.")
-    if use_kstep:
-        print(
-            f"  K-step: GeoHead (dim={args.geo_dim}) + bank={args.geo_bank_size}, "
-            f"temp={args.kstep_temperature}, separate AdamW; starts after {args.kstep_min_steps} env steps"
+            f"  GeoHead: dim={args.geo_dim}  bank={args.geo_bank_size}, "
+            f"temp={args.kstep_temperature}, separate AdamW; loss starts after {args.kstep_min_steps} env steps"
         )
 
     start_cells: list[tuple[int, int]] | None = None
@@ -822,7 +816,7 @@ def main(args):
     geo_opt = None
     bank: torch.Tensor | None = None
     bank_ptr = 0
-    if use_kstep:
+    if use_geo_head:
         geo_head = GeoHead(args.deter_dim, args.stoch_dim, geo_dim=args.geo_dim).to(device)
         geo_opt = torch.optim.AdamW(geo_head.parameters(), lr=args.geo_lr, weight_decay=1e-5)
         bank = F.normalize(
@@ -932,13 +926,17 @@ def main(args):
             if use_intrinsic:
                 cell_pre = int(_positions_to_cell_indices(
                     geodesic, env.agent_pos.reshape(1, -1))[0])
-            if use_intrinsic and total_steps >= args.kstep_min_steps:
+            intrinsic_needs_geo_delay = geo_head is not None
+            intrinsic_mix_ready = (not intrinsic_needs_geo_delay) or (
+                total_steps >= args.kstep_min_steps
+            )
+            if use_intrinsic and intrinsic_mix_ready:
                 if int_lf > 0:
                     vc = int_visit_count[cell_pre]
                     Fv = 1.0 / math.sqrt(vc + 1.0)
                     int_visit_count[cell_pre] = vc + 1
 
-                # D: ramps in over 10k steps after kstep_min_steps (noisy head early).
+                # D: |d_g - s·d_z| for z=concat(h,s), g=GeoHead(h,s); ramps after kstep_min_steps (untrained head).
                 geo_ready = int_ld > 0 and geo_head is not None
                 if geo_ready:
                     with torch.no_grad():
@@ -1085,8 +1083,7 @@ def main(args):
                     l_geo_total = torch.tensor(0.0, device=device)
                     k_curriculum_kmax = float(args.kstep_max_k)
                     if (
-                        use_kstep
-                        and geo_head is not None
+                        geo_head is not None
                         and geo_opt is not None
                         and bank is not None
                         and total_steps >= args.kstep_min_steps
@@ -1210,14 +1207,14 @@ def main(args):
                 writer.add_scalar("loss/value", sum_value / n_ts, total_steps)
                 writer.add_scalar("imag/reward_mean", sum_imag_r / n_ts, total_steps)
                 writer.add_scalar("train/exploration_noise", expl_amount, total_steps)
-                if use_kstep:
+                if geo_head is not None:
                     writer.add_scalar(
                         "train/kstep_loss_enabled",
                         1.0 if total_steps >= args.kstep_min_steps else 0.0,
                         total_steps,
                     )
 
-                if use_kstep:
+                if geo_head is not None:
                     writer.add_scalar("loss/kstep_nce", sum_kstep / n_ts, total_steps)
                     writer.add_scalar("loss/kstep_unif", sum_kstep_unif / n_ts, total_steps)
                     writer.add_scalar("loss/geo_total", sum_geo_total / n_ts, total_steps)
@@ -1236,7 +1233,7 @@ def main(args):
             if (
                 use_intrinsic
                 and args.intrinsic_decay_on_success < 1.0
-                and total_steps >= args.kstep_min_steps
+                and (geo_head is None or total_steps >= args.kstep_min_steps)
             ):
                 old_beta = intrinsic_beta
                 intrinsic_beta *= args.intrinsic_decay_on_success
@@ -1261,7 +1258,11 @@ def main(args):
             writer.add_scalar("intrinsic/B_mean", ep_sum_B / ep_steps, total_steps)
             writer.add_scalar("intrinsic/r_store_bonus", intrinsic_beta * ep_sum_int / ep_steps, total_steps)
             writer.add_scalar("intrinsic/beta", intrinsic_beta, total_steps)
-            writer.add_scalar("intrinsic/D_gated", 1.0 if total_steps >= args.kstep_min_steps else 0.0, total_steps)
+            writer.add_scalar(
+                "intrinsic/D_gated",
+                1.0 if (geo_head is None or total_steps >= args.kstep_min_steps) else 0.0,
+                total_steps,
+            )
 
         int_str = ""
         if use_intrinsic and ep_steps > 0:
