@@ -459,6 +459,8 @@ def _bridge_crossing_count(geodesic, pos_seq):
 # =====================================================================
 
 
+GEO_HEAD_FREEZE_AFTER_STEPS = 120_000
+
 INTRINSIC_PRESETS: dict[str, tuple[float, float, float]] = {
     "baseline": (0.0, 0.0, 0.0),
     "f_only": (1.0, 0.0, 0.0),
@@ -868,6 +870,7 @@ def main(args):
         int_norm_D = _EMANormalizer(alpha=0.01)
 
     total_steps = 0
+    geo_head_frozen = False
     expl_amount = args.expl_amount
 
     print(f"  Seeding replay with {args.seed_episodes} episodes ...")
@@ -975,7 +978,7 @@ def main(args):
                 Dv_mix = max(0.0, int_norm_D.normalize(Dv))
 
             r_int = int_lf * Fv_mix + int_ld * Dv_mix + int_lb * Bv
-            r_store = float(r) + intrinsic_beta * r_int
+            #r_store = float(r) + intrinsic_beta * r_int
             ep_sum_int += r_int
             ep_sum_F += Fv
             ep_sum_D += Dv
@@ -984,7 +987,7 @@ def main(args):
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=action,
-                reward=r_store,
+                reward=float(r),
                 next_obs=np.ascontiguousarray(next_obs, np.uint8),
                 done=done,
             )
@@ -992,6 +995,15 @@ def main(args):
             ep_ret += float(r)
             ep_steps += 1
             total_steps += 1
+            if (
+                not geo_head_frozen
+                and geo_head is not None
+                and total_steps > GEO_HEAD_FREEZE_AFTER_STEPS
+            ):
+                for p in geo_head.parameters():
+                    p.requires_grad = False
+                geo_head_frozen = True
+                print(f"    [geo_head] frozen (requires_grad=False) at total_steps={total_steps}")
             if step_info.get("success", False) or step_info.get("is_success", False):
                 ep_success = True
 
@@ -1017,7 +1029,10 @@ def main(args):
                 reward_model.train(); cont_model.train()
                 actor.train(); value_model.train()
                 if geo_head is not None:
-                    geo_head.train()
+                    if geo_head_frozen:
+                        geo_head.eval()
+                    else:
+                        geo_head.train()
 
                 sum_rec = sum_kld = sum_rew = sum_cont = sum_model = 0.0
                 sum_actor = sum_value = sum_imag_r = 0.0
@@ -1087,6 +1102,7 @@ def main(args):
                         and geo_opt is not None
                         and bank is not None
                         and total_steps >= args.kstep_min_steps
+                        and not geo_head_frozen
                     ):
                         g_seq = geo_head(h_seq.detach(), s_seq.detach())
                         #k_curriculum_kmax = float(min(args.kstep_max_k + total_steps // 50_000, 16))
@@ -1165,7 +1181,35 @@ def main(args):
                         pcont_imag = torch.sigmoid(cont_logits_imag).clamp(0.0, 1.0)
                         discounts_imag = effective_gamma * pcont_imag
 
-                        rewards_total = rewards_imag
+                        with torch.no_grad():
+                            if geo_head is not None and int_ld > 0:
+                                g_imag = geo_head(h_imag[:,1:], s_imag[:,1:])  # [B, H, D]
+                                z_imag = torch.cat([h_imag[:,1:], s_imag[:,1:]], dim=-1)
+
+                                # compute landmark D for each imagined trajectory independently
+                                B, H, _ = z_imag.shape
+                                r_int_imag = torch.zeros(B, H, device=device)
+                                for b in range(B):
+                                    ep_z = []
+                                    ep_g = []
+                                    ema = 1.0
+                                    for t in range(H):
+                                        z_t = z_imag[b,t].cpu().numpy()
+                                        g_t = g_imag[b,t].cpu().numpy()
+                                        if ep_z:
+                                            Dv, ema = _online_disagreement_step(
+                                                ep_z, ep_g, z_t, g_t, ema, max_landmarks=4
+                                            )
+                                            r_int_imag[b,t] = Dv
+                                        ep_z.append(z_t)
+                                        ep_g.append(g_t)
+
+                                r_int_imag = int_ld * r_int_imag
+                            else:
+                                r_int_imag = torch.zeros_like(rewards_imag)
+
+                        #rewards_total = rewards_imag
+                        rewards_total = rewards_imag + intrinsic_beta * r_int_imag
                         sum_imag_r += float(rewards_total.mean().item())
 
                     with torch.no_grad():
