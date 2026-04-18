@@ -1089,7 +1089,8 @@ def main(args):
                         and total_steps >= args.kstep_min_steps
                     ):
                         g_seq = geo_head(h_seq.detach(), s_seq.detach())
-                        k_curriculum_kmax = float(min(args.kstep_max_k + total_steps // 50_000, 16))
+                        #k_curriculum_kmax = float(min(args.kstep_max_k + total_steps // 50_000, 16))
+                        k_curriculum_kmax = float(args.kstep_max_k)
                         l_nce, kstep_info = kstep_nce_with_bank(
                             g_seq,
                             bank,
