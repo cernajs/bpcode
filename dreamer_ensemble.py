@@ -152,6 +152,31 @@ class GeoDisagreementEnsemble(nn.Module):
         preds = [F.normalize(m(x), dim=-1) for m in self.members]
         return torch.stack(preds, dim=0)
 
+    def bootstrap_training_loss(
+        self,
+        h: torch.Tensor,
+        s: torch.Tensor,
+        a: torch.Tensor,
+        g_tgt: torch.Tensor,
+        *,
+        keep_prob: float,
+    ) -> torch.Tensor:
+        """Per-member MSE to g_tgt on an independent random row mask (bootstrap), then mean over members."""
+        x = torch.cat([h, s, a], dim=-1)
+        n = h.size(0)
+        device = h.device
+        p = float(keep_prob)
+        losses: list[torch.Tensor] = []
+        for m in self.members:
+            pred = F.normalize(m(x), dim=-1)
+            mask = torch.rand(n, device=device) < p
+            if int(mask.sum()) > 0:
+                loss_k = F.mse_loss(pred[mask], g_tgt[mask])
+            else:
+                loss_k = F.mse_loss(pred, g_tgt)
+            losses.append(loss_k)
+        return torch.stack(losses).mean()
+
     @staticmethod
     def disagreement(preds: torch.Tensor) -> torch.Tensor:
         """Return per-sample ensemble variance scalar.
@@ -780,6 +805,12 @@ def build_parser():
                    help="Optional Gaussian noise added to geo targets during ensemble training")
     p.add_argument("--disag_reward_clip", type=float, default=5.0,
                    help="Clip for intrinsic disagreement reward before beta scaling")
+    p.add_argument(
+        "--disag_bootstrap_prob",
+        type=float,
+        default=0.7,
+        help="Per-ensemble-member row mask: train MSE on random fraction ~p of batch rows (bootstrap diversity)",
+    )
 
     # Intrinsic reward during training
     p.add_argument("--intrinsic_ablation", type=str, default="baseline",
@@ -865,7 +896,7 @@ def main(args):
     if use_geo_disagreement:
         print(
             f"  Geo disagreement ensemble: K={args.disag_ensemble_size} hidden={args.disag_hidden_dim} "
-            f"lr={args.disag_lr} clip={args.disag_reward_clip}"
+            f"lr={args.disag_lr} clip={args.disag_reward_clip} bootstrap_p={args.disag_bootstrap_prob}"
         )
 
     start_cells: list[tuple[int, int]] | None = None
@@ -1284,9 +1315,13 @@ def main(args):
                                     dim=-1,
                                 )
                         if h_curr.numel() > 0 and a_curr.numel() > 0:
-                            preds = geo_disag(h_curr, s_curr, a_curr)
-                            target = g_tgt.unsqueeze(0).expand_as(preds)
-                            disag_loss = F.mse_loss(preds, target)
+                            disag_loss = geo_disag.bootstrap_training_loss(
+                                h_curr,
+                                s_curr,
+                                a_curr,
+                                g_tgt,
+                                keep_prob=args.disag_bootstrap_prob,
+                            )
                             geo_disag_opt.zero_grad(set_to_none=True)
                             disag_loss.backward()
                             torch.nn.utils.clip_grad_norm_(geo_disag.parameters(), args.grad_clip)
