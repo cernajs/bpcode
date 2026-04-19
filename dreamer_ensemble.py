@@ -519,6 +519,34 @@ INTRINSIC_PRESETS: dict[str, tuple[float, float, float]] = {
 }
 
 
+def intrinsic_beta_linear_schedule(
+    total_steps: int,
+    *,
+    intrinsic_scale: float,
+    kstep_min_steps: int,
+    explore_period: int,
+    decay_period: int,
+) -> float:
+    """β = 0 until kstep_min_steps, then intrinsic_scale for explore_period env steps, then linear decay to 0.
+
+    k0 = kstep_min_steps. Plateau is [k0, k0 + explore_period); decay is
+    [k0 + explore_period, k0 + explore_period + decay_period].
+    """
+    k0 = int(kstep_min_steps)
+    plateau_end = k0 + int(explore_period)
+    dper = int(max(decay_period, 0))
+    decay_end = plateau_end + dper
+    s = float(intrinsic_scale)
+    if total_steps < k0:
+        return 0.0
+    if total_steps < plateau_end:
+        return s
+    if dper <= 0 or total_steps >= decay_end:
+        return 0.0
+    t = total_steps - plateau_end
+    return s * max(0.0, 1.0 - t / float(dper))
+
+
 def _trapezoid_auc(xs: list[float], ys: list[float]) -> float:
     """Area under y(x) with x = env steps (trapezoid rule)."""
     if len(xs) < 2 or len(xs) != len(ys):
@@ -765,12 +793,19 @@ def build_parser():
     p.add_argument("--int_lambda_b", type=float, default=0.05,
                    help="Weight on bridge crossing B (overridden by preset)")
     p.add_argument("--intrinsic_scale", type=float, default=0.25,
-                   help="Global scale beta: r_store = r_ext + beta * r_int (sweep with λs for ~0.01–0.05 r_store_bonus)")
-    p.add_argument("--intrinsic_beta_min", type=float, default=0.01,
-                   help="Floor on beta after intrinsic_decay_on_success (stay above ~0.002 noise floor)")
-    p.add_argument("--intrinsic_decay_on_success", type=float, default=0.25,
-                   help="Multiply intrinsic_scale by this factor after first goal success "
-                   "(0 = kill intrinsic entirely; 1 = no decay)")
+                   help="Global scale beta: imagination r += beta * r_int (sweep with λs for ~0.01–0.05 r_store_bonus)")
+    p.add_argument(
+        "--explore_period",
+        type=int,
+        default=50_000,
+        help="Env steps after kstep_min_steps to keep beta=intrinsic_scale before linear decay",
+    )
+    p.add_argument(
+        "--decay_period",
+        type=int,
+        default=100_000,
+        help="Env steps to linearly decay beta from intrinsic_scale to 0 (after explore_period)",
+    )
     p.add_argument("--intrinsic_normalize", action="store_true",
                    help="EMA-normalize F and D before mixing (makes lambda ratios "
                    "reflect effective weight regardless of raw magnitude)")
@@ -813,8 +848,15 @@ def main(args):
     print(f"Device: {device} Geo mode: {args.geo_mode}")
     print(f"  K-step InfoNCE on GeoHead: {use_geo_head} (weight={args.kstep_weight})")
     if use_intrinsic:
-        print(f"  Intrinsic: {args.intrinsic_ablation}  λ_f={int_lf} λ_d={int_ld} λ_b={int_lb}  β={intrinsic_beta}")
-        print(f"  Intrinsic decay_on_success={args.intrinsic_decay_on_success}  normalize={args.intrinsic_normalize}")
+        print(
+            f"  Intrinsic: {args.intrinsic_ablation}  λ_f={int_lf} λ_d={int_ld} λ_b={int_lb}  "
+            f"β_scale={args.intrinsic_scale}"
+        )
+        print(
+            f"  Intrinsic β schedule: β=0 until step {args.kstep_min_steps}, then β={args.intrinsic_scale} "
+            f"for {args.explore_period} steps, then linear decay to 0 over {args.decay_period} env steps"
+        )
+        print(f"  Intrinsic normalize={args.intrinsic_normalize}")
     if use_geo_head:
         print(
             f"  GeoHead: dim={args.geo_dim}  bank={args.geo_bank_size}, "
@@ -1065,6 +1107,14 @@ def main(args):
             ep_ret += float(r)
             ep_steps += 1
             total_steps += 1
+            if use_intrinsic:
+                intrinsic_beta = intrinsic_beta_linear_schedule(
+                    total_steps,
+                    intrinsic_scale=args.intrinsic_scale,
+                    kstep_min_steps=args.kstep_min_steps,
+                    explore_period=args.explore_period,
+                    decay_period=args.decay_period,
+                )
             if (
                 not geo_head_frozen
                 and geo_head is not None
@@ -1369,17 +1419,6 @@ def main(args):
             if first_goal_step is None:
                 first_goal_step = total_steps
                 writer.add_scalar("eval/first_goal_env_step", float(first_goal_step), 0)
-            if (
-                use_intrinsic
-                and args.intrinsic_decay_on_success < 1.0
-                and (geo_head is None or total_steps >= args.kstep_min_steps)
-            ):
-                old_beta = intrinsic_beta
-                intrinsic_beta *= args.intrinsic_decay_on_success
-                intrinsic_beta = max(float(args.intrinsic_beta_min), intrinsic_beta)
-                if abs(old_beta - intrinsic_beta) > 1e-8:
-                    print(f"    [intrinsic decay] β {old_beta:.6f} → {intrinsic_beta:.6f} (success #{cumulative_successes})")
-                writer.add_scalar("intrinsic/beta", intrinsic_beta, total_steps)
 
         writer.add_scalar("train/episode_return", ep_ret, episode)
         writer.add_scalar("episode/return_env_step", ep_ret, total_steps)
