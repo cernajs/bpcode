@@ -117,8 +117,9 @@ class GeoHead(nn.Module):
 class GeoDisagreementEnsemble(nn.Module):
     """Ensemble of predictors for next-step geo embedding g_{t+1}.
 
-    Each member predicts the next normalized geo embedding from current Dreamer
-    latent z=[h,s] and action a. Intrinsic reward is the ensemble variance.
+    Each member outputs a raw D-vector (not L2-normalized) so disagreement
+    (variance across members) is not capped by the unit-sphere geometry. Training
+    still uses MSE to ``g_tgt`` from GeoHead (already normalized).
     """
 
     def __init__(
@@ -149,7 +150,7 @@ class GeoDisagreementEnsemble(nn.Module):
 
     def forward(self, h: torch.Tensor, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         x = torch.cat([h, s, a], dim=-1)
-        preds = [F.normalize(m(x), dim=-1) for m in self.members]
+        preds = [m(x) for m in self.members]
         return torch.stack(preds, dim=0)
 
     def bootstrap_training_loss(
@@ -168,7 +169,7 @@ class GeoDisagreementEnsemble(nn.Module):
         p = float(keep_prob)
         losses: list[torch.Tensor] = []
         for m in self.members:
-            pred = F.normalize(m(x), dim=-1)
+            pred = m(x)
             mask = torch.rand(n, device=device) < p
             if int(mask.sum()) > 0:
                 loss_k = F.mse_loss(pred[mask], g_tgt[mask])
