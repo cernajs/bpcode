@@ -535,6 +535,7 @@ def _bridge_crossing_count(geodesic, pos_seq):
 
 
 GEO_HEAD_FREEZE_AFTER_STEPS = 120_000
+GEO_HEAD_EMA_DECAY = 0.995
 
 INTRINSIC_PRESETS: dict[str, tuple[float, float, float]] = {
     "baseline": (0.0, 0.0, 0.0),
@@ -961,6 +962,7 @@ def main(args):
     value_model = ValueModel(args.deter_dim, args.stoch_dim, args.value_hidden_dim).to(device)
 
     geo_head: GeoHead | None = None
+    geo_head_ema: GeoHead | None = None
     geo_opt = None
     bank: torch.Tensor | None = None
     bank_ptr = 0
@@ -977,6 +979,14 @@ def main(args):
                 bank = ckpt["bank"].to(device)
             if "bank_ptr" in ckpt:
                 bank_ptr = int(ckpt["bank_ptr"])
+        geo_head_ema = GeoHead(args.deter_dim, args.stoch_dim, geo_dim=args.geo_dim).to(device)
+        if ckpt is not None and "geo_head_ema" in ckpt:
+            geo_head_ema.load_state_dict(ckpt["geo_head_ema"])
+        else:
+            geo_head_ema.load_state_dict(geo_head.state_dict())
+        for p in geo_head_ema.parameters():
+            p.requires_grad_(False)
+        geo_head_ema.eval()
 
     geo_disag: GeoDisagreementEnsemble | None = None
     geo_disag_opt = None
@@ -1194,6 +1204,8 @@ def main(args):
                         geo_head.eval()
                     else:
                         geo_head.train()
+                if geo_head_ema is not None:
+                    geo_head_ema.eval()
                 if geo_disag is not None:
                     geo_disag.train()
 
@@ -1204,6 +1216,7 @@ def main(args):
                 sum_kstep_kmax = 0.0
                 sum_disag_loss = 0.0
                 sum_disag_reward = 0.0
+                sum_geo_ema_absdiff = 0.0
                 kstep_info_accum: dict[str, float] = {}
 
                 for _ in range(args.train_steps):
@@ -1310,6 +1323,7 @@ def main(args):
 
                     if (
                         geo_head is not None
+                        and geo_head_ema is not None
                         and geo_disag is not None
                         and geo_disag_opt is not None
                         and total_steps >= args.kstep_min_steps
@@ -1318,7 +1332,9 @@ def main(args):
                         s_curr = s_seq[:, :-1].detach().reshape(-1, Ds)
                         a_curr = act_seq[:, 1:T].reshape(-1, act_dim)
                         with torch.no_grad():
-                            g_tgt = geo_head(h_seq[:, 1:].detach(), s_seq[:, 1:].detach()).reshape(-1, args.geo_dim)
+                            g_tgt = geo_head_ema(h_seq[:, 1:].detach(), s_seq[:, 1:].detach()).reshape(
+                                -1, args.geo_dim
+                            )
                             if args.disag_target_noise > 0:
                                 g_tgt = F.normalize(
                                     g_tgt + args.disag_target_noise * torch.randn_like(g_tgt),
@@ -1446,6 +1462,15 @@ def main(args):
                     actor_opt.step()
                     sum_actor += float(actor_loss.item())
 
+                    if geo_head is not None and geo_head_ema is not None:
+                        with torch.no_grad():
+                            g_on = geo_head(h_seq.detach(), s_seq.detach())
+                            g_em = geo_head_ema(h_seq.detach(), s_seq.detach())
+                            sum_geo_ema_absdiff += float((g_on - g_em).abs().mean().item())
+                            beta = 1.0 - GEO_HEAD_EMA_DECAY
+                            for p_ema, p in zip(geo_head_ema.parameters(), geo_head.parameters()):
+                                p_ema.data.mul_(GEO_HEAD_EMA_DECAY).add_(p.data, alpha=beta)
+
                 # ---- TensorBoard logging ----
                 n_ts = float(args.train_steps)
                 writer.add_scalar("loss/reconstruction", sum_rec / n_ts, total_steps)
@@ -1471,6 +1496,12 @@ def main(args):
                     writer.add_scalar("kstep/k_max", sum_kstep_kmax / n_ts, total_steps)
                     for k, v in kstep_info_accum.items():
                         writer.add_scalar(f"loss/{k}", v / n_ts, total_steps)
+                if geo_head_ema is not None:
+                    writer.add_scalar(
+                        "geo_head/mean_abs_online_minus_ema",
+                        sum_geo_ema_absdiff / n_ts,
+                        total_steps,
+                    )
                 if geo_disag is not None:
                     writer.add_scalar("loss/disag_pred", sum_disag_loss / n_ts, total_steps)
                     writer.add_scalar("imag/disag_reward_mean", sum_disag_reward / n_ts, total_steps)
@@ -1589,6 +1620,8 @@ def main(args):
             }
             if geo_head is not None and bank is not None:
                 ckpt_d["geo_head"] = geo_head.state_dict()
+                if geo_head_ema is not None:
+                    ckpt_d["geo_head_ema"] = geo_head_ema.state_dict()
                 ckpt_d["bank"] = bank.detach().cpu()
                 ckpt_d["bank_ptr"] = bank_ptr
             if geo_disag is not None:
@@ -1610,6 +1643,8 @@ def main(args):
     }
     if geo_head is not None and bank is not None:
         final_ckpt["geo_head"] = geo_head.state_dict()
+        if geo_head_ema is not None:
+            final_ckpt["geo_head_ema"] = geo_head_ema.state_dict()
         final_ckpt["bank"] = bank.detach().cpu()
         final_ckpt["bank_ptr"] = bank_ptr
     if geo_disag is not None:
