@@ -811,6 +811,12 @@ def build_parser():
         default=0.7,
         help="Per-ensemble-member row mask: train MSE on random fraction ~p of batch rows (bootstrap diversity)",
     )
+    p.add_argument(
+        "--disag_imag_ema_alpha",
+        type=float,
+        default=0.01,
+        help="EMA alpha for batch mean/std of imag disagreement (0 = off, use raw clamped disag).",
+    )
 
     # Intrinsic reward during training
     p.add_argument("--intrinsic_ablation", type=str, default="baseline",
@@ -896,7 +902,8 @@ def main(args):
     if use_geo_disagreement:
         print(
             f"  Geo disagreement ensemble: K={args.disag_ensemble_size} hidden={args.disag_hidden_dim} "
-            f"lr={args.disag_lr} clip={args.disag_reward_clip} bootstrap_p={args.disag_bootstrap_prob}"
+            f"lr={args.disag_lr} clip={args.disag_reward_clip} bootstrap_p={args.disag_bootstrap_prob} "
+            f"imag_ema_alpha={args.disag_imag_ema_alpha}"
         )
 
     start_cells: list[tuple[int, int]] | None = None
@@ -1025,6 +1032,8 @@ def main(args):
     total_steps = 0
     geo_head_frozen = False
     expl_amount = args.expl_amount
+    disag_imag_ema_mean: float | None = None
+    disag_imag_ema_std: float = 1.0
 
     print(f"  Seeding replay with {args.seed_episodes} episodes ...")
     for _ in range(args.seed_episodes):
@@ -1380,7 +1389,25 @@ def main(args):
                                     a_imag.reshape(-1, act_dim),
                                 )
                                 disag_imag = geo_disag.disagreement(preds_imag).reshape(h_imag.size(0), -1)
-                                r_int_imag = int_ld * torch.clamp(disag_imag, 0.0, float(args.disag_reward_clip))
+                                if float(args.disag_imag_ema_alpha) > 0.0:
+                                    bm = float(disag_imag.mean().detach().item())
+                                    bs = float(
+                                        disag_imag.std(unbiased=False).clamp(min=1e-6).detach().item()
+                                    )
+                                    if disag_imag_ema_mean is None:
+                                        disag_imag_ema_mean = bm
+                                        disag_imag_ema_std = max(bs, 1e-6)
+                                    em_m = disag_imag_ema_mean
+                                    em_s = max(disag_imag_ema_std, 1e-6)
+                                    z = (disag_imag - em_m) / (em_s + 1e-6)
+                                    r_int_imag = int_ld * torch.clamp(z, 0.0, float(args.disag_reward_clip))
+                                    a_ema = float(args.disag_imag_ema_alpha)
+                                    disag_imag_ema_mean = (1.0 - a_ema) * disag_imag_ema_mean + a_ema * bm
+                                    disag_imag_ema_std = (1.0 - a_ema) * disag_imag_ema_std + a_ema * max(bs, 1e-6)
+                                else:
+                                    r_int_imag = int_ld * torch.clamp(
+                                        disag_imag, 0.0, float(args.disag_reward_clip)
+                                    )
                             else:
                                 r_int_imag = torch.zeros_like(rewards_imag)
 
@@ -1445,6 +1472,9 @@ def main(args):
                 if geo_disag is not None:
                     writer.add_scalar("loss/disag_pred", sum_disag_loss / n_ts, total_steps)
                     writer.add_scalar("imag/disag_reward_mean", sum_disag_reward / n_ts, total_steps)
+                    if float(args.disag_imag_ema_alpha) > 0.0 and disag_imag_ema_mean is not None:
+                        writer.add_scalar("imag/disag_ema_mean", disag_imag_ema_mean, total_steps)
+                        writer.add_scalar("imag/disag_ema_std", disag_imag_ema_std, total_steps)
 
         if args.expl_decay > 0:
             expl_amount = max(args.expl_min, expl_amount - args.expl_decay)
