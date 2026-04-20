@@ -120,6 +120,10 @@ class GeoDisagreementEnsemble(nn.Module):
     Each member outputs a raw D-vector (not L2-normalized) so disagreement
     (variance across members) is not capped by the unit-sphere geometry. Training
     still uses MSE to ``g_tgt`` from GeoHead (already normalized).
+
+    Optional **randomized prior functions** (Osband et al., 2018): each member is
+    ``m_k(x) + β·p_k(x)`` where ``p_k`` is a fixed randomly initialized MLP
+    (never trained), preserving cross-member diversity as data grows.
     """
 
     def __init__(
@@ -130,11 +134,16 @@ class GeoDisagreementEnsemble(nn.Module):
         geo_dim: int,
         hidden_dim: int = 256,
         ensemble_size: int = 5,
+        *,
+        prior_scale: float = 0.0,
+        prior_hidden_dim: int | None = None,
     ):
         super().__init__()
         in_dim = h_dim + s_dim + act_dim
         self.ensemble_size = int(ensemble_size)
         self.geo_dim = int(geo_dim)
+        self.register_buffer("prior_scale", torch.tensor(float(prior_scale)))
+        ph = int(prior_hidden_dim) if prior_hidden_dim is not None else int(hidden_dim)
         self.members = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(in_dim, hidden_dim),
@@ -147,11 +156,33 @@ class GeoDisagreementEnsemble(nn.Module):
             )
             for _ in range(self.ensemble_size)
         ])
+        self.priors: nn.ModuleList | None
+        if float(prior_scale) > 0.0:
+            self.priors = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(in_dim, ph),
+                        nn.ELU(),
+                        nn.Linear(ph, geo_dim),
+                    )
+                    for _ in range(self.ensemble_size)
+                ]
+            )
+            for pr in self.priors:
+                for p in pr.parameters():
+                    p.requires_grad_(False)
+        else:
+            self.priors = None
+
+    def _preds_list(self, x: torch.Tensor) -> list[torch.Tensor]:
+        beta = self.prior_scale
+        if self.priors is not None:
+            return [m(x) + beta * pr(x) for m, pr in zip(self.members, self.priors)]
+        return [m(x) for m in self.members]
 
     def forward(self, h: torch.Tensor, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         x = torch.cat([h, s, a], dim=-1)
-        preds = [m(x) for m in self.members]
-        return torch.stack(preds, dim=0)
+        return torch.stack(self._preds_list(x), dim=0)
 
     def bootstrap_training_loss(
         self,
@@ -168,8 +199,7 @@ class GeoDisagreementEnsemble(nn.Module):
         device = h.device
         p = float(keep_prob)
         losses: list[torch.Tensor] = []
-        for m in self.members:
-            pred = m(x)
+        for pred in self._preds_list(x):
             mask = torch.rand(n, device=device) < p
             if int(mask.sum()) > 0:
                 loss_k = F.mse_loss(pred[mask], g_tgt[mask])
@@ -819,6 +849,18 @@ def build_parser():
         default=0.01,
         help="EMA alpha for batch mean/std of imag disagreement (0 = off, use raw clamped disag).",
     )
+    p.add_argument(
+        "--disag_prior_scale",
+        type=float,
+        default=1.0,
+        help="Osband et al. 2018 randomized priors: pred_k = m_k(x)+β·p_k(x) with fixed p_k; 0 disables",
+    )
+    p.add_argument(
+        "--disag_prior_hidden_dim",
+        type=int,
+        default=0,
+        help="Hidden width of each fixed prior MLP; 0 means match --disag_hidden_dim",
+    )
 
     # Intrinsic reward during training
     p.add_argument("--intrinsic_ablation", type=str, default="baseline",
@@ -905,7 +947,8 @@ def main(args):
         print(
             f"  Geo disagreement ensemble: K={args.disag_ensemble_size} hidden={args.disag_hidden_dim} "
             f"lr={args.disag_lr} clip={args.disag_reward_clip} bootstrap_p={args.disag_bootstrap_prob} "
-            f"imag_ema_alpha={args.disag_imag_ema_alpha}"
+            f"imag_ema_alpha={args.disag_imag_ema_alpha} "
+            f"prior_β={args.disag_prior_scale} prior_h={args.disag_prior_hidden_dim or args.disag_hidden_dim}"
         )
 
     start_cells: list[tuple[int, int]] | None = None
@@ -991,6 +1034,7 @@ def main(args):
     geo_disag: GeoDisagreementEnsemble | None = None
     geo_disag_opt = None
     if use_geo_disagreement:
+        prior_h = int(args.disag_prior_hidden_dim) if int(args.disag_prior_hidden_dim) > 0 else None
         geo_disag = GeoDisagreementEnsemble(
             args.deter_dim,
             args.stoch_dim,
@@ -998,10 +1042,17 @@ def main(args):
             args.geo_dim,
             hidden_dim=args.disag_hidden_dim,
             ensemble_size=args.disag_ensemble_size,
+            prior_scale=float(args.disag_prior_scale),
+            prior_hidden_dim=prior_h,
         ).to(device)
-        geo_disag_opt = torch.optim.Adam(geo_disag.parameters(), lr=args.disag_lr, eps=args.adam_eps)
+        geo_disag_trainable = [p for p in geo_disag.parameters() if p.requires_grad]
+        geo_disag_opt = torch.optim.Adam(geo_disag_trainable, lr=args.disag_lr, eps=args.adam_eps)
         if ckpt is not None and "geo_disag" in ckpt:
-            geo_disag.load_state_dict(ckpt["geo_disag"])
+            inc = geo_disag.load_state_dict(ckpt["geo_disag"], strict=False)
+            if inc.missing_keys:
+                print(f"    [geo_disag] checkpoint missing {len(inc.missing_keys)} keys (re-init those modules)")
+            if inc.unexpected_keys:
+                print(f"    [geo_disag] checkpoint unexpected {len(inc.unexpected_keys)} keys (ignored)")
 
     world_params = (
         list(encoder.parameters()) + list(decoder.parameters())
@@ -1350,7 +1401,7 @@ def main(args):
                             )
                             geo_disag_opt.zero_grad(set_to_none=True)
                             disag_loss.backward()
-                            torch.nn.utils.clip_grad_norm_(geo_disag.parameters(), args.grad_clip)
+                            torch.nn.utils.clip_grad_norm_(geo_disag_trainable, args.grad_clip)
                             geo_disag_opt.step()
                         else:
                             disag_loss = torch.tensor(0.0, device=device)
