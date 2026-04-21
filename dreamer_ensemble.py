@@ -1309,6 +1309,8 @@ def main(args):
 
                     h_seq = torch.stack(states, dim=1)
                     s_seq = torch.stack(s_samples, dim=1)
+                    _, _, Dh = h_seq.shape
+                    Ds = s_seq.size(-1)
                     prior_m = torch.stack([p[0] for p in priors], dim=0)
                     prior_s = torch.stack([p[1] for p in priors], dim=0)
                     post_m = torch.stack([p[0] for p in posts], dim=0)
@@ -1449,8 +1451,7 @@ def main(args):
                     sum_disag_loss += float(disag_loss.item())
 
                     # ---- Actor-critic (imagination) ----
-                    B_seq, T_seq, Dh = h_seq.shape
-                    Ds = s_seq.size(-1)
+                    B_seq, T_seq = h_seq.shape[0], h_seq.shape[1]
                     if args.imagination_starts and 0 < args.imagination_starts < T_seq:
                         K = args.imagination_starts
                         t_idx = torch.randint(0, T_seq, (B_seq, K), device=device)
