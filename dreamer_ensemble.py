@@ -1468,8 +1468,10 @@ def main(args):
                                     em_m = disag_imag_ema_mean
                                     em_s = max(disag_imag_ema_std, 1e-6)
                                     #z = (disag_imag - em_m) / (em_s + 1e-6)
-                                    z = (disag_imag - em_m) / max(em_s, 0.05)
-                                    r_int_imag = int_ld * torch.clamp(z, 0.0, float(args.disag_reward_clip))
+                                    #z = (disag_imag - em_m) / max(em_s, 0.05)
+                                    #r_int_imag = int_ld * torch.clamp(z, 0.0, float(args.disag_reward_clip))
+                                    z = torch.clamp(disag_imag - em_m, 0.0)
+                                    r_int_imag = int_ld * torch.clamp(z, 0.0, float(args.disag_reward_clip))    
                                     a_ema = float(args.disag_imag_ema_alpha)
                                     disag_imag_ema_mean = (1.0 - a_ema) * disag_imag_ema_mean + a_ema * bm
                                     disag_imag_ema_std = (1.0 - a_ema) * disag_imag_ema_std + a_ema * max(bs, 1e-6)
