@@ -823,6 +823,12 @@ def build_parser():
                    help="Env steps before applying k-step GeoHead loss (WM trains without it until then)")
     p.add_argument("--kstep_unif_weight", type=float, default=0.5,
                    help="Weight of uniformity loss on GeoHead embeddings")
+    p.add_argument(
+        "--kstep_action_reg_weight",
+        type=float,
+        default=-1.0,
+        help="Weight for local one-action geo smoothness ||g_t-g_t+1||^2; -1 sets 0.1*kstep_weight",
+    )
     p.add_argument("--geo_dim", type=int, default=32, help="GeoHead output dimension")
     p.add_argument("--geo_bank_size", type=int, default=16384,
                    help="Memory bank size for k-step negatives")
@@ -939,10 +945,15 @@ def main(args):
         )
         print(f"  Intrinsic normalize={args.intrinsic_normalize}")
     if use_geo_head:
+        kstep_action_reg_w = (
+            0.1 * args.kstep_weight if float(args.kstep_action_reg_weight) < 0.0 else float(args.kstep_action_reg_weight)
+        )
         print(
             f"  GeoHead: dim={args.geo_dim}  bank={args.geo_bank_size}, "
-            f"temp={args.kstep_temperature}, separate AdamW; loss starts after {args.kstep_min_steps} env steps"
+            f"temp={args.kstep_temperature}, separate AdamW; trains from step 0 "
+            f"(intrinsic D still gated until {args.kstep_min_steps} env steps)"
         )
+        print(f"  Geo local action regularizer: w={kstep_action_reg_w:.4g} on ||g_t-g_t+1||^2")
     if use_geo_disagreement:
         print(
             f"  Geo disagreement ensemble: K={args.disag_ensemble_size} hidden={args.disag_hidden_dim} "
@@ -1264,6 +1275,7 @@ def main(args):
                 sum_actor = sum_value = sum_imag_r = 0.0
                 sum_kstep = 0.0
                 sum_kstep_unif = sum_geo_total = 0.0
+                sum_kstep_action_reg = 0.0
                 sum_kstep_kmax = 0.0
                 sum_disag_loss = 0.0
                 sum_disag_reward = 0.0
@@ -1324,13 +1336,13 @@ def main(args):
 
                     l_kstep = torch.tensor(0.0, device=device)
                     l_kstep_unif = torch.tensor(0.0, device=device)
+                    l_kstep_action_reg = torch.tensor(0.0, device=device)
                     l_geo_total = torch.tensor(0.0, device=device)
                     k_curriculum_kmax = float(args.kstep_max_k)
                     if (
                         geo_head is not None
                         and geo_opt is not None
                         and bank is not None
-                        and total_steps >= args.kstep_min_steps
                         and not geo_head_frozen
                     ):
                         g_seq = geo_head(h_seq.detach(), s_seq.detach())
@@ -1346,13 +1358,30 @@ def main(args):
                             max_anchors=args.kstep_max_anchors,
                         )
                         l_unif = uniformity_loss(g_seq.reshape(-1, args.geo_dim))
+                        if g_seq.size(1) > 1:
+                            # Local temporal smoothness: one-action neighbors should stay close in g-space.
+                            d2 = (g_seq[:, 1:] - g_seq[:, :-1]).pow(2).sum(dim=-1)
+                            valid_pair = (1.0 - done_seq[:, 1:T]).to(dtype=d2.dtype)
+                            denom = float(valid_pair.sum().item())
+                            if denom > 0.0:
+                                l_action_reg = (d2 * valid_pair).sum() / valid_pair.sum().clamp_min(1.0)
+                            else:
+                                l_action_reg = d2.mean()
+                        else:
+                            l_action_reg = torch.tensor(0.0, device=device)
+                        l_kstep_action_reg = l_action_reg
                         ramp_denom = 10_000
-                        if total_steps < args.kstep_min_steps + ramp_denom:
-                            kstep_w = args.kstep_weight * (total_steps - args.kstep_min_steps) / ramp_denom
+                        if total_steps < ramp_denom:
+                            kstep_w = args.kstep_weight * float(total_steps) / float(ramp_denom)
                         else:
                             kstep_w = args.kstep_weight
                         kstep_w = max(0.0, float(kstep_w))
-                        l_geo_total = kstep_w * l_nce + args.kstep_unif_weight * l_unif
+                        action_reg_w = (
+                            0.1 * args.kstep_weight
+                            if float(args.kstep_action_reg_weight) < 0.0
+                            else float(args.kstep_action_reg_weight)
+                        )
+                        l_geo_total = kstep_w * l_nce + args.kstep_unif_weight * l_unif + action_reg_w * l_action_reg
                         geo_opt.zero_grad(set_to_none=True)
                         l_geo_total.backward()
                         torch.nn.utils.clip_grad_norm_(geo_head.parameters(), args.grad_clip)
@@ -1377,7 +1406,6 @@ def main(args):
                         and geo_head_ema is not None
                         and geo_disag is not None
                         and geo_disag_opt is not None
-                        and total_steps >= args.kstep_min_steps
                     ):
                         h_curr = h_seq[:, :-1].detach().reshape(-1, Dh)
                         s_curr = s_seq[:, :-1].detach().reshape(-1, Ds)
@@ -1415,6 +1443,7 @@ def main(args):
                     sum_model += float(model_loss.item())
                     sum_kstep += float(l_kstep.item())
                     sum_kstep_unif += float(l_kstep_unif.item())
+                    sum_kstep_action_reg += float(l_kstep_action_reg.item())
                     sum_geo_total += float(l_geo_total.item())
                     sum_kstep_kmax += k_curriculum_kmax
                     sum_disag_loss += float(disag_loss.item())
@@ -1538,13 +1567,14 @@ def main(args):
                 if geo_head is not None:
                     writer.add_scalar(
                         "train/kstep_loss_enabled",
-                        1.0 if total_steps >= args.kstep_min_steps else 0.0,
+                        1.0 if not geo_head_frozen else 0.0,
                         total_steps,
                     )
 
                 if geo_head is not None:
                     writer.add_scalar("loss/kstep_nce", sum_kstep / n_ts, total_steps)
                     writer.add_scalar("loss/kstep_unif", sum_kstep_unif / n_ts, total_steps)
+                    writer.add_scalar("loss/kstep_action_reg", sum_kstep_action_reg / n_ts, total_steps)
                     writer.add_scalar("loss/geo_total", sum_geo_total / n_ts, total_steps)
                     writer.add_scalar("kstep/k_max", sum_kstep_kmax / n_ts, total_steps)
                     for k, v in kstep_info_accum.items():
