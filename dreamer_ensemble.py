@@ -823,15 +823,15 @@ def build_parser():
                    help="Env steps before applying k-step GeoHead loss (WM trains without it until then)")
     p.add_argument("--kstep_unif_weight", type=float, default=0.5,
                    help="Weight of uniformity loss on GeoHead embeddings")
-    p.add_argument(
-        "--kstep_action_reg_weight",
-        type=float,
-        default=-1.0,
-        help="Weight for local one-action geo smoothness ||g_t-g_t+1||^2; -1 sets 0.1*kstep_weight",
-    )
     p.add_argument("--geo_dim", type=int, default=32, help="GeoHead output dimension")
     p.add_argument("--geo_bank_size", type=int, default=16384,
                    help="Memory bank size for k-step negatives")
+    p.add_argument(
+        "--geo_bank_prefill_batches",
+        type=int,
+        default=256,
+        help="Replay-driven bank prefill batches (random-walk seed data) before k-step contrastive updates",
+    )
     p.add_argument("--geo_lr", type=float, default=3e-4, help="GeoHead AdamW learning rate")
     p.add_argument("--disag_ensemble_size", type=int, default=5,
                    help="Number of ensemble members for Option-A geo disagreement")
@@ -1020,6 +1020,7 @@ def main(args):
     geo_opt = None
     bank: torch.Tensor | None = None
     bank_ptr = 0
+    bank_loaded_from_ckpt = False
     if use_geo_head:
         geo_head = GeoHead(args.deter_dim, args.stoch_dim, geo_dim=args.geo_dim).to(device)
         geo_opt = torch.optim.AdamW(geo_head.parameters(), lr=args.geo_lr, weight_decay=1e-5)
@@ -1031,6 +1032,7 @@ def main(args):
                 geo_head.load_state_dict(ckpt["geo_head"])
             if "bank" in ckpt:
                 bank = ckpt["bank"].to(device)
+                bank_loaded_from_ckpt = True
             if "bank_ptr" in ckpt:
                 bank_ptr = int(ckpt["bank_ptr"])
         geo_head_ema = GeoHead(args.deter_dim, args.stoch_dim, geo_dim=args.geo_dim).to(device)
@@ -1120,6 +1122,48 @@ def main(args):
                        reward=float(r), next_obs=np.ascontiguousarray(next_obs, np.uint8), done=done)
             obs = next_obs
             total_steps += 1
+
+    if (
+        geo_head is not None
+        and bank is not None
+        and not bank_loaded_from_ckpt
+        and replay.size > 3
+        and int(args.geo_bank_prefill_batches) > 0
+    ):
+        print("  Prefilling geo bank from random-walk replay ...")
+        encoder_prev, rssm_prev, geo_prev = encoder.training, rssm.training, geo_head.training
+        encoder.eval(); rssm.eval(); geo_head.eval()
+        filled = 0
+        bs = max(8, min(int(args.batch_size), 256, replay.size - 2))
+        seq_len_prefill = 2
+        with torch.no_grad():
+            for _ in range(int(args.geo_bank_prefill_batches)):
+                if filled >= bank.size(0):
+                    break
+                batch = replay.sample_sequences(bs, seq_len_prefill)
+                obs_seq = torch.tensor(batch.obs, dtype=torch.float32, device=device)
+                act_seq = torch.tensor(batch.actions, dtype=torch.float32, device=device)
+                x = obs_seq.permute(0, 1, 4, 2, 3).contiguous()
+                preprocess_img(x, depth=args.bit_depth)
+                e_t = bottle(encoder, x)
+                h_t, s_t = rssm.get_init_state(e_t[:, 0])
+                h_t = rssm.deterministic_state_fwd(h_t, s_t, act_seq[:, 0])
+                pm, ps = rssm.state_posterior(h_t, e_t[:, 1])
+                s_t = pm
+                g = geo_head(h_t, s_t)
+                n = min(g.size(0), bank.size(0) - filled)
+                bank[filled : filled + n] = g[:n]
+                filled += n
+        if filled < bank.size(0):
+            bank[filled:] = F.normalize(torch.randn_like(bank[filled:]), dim=-1)
+        bank_ptr = 0
+        if encoder_prev:
+            encoder.train()
+        if rssm_prev:
+            rssm.train()
+        if geo_prev and not geo_head_frozen:
+            geo_head.train()
+        print(f"    geo bank prefill: {filled}/{bank.size(0)} from replay, {bank.size(0)-filled} random fallback")
 
     first_goal_step = None
     cumulative_successes = 0
@@ -1338,7 +1382,6 @@ def main(args):
 
                     l_kstep = torch.tensor(0.0, device=device)
                     l_kstep_unif = torch.tensor(0.0, device=device)
-                    l_kstep_action_reg = torch.tensor(0.0, device=device)
                     l_geo_total = torch.tensor(0.0, device=device)
                     k_curriculum_kmax = float(args.kstep_max_k)
                     if (
@@ -1360,30 +1403,13 @@ def main(args):
                             max_anchors=args.kstep_max_anchors,
                         )
                         l_unif = uniformity_loss(g_seq.reshape(-1, args.geo_dim))
-                        if g_seq.size(1) > 1:
-                            # Local temporal smoothness: one-action neighbors should stay close in g-space.
-                            d2 = (g_seq[:, 1:] - g_seq[:, :-1]).pow(2).sum(dim=-1)
-                            valid_pair = (1.0 - done_seq[:, 1:T]).to(dtype=d2.dtype)
-                            denom = float(valid_pair.sum().item())
-                            if denom > 0.0:
-                                l_action_reg = (d2 * valid_pair).sum() / valid_pair.sum().clamp_min(1.0)
-                            else:
-                                l_action_reg = d2.mean()
-                        else:
-                            l_action_reg = torch.tensor(0.0, device=device)
-                        l_kstep_action_reg = l_action_reg
                         ramp_denom = 10_000
                         if total_steps < ramp_denom:
                             kstep_w = args.kstep_weight * float(total_steps) / float(ramp_denom)
                         else:
                             kstep_w = args.kstep_weight
                         kstep_w = max(0.0, float(kstep_w))
-                        action_reg_w = (
-                            0.1 * args.kstep_weight
-                            if float(args.kstep_action_reg_weight) < 0.0
-                            else float(args.kstep_action_reg_weight)
-                        )
-                        l_geo_total = kstep_w * l_nce + args.kstep_unif_weight * l_unif + action_reg_w * l_action_reg
+                        l_geo_total = kstep_w * l_nce + args.kstep_unif_weight * l_unif
                         geo_opt.zero_grad(set_to_none=True)
                         l_geo_total.backward()
                         torch.nn.utils.clip_grad_norm_(geo_head.parameters(), args.grad_clip)
@@ -1445,7 +1471,6 @@ def main(args):
                     sum_model += float(model_loss.item())
                     sum_kstep += float(l_kstep.item())
                     sum_kstep_unif += float(l_kstep_unif.item())
-                    sum_kstep_action_reg += float(l_kstep_action_reg.item())
                     sum_geo_total += float(l_geo_total.item())
                     sum_kstep_kmax += k_curriculum_kmax
                     sum_disag_loss += float(disag_loss.item())
