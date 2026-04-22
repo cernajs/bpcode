@@ -965,15 +965,11 @@ def main(args):
         )
         print(f"  Intrinsic normalize={args.intrinsic_normalize}")
     if use_geo_head:
-        kstep_action_reg_w = (
-            0.1 * args.kstep_weight if float(args.kstep_action_reg_weight) < 0.0 else float(args.kstep_action_reg_weight)
-        )
         print(
             f"  GeoHead: dim={args.geo_dim}  bank={args.geo_bank_size}, "
             f"temp={args.kstep_temperature}, separate AdamW; trains from step 0 "
             f"(intrinsic D still gated until {args.kstep_min_steps} env steps)"
         )
-        print(f"  Geo local action regularizer: w={kstep_action_reg_w:.4g} on ||g_t-g_t+1||^2")
     if use_geo_disagreement:
         print(
             f"  Geo disagreement ensemble: K={args.disag_ensemble_size} hidden={args.disag_hidden_dim} "
