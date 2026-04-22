@@ -130,7 +130,6 @@ class GeoDisagreementEnsemble(nn.Module):
         self,
         h_dim: int,
         s_dim: int,
-        act_dim: int,
         geo_dim: int,
         hidden_dim: int = 256,
         ensemble_size: int = 5,
@@ -139,7 +138,7 @@ class GeoDisagreementEnsemble(nn.Module):
         prior_hidden_dim: int | None = None,
     ):
         super().__init__()
-        in_dim = h_dim + s_dim + act_dim
+        in_dim = h_dim + s_dim
         self.ensemble_size = int(ensemble_size)
         self.geo_dim = int(geo_dim)
         self.register_buffer("prior_scale", torch.tensor(float(prior_scale)))
@@ -180,21 +179,20 @@ class GeoDisagreementEnsemble(nn.Module):
             return [m(x) + beta * pr(x) for m, pr in zip(self.members, self.priors)]
         return [m(x) for m in self.members]
 
-    def forward(self, h: torch.Tensor, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([h, s, a], dim=-1)
+    def forward(self, h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([h, s], dim=-1)
         return torch.stack(self._preds_list(x), dim=0)
 
     def bootstrap_training_loss(
         self,
         h: torch.Tensor,
         s: torch.Tensor,
-        a: torch.Tensor,
         g_tgt: torch.Tensor,
         *,
         keep_prob: float,
     ) -> torch.Tensor:
         """Per-member MSE to g_tgt on an independent random row mask (bootstrap), then mean over members."""
-        x = torch.cat([h, s, a], dim=-1)
+        x = torch.cat([h, s], dim=-1)
         n = h.size(0)
         device = h.device
         p = float(keep_prob)
@@ -233,8 +231,10 @@ def kstep_nce_with_bank(
     temperature: float = 0.07,
     max_anchors: int = 256,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """InfoNCE with memory-bank negatives (reduces false negatives vs batch sampling).
+    """InfoNCE with memory-bank negatives.
 
+    Negatives are mined by similarity to each anchor (hard-negative mining),
+    with random subsampling from a top-similarity pool to reduce false negatives.
     ``g_seq`` should already be L2-normalized per vector (e.g. GeoHead output).
     """
     B, T, D = g_seq.shape
@@ -288,7 +288,27 @@ def kstep_nce_with_bank(
     positives = flat[pos_idx]
 
     n_neg = max(1, int(n_neg))
-    neg_idx = torch.randint(0, bank.size(0), (len(pairs), n_neg), device=g_seq.device)
+    bank_n = int(bank.size(0))
+    n_neg_eff = min(n_neg, bank_n)
+    # Mine hard negatives by maximum cosine similarity to each anchor.
+    # For efficiency, score a candidate subset when bank is very large.
+    cand = min(bank_n, max(n_neg_eff * 8, 2048))
+    if cand < bank_n:
+        cand_idx = torch.randperm(bank_n, device=g_seq.device)[:cand]
+        bank_cand = bank[cand_idx]
+    else:
+        cand_idx = None
+        bank_cand = bank
+    sim = anchors @ bank_cand.T  # [N_pairs, cand]
+    # Middle-ground mining: sample from a moderately hard top-similarity pool.
+    topk_pool = min(cand, max(n_neg_eff * 4, n_neg_eff))
+    _, pool_idx = torch.topk(sim, k=topk_pool, dim=1, largest=True)
+    rand_pick = torch.randint(0, topk_pool, (sim.size(0), n_neg_eff), device=g_seq.device)
+    hard_idx = pool_idx.gather(1, rand_pick)
+    if cand_idx is not None:
+        neg_idx = cand_idx[hard_idx]
+    else:
+        neg_idx = hard_idx
     negatives = bank[neg_idx]
 
     temp = max(float(temperature), 1e-6)
@@ -814,7 +834,7 @@ def build_parser():
     p.add_argument("--kstep_max_k", type=int, default=5,
                    help="Positive window size for k-step reachability")
     p.add_argument("--kstep_negatives", type=int, default=256,
-                   help="Negatives per anchor (sampled from geo memory bank)")
+                   help="Negatives per anchor (hard-mined as farthest samples from geo memory bank)")
     p.add_argument("--kstep_temperature", type=float, default=0.07,
                    help="InfoNCE temperature for k-step reachability")
     p.add_argument("--kstep_max_anchors", type=int, default=256,
@@ -1051,7 +1071,6 @@ def main(args):
         geo_disag = GeoDisagreementEnsemble(
             args.deter_dim,
             args.stoch_dim,
-            act_dim,
             args.geo_dim,
             hidden_dim=args.disag_hidden_dim,
             ensemble_size=args.disag_ensemble_size,
@@ -1219,7 +1238,7 @@ def main(args):
                 geo_ready = int_ld > 0 and geo_head is not None and geo_disag is not None
                 if geo_ready:
                     with torch.no_grad():
-                        preds = geo_disag(h_state, s_state, action_t)
+                        preds = geo_disag(h_state, s_state)
                         Dv = float(geo_disag.disagreement(preds).squeeze(0).item())
                     ramp_denom = 10_000.0
                     d_ramp = min(1.0, (total_steps - args.kstep_min_steps) / ramp_denom)
@@ -1437,7 +1456,6 @@ def main(args):
                     ):
                         h_curr = h_seq[:, :-1].detach().reshape(-1, Dh)
                         s_curr = s_seq[:, :-1].detach().reshape(-1, Ds)
-                        a_curr = act_seq[:, 1:T].reshape(-1, act_dim)
                         with torch.no_grad():
                             g_tgt = geo_head_ema(h_seq[:, 1:].detach(), s_seq[:, 1:].detach()).reshape(
                                 -1, args.geo_dim
@@ -1447,11 +1465,10 @@ def main(args):
                                     g_tgt + args.disag_target_noise * torch.randn_like(g_tgt),
                                     dim=-1,
                                 )
-                        if h_curr.numel() > 0 and a_curr.numel() > 0:
+                        if h_curr.numel() > 0:
                             disag_loss = geo_disag.bootstrap_training_loss(
                                 h_curr,
                                 s_curr,
-                                a_curr,
                                 g_tgt,
                                 keep_prob=args.disag_bootstrap_prob,
                             )
@@ -1509,7 +1526,6 @@ def main(args):
                                 preds_imag = geo_disag(
                                     h_imag[:, :-1].reshape(-1, Dh),
                                     s_imag[:, :-1].reshape(-1, Ds),
-                                    a_imag.reshape(-1, act_dim),
                                 )
                                 disag_imag = geo_disag.disagreement(preds_imag).reshape(h_imag.size(0), -1)
                                 if float(args.disag_imag_ema_alpha) > 0.0:
