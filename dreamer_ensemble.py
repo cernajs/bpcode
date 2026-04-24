@@ -616,12 +616,15 @@ def intrinsic_beta_linear_schedule(
     s = float(intrinsic_scale)
     if total_steps < k0:
         return 0.0
+    return s
+    """
     if total_steps < plateau_end:
         return s
     if dper <= 0 or total_steps >= decay_end:
         return 0.0
     t = total_steps - plateau_end
     return s * max(0.0, 1.0 - t / float(dper))
+    """
 
 
 def _trapezoid_auc(xs: list[float], ys: list[float]) -> float:
