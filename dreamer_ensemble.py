@@ -584,7 +584,7 @@ def _bridge_crossing_count(geodesic, pos_seq):
 # =====================================================================
 
 
-GEO_HEAD_FREEZE_AFTER_STEPS = 120_000
+GEO_HEAD_FREEZE_AFTER_STEPS = float("inf")
 GEO_HEAD_EMA_DECAY = 0.995
 
 INTRINSIC_PRESETS: dict[str, tuple[float, float, float]] = {
