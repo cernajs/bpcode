@@ -672,6 +672,73 @@ def _online_disagreement_step(
     return Dv, ema_scale
 
 
+def _build_kstep_disag_targets_from_seq(
+    h_seq: torch.Tensor,
+    s_seq: torch.Tensor,
+    done_seq: torch.Tensor | None,
+    *,
+    k_min: int,
+    k_max: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Build (h_t, s_t) -> (h_{t+k}, s_{t+k}) pairs with k ~ Uniform(k_min, k_max).
+
+    Targets are sampled from real replay sequences (same sampled batch), with terminal
+    boundaries respected when done_seq is provided.
+    """
+    B, T, Dh = h_seq.shape
+    Ds = int(s_seq.size(-1))
+    device = h_seq.device
+    kmn = max(1, int(k_min))
+    kmx = max(kmn, int(k_max))
+    if T < (kmn + 1):
+        z_h = torch.empty((0, Dh), device=device, dtype=h_seq.dtype)
+        z_s = torch.empty((0, Ds), device=device, dtype=s_seq.dtype)
+        return z_h, z_s, z_h, z_s, {"n_pairs": 0.0, "k_mean": 0.0, "k_min": float(kmn), "k_max": float(kmx)}
+
+    h_src_list: list[torch.Tensor] = []
+    s_src_list: list[torch.Tensor] = []
+    h_tgt_list: list[torch.Tensor] = []
+    s_tgt_list: list[torch.Tensor] = []
+    ks: list[float] = []
+
+    done_np = done_seq.detach().cpu().numpy() if done_seq is not None else None
+    for b in range(B):
+        for t in range(T):
+            max_delta = min(kmx, T - 1 - t)
+            if max_delta < kmn:
+                continue
+            valid_k: list[int] = []
+            for d in range(kmn, max_delta + 1):
+                if done_np is not None and bool(done_np[b, t : t + d].max() > 0.5):
+                    continue
+                valid_k.append(d)
+            if not valid_k:
+                continue
+            k = int(valid_k[np.random.randint(0, len(valid_k))])
+            j = t + k
+            h_src_list.append(h_seq[b, t])
+            s_src_list.append(s_seq[b, t])
+            h_tgt_list.append(h_seq[b, j])
+            s_tgt_list.append(s_seq[b, j])
+            ks.append(float(k))
+
+    if not h_src_list:
+        z_h = torch.empty((0, Dh), device=device, dtype=h_seq.dtype)
+        z_s = torch.empty((0, Ds), device=device, dtype=s_seq.dtype)
+        return z_h, z_s, z_h, z_s, {"n_pairs": 0.0, "k_mean": 0.0, "k_min": float(kmn), "k_max": float(kmx)}
+
+    h_src = torch.stack(h_src_list, dim=0).detach().reshape(-1, Dh)
+    s_src = torch.stack(s_src_list, dim=0).detach().reshape(-1, Ds)
+    h_tgt = torch.stack(h_tgt_list, dim=0).detach().reshape(-1, Dh)
+    s_tgt = torch.stack(s_tgt_list, dim=0).detach().reshape(-1, Ds)
+    return h_src, s_src, h_tgt, s_tgt, {
+        "n_pairs": float(len(ks)),
+        "k_mean": float(np.mean(np.asarray(ks, dtype=np.float32))),
+        "k_min": float(kmn),
+        "k_max": float(kmx),
+    }
+
+
 class _EMANormalizer:
     """Running EMA mean/std normalizer for a scalar signal."""
 
@@ -873,6 +940,25 @@ def build_parser():
         help="Per-ensemble-member row mask: train MSE on random fraction ~p of batch rows (bootstrap diversity)",
     )
     p.add_argument(
+        "--disag_kstep_min_k",
+        type=int,
+        default=5,
+        help="Min k for replay-based multistep disagreement targets g_{t+k}.",
+    )
+    p.add_argument(
+        "--disag_kstep_max_k",
+        type=int,
+        default=0,
+        help="Max k for replay-based multistep disagreement; <=0 uses --kstep_max_k.",
+    )
+    p.add_argument(
+        "--disag_reward_source",
+        type=str,
+        default="one_step",
+        choices=["one_step", "kstep"],
+        help="Which disagreement signal drives intrinsic reward D: one_step (Dv_mix) or kstep (Dv_kstep_mix).",
+    )
+    p.add_argument(
         "--disag_imag_ema_alpha",
         type=float,
         default=0.01,
@@ -1065,6 +1151,8 @@ def main(args):
 
     geo_disag: GeoDisagreementEnsemble | None = None
     geo_disag_opt = None
+    geo_disag_kstep: GeoDisagreementEnsemble | None = None
+    geo_disag_kstep_opt = None
     if use_geo_disagreement:
         prior_h = int(args.disag_prior_hidden_dim) if int(args.disag_prior_hidden_dim) > 0 else None
         geo_disag = GeoDisagreementEnsemble(
@@ -1078,12 +1166,29 @@ def main(args):
         ).to(device)
         geo_disag_trainable = [p for p in geo_disag.parameters() if p.requires_grad]
         geo_disag_opt = torch.optim.Adam(geo_disag_trainable, lr=args.disag_lr, eps=args.adam_eps)
+        geo_disag_kstep = GeoDisagreementEnsemble(
+            args.deter_dim,
+            args.stoch_dim,
+            args.geo_dim,
+            hidden_dim=args.disag_hidden_dim,
+            ensemble_size=args.disag_ensemble_size,
+            prior_scale=float(args.disag_prior_scale),
+            prior_hidden_dim=prior_h,
+        ).to(device)
+        geo_disag_kstep_trainable = [p for p in geo_disag_kstep.parameters() if p.requires_grad]
+        geo_disag_kstep_opt = torch.optim.Adam(geo_disag_kstep_trainable, lr=args.disag_lr, eps=args.adam_eps)
         if ckpt is not None and "geo_disag" in ckpt:
             inc = geo_disag.load_state_dict(ckpt["geo_disag"], strict=False)
             if inc.missing_keys:
                 print(f"    [geo_disag] checkpoint missing {len(inc.missing_keys)} keys (re-init those modules)")
             if inc.unexpected_keys:
                 print(f"    [geo_disag] checkpoint unexpected {len(inc.unexpected_keys)} keys (ignored)")
+        if ckpt is not None and "geo_disag_kstep" in ckpt:
+            inc_k = geo_disag_kstep.load_state_dict(ckpt["geo_disag_kstep"], strict=False)
+            if inc_k.missing_keys:
+                print(f"    [geo_disag_kstep] checkpoint missing {len(inc_k.missing_keys)} keys (re-init those modules)")
+            if inc_k.unexpected_keys:
+                print(f"    [geo_disag_kstep] checkpoint unexpected {len(inc_k.unexpected_keys)} keys (ignored)")
 
     world_params = (
         list(encoder.parameters()) + list(decoder.parameters())
@@ -1118,9 +1223,11 @@ def main(args):
         print(f"  Bridge topology: {len(int_bridge_edges)} bridge edges (oracle, edge-crossing only)")
     int_norm_F: _EMANormalizer | None = None
     int_norm_D: _EMANormalizer | None = None
+    int_norm_D_kstep: _EMANormalizer | None = None
     if use_intrinsic and args.intrinsic_normalize:
         int_norm_F = _EMANormalizer(alpha=0.01)
         int_norm_D = _EMANormalizer(alpha=0.01)
+        int_norm_D_kstep = _EMANormalizer(alpha=0.01)
 
     total_steps = 0
     geo_head_frozen = False
@@ -1206,7 +1313,7 @@ def main(args):
             h_state, s_state = rssm.get_init_state(e0)
 
         ep_used_bridge_edges: set[tuple[int, int]] = set()
-        ep_sum_int = ep_sum_F = ep_sum_D = ep_sum_B = 0.0
+        ep_sum_int = ep_sum_F = ep_sum_D = ep_sum_D_kstep = ep_sum_B = 0.0
 
         while not done:
             encoder.eval(); rssm.eval(); actor.eval()
@@ -1218,7 +1325,7 @@ def main(args):
                 action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
 
             # --- Intrinsic: F (frontier) and D (disagreement) before env step ---
-            Fv = Dv = 0.0
+            Fv = Dv = Dv_kstep = 0.0
             cell_pre = 0
             if use_intrinsic:
                 cell_pre = int(_positions_to_cell_indices(
@@ -1242,6 +1349,14 @@ def main(args):
                     ramp_denom = 10_000.0
                     d_ramp = min(1.0, (total_steps - args.kstep_min_steps) / ramp_denom)
                     Dv *= d_ramp
+                geo_kstep_ready = int_ld > 0 and geo_head is not None and geo_disag_kstep is not None
+                if geo_kstep_ready:
+                    with torch.no_grad():
+                        preds_k = geo_disag_kstep(h_state, s_state)
+                        Dv_kstep = float(geo_disag_kstep.disagreement(preds_k).squeeze(0).item())
+                    ramp_denom = 10_000.0
+                    d_ramp = min(1.0, (total_steps - args.kstep_min_steps) / ramp_denom)
+                    Dv_kstep *= d_ramp
 
             next_obs, r, term, trunc, step_info = env.step(action, repeat=action_repeat)
             done = bool(term or trunc)
@@ -1258,18 +1373,24 @@ def main(args):
                         ep_used_bridge_edges.add(edge)
 
             # Optional EMA normalization before mixing
-            Fv_mix, Dv_mix = Fv, Dv
+            Fv_mix, Dv_mix, Dv_kstep_mix = Fv, Dv, Dv_kstep
             if int_norm_F is not None and Fv != 0.0:
                 Fv_mix = max(0.0, int_norm_F.normalize(Fv))
             if int_norm_D is not None and Dv != 0.0:
                 Dv_mix = max(0.0, int_norm_D.normalize(Dv))
+            if int_norm_D_kstep is not None and Dv_kstep != 0.0:
+                Dv_kstep_mix = max(0.0, int_norm_D_kstep.normalize(Dv_kstep))
 
-            r_int = int_lf * Fv_mix + int_ld * Dv_mix + int_lb * Bv
+            d_for_reward = Dv_kstep_mix if args.disag_reward_source == "kstep" else Dv_mix
+            r_int = int_lf * Fv_mix + int_ld * d_for_reward + int_lb * Bv
             #r_store = float(r) + intrinsic_beta * r_int
             ep_sum_int += r_int
             ep_sum_F += Fv
             ep_sum_D += Dv
+            ep_sum_D_kstep += Dv_kstep
             ep_sum_B += Bv
+
+            writer.add_scalar("intrinsic/component_D_var_ens_kstep_norm", Dv_kstep_mix, total_steps)
 
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
@@ -1332,6 +1453,8 @@ def main(args):
                     geo_head_ema.eval()
                 if geo_disag is not None:
                     geo_disag.train()
+                if geo_disag_kstep is not None:
+                    geo_disag_kstep.train()
 
                 sum_rec = sum_kld = sum_rew = sum_cont = sum_model = 0.0
                 sum_actor = sum_value = sum_imag_r = 0.0
@@ -1340,7 +1463,10 @@ def main(args):
                 sum_kstep_action_reg = 0.0
                 sum_kstep_kmax = 0.0
                 sum_disag_loss = 0.0
+                sum_disag_kstep_loss = 0.0
                 sum_disag_reward = 0.0
+                sum_disag_kstep_pairs = 0.0
+                sum_disag_kstep_kmean = 0.0
                 sum_geo_ema_absdiff = 0.0
                 kstep_info_accum: dict[str, float] = {}
 
@@ -1480,6 +1606,45 @@ def main(args):
                     else:
                         disag_loss = torch.tensor(0.0, device=device)
 
+                    if (
+                        geo_head is not None
+                        and geo_head_ema is not None
+                        and geo_disag_kstep is not None
+                        and geo_disag_kstep_opt is not None
+                    ):
+                        kstep_target_max = int(args.disag_kstep_max_k) if int(args.disag_kstep_max_k) > 0 else int(args.kstep_max_k)
+                        h_curr_k, s_curr_k, h_tgt_k, s_tgt_k, k_meta = _build_kstep_disag_targets_from_seq(
+                            h_seq.detach(),
+                            s_seq.detach(),
+                            done_seq[:, :T].detach(),
+                            k_min=int(args.disag_kstep_min_k),
+                            k_max=kstep_target_max,
+                        )
+                        if h_curr_k.numel() > 0:
+                            with torch.no_grad():
+                                g_tgt_k = geo_head_ema(h_tgt_k, s_tgt_k)
+                                if args.disag_target_noise > 0:
+                                    g_tgt_k = F.normalize(
+                                        g_tgt_k + args.disag_target_noise * torch.randn_like(g_tgt_k),
+                                        dim=-1,
+                                    )
+                            disag_kstep_loss = geo_disag_kstep.bootstrap_training_loss(
+                                h_curr_k,
+                                s_curr_k,
+                                g_tgt_k,
+                                keep_prob=args.disag_bootstrap_prob,
+                            )
+                            geo_disag_kstep_opt.zero_grad(set_to_none=True)
+                            disag_kstep_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(geo_disag_kstep_trainable, args.grad_clip)
+                            geo_disag_kstep_opt.step()
+                        else:
+                            disag_kstep_loss = torch.tensor(0.0, device=device)
+                        sum_disag_kstep_pairs += float(k_meta.get("n_pairs", 0.0))
+                        sum_disag_kstep_kmean += float(k_meta.get("k_mean", 0.0))
+                    else:
+                        disag_kstep_loss = torch.tensor(0.0, device=device)
+
                     sum_rec += float(rec_loss.item())
                     sum_kld += float(kld.item())
                     sum_rew += float(rew_loss.item())
@@ -1490,6 +1655,7 @@ def main(args):
                     sum_geo_total += float(l_geo_total.item())
                     sum_kstep_kmax += k_curriculum_kmax
                     sum_disag_loss += float(disag_loss.item())
+                    sum_disag_kstep_loss += float(disag_kstep_loss.item())
 
                     # ---- Actor-critic (imagination) ----
                     B_seq, T_seq = h_seq.shape[0], h_seq.shape[1]
@@ -1632,6 +1798,10 @@ def main(args):
                     if float(args.disag_imag_ema_alpha) > 0.0 and disag_imag_ema_mean is not None:
                         writer.add_scalar("imag/disag_ema_mean", disag_imag_ema_mean, total_steps)
                         writer.add_scalar("imag/disag_ema_std", disag_imag_ema_std, total_steps)
+                if geo_disag_kstep is not None:
+                    writer.add_scalar("loss/disag_pred_kstep", sum_disag_kstep_loss / n_ts, total_steps)
+                    writer.add_scalar("intrinsic/disag_kstep_pairs", sum_disag_kstep_pairs / n_ts, total_steps)
+                    writer.add_scalar("intrinsic/disag_kstep_kmean", sum_disag_kstep_kmean / n_ts, total_steps)
 
         if args.expl_decay > 0:
             expl_amount = max(args.expl_min, expl_amount - args.expl_decay)
@@ -1655,9 +1825,15 @@ def main(args):
             writer.add_scalar("intrinsic/r_int_mean", ep_sum_int / ep_steps, total_steps)
             writer.add_scalar("intrinsic/F_mean", ep_sum_F / ep_steps, total_steps)
             writer.add_scalar("intrinsic/D_mean", ep_sum_D / ep_steps, total_steps)
+            writer.add_scalar("intrinsic/D_kstep_mean", ep_sum_D_kstep / ep_steps, total_steps)
             writer.add_scalar("intrinsic/B_mean", ep_sum_B / ep_steps, total_steps)
             writer.add_scalar("intrinsic/r_store_bonus", intrinsic_beta * ep_sum_int / ep_steps, total_steps)
             writer.add_scalar("intrinsic/beta", intrinsic_beta, total_steps)
+            writer.add_scalar(
+                "intrinsic/disag_reward_source_is_kstep",
+                1.0 if args.disag_reward_source == "kstep" else 0.0,
+                total_steps,
+            )
             writer.add_scalar(
                 "intrinsic/D_gated",
                 1.0 if (geo_head is None or total_steps >= args.kstep_min_steps) else 0.0,
@@ -1666,7 +1842,11 @@ def main(args):
 
         int_str = ""
         if use_intrinsic and ep_steps > 0:
-            int_str = f"  r_int={ep_sum_int/ep_steps:.4f}(F={ep_sum_F/ep_steps:.3f} D={ep_sum_D/ep_steps:.3f} B={ep_sum_B/ep_steps:.3f})"
+            int_str = (
+                f"  r_int={ep_sum_int/ep_steps:.4f}(F={ep_sum_F/ep_steps:.3f} "
+                f"D={ep_sum_D/ep_steps:.3f} Dk={ep_sum_D_kstep/ep_steps:.3f} B={ep_sum_B/ep_steps:.3f}; "
+                f"Dsrc={args.disag_reward_source})"
+            )
         print(f"  Ep {episode+1}/{args.max_episodes}  ret={ep_ret:.2f}  steps={ep_steps}  "
               f"cells={len(ep_cells)}  total={total_steps}  success={ep_success}{int_str}")
 
@@ -1750,6 +1930,8 @@ def main(args):
                 ckpt_d["bank_ptr"] = bank_ptr
             if geo_disag is not None:
                 ckpt_d["geo_disag"] = geo_disag.state_dict()
+            if geo_disag_kstep is not None:
+                ckpt_d["geo_disag_kstep"] = geo_disag_kstep.state_dict()
             torch.save(ckpt_d, ckpt_path)
 
     # ---- Final save ----
@@ -1773,6 +1955,8 @@ def main(args):
         final_ckpt["bank_ptr"] = bank_ptr
     if geo_disag is not None:
         final_ckpt["geo_disag"] = geo_disag.state_dict()
+    if geo_disag_kstep is not None:
+        final_ckpt["geo_disag_kstep"] = geo_disag_kstep.state_dict()
     torch.save(final_ckpt, os.path.join(out_dir, "world_model_final.pt"))
 
     # ---- Run-level summary (AUC / max / first crossing on periodic eval curve) ----
