@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 import torch
@@ -336,6 +336,118 @@ def uniformity_loss(g: torch.Tensor) -> torch.Tensor:
     return torch.log(torch.exp(-2.0 * d).mean() + 1e-6)
 
 
+def knn_novelty_from_memory(
+    e_t: np.ndarray,
+    memory: list[np.ndarray],
+    *,
+    k: int,
+    clip_min: float,
+    clip_max: float,
+    use_density_count: bool,
+    density_radius: float,
+) -> float:
+    """NGU-style episodic novelty over geometric embedding memory."""
+    if not memory:
+        return float(clip_max)
+    mem = np.asarray(memory, dtype=np.float32)
+    d = np.linalg.norm(mem - e_t.reshape(1, -1), axis=1)
+    if use_density_count:
+        cnt = int(np.sum(d <= max(float(density_radius), 1e-6)))
+        return float(1.0 / math.sqrt(max(cnt, 1)))
+    kk = max(1, min(int(k), len(d)))
+    dk = float(np.partition(d, kk - 1)[kk - 1])
+    lo = float(clip_min)
+    hi = max(float(clip_max), lo + 1e-6)
+    return float(np.clip(dk, lo, hi))
+
+
+@torch.no_grad()
+def refresh_embed_memory_from_replay(
+    *,
+    replay: ReplayBuffer,
+    encoder: ConvEncoder,
+    rssm: RSSM,
+    geo_head_ema: GeoHead,
+    device: torch.device,
+    bit_depth: int,
+    target_size: int,
+    batch_size: int,
+) -> list[np.ndarray]:
+    """Recompute embedding memory from replay with current EMA head."""
+    n_target = max(0, int(target_size))
+    if n_target <= 0 or replay.size < 2:
+        return []
+    out: list[np.ndarray] = []
+    bs = max(8, int(batch_size))
+    while len(out) < n_target:
+        cur_bs = min(bs, n_target - len(out))
+        batch = replay.sample_sequences(cur_bs, 1)
+        obs0 = torch.tensor(batch.obs[:, 0], dtype=torch.float32, device=device).permute(0, 3, 1, 2)
+        preprocess_img(obs0, depth=bit_depth)
+        e0 = encoder(obs0)
+        h0, s0 = rssm.get_init_state(e0)
+        g0 = geo_head_ema(h0, s0).detach().cpu().numpy().astype(np.float32)
+        out.extend([g0[i].copy() for i in range(g0.shape[0])])
+    return out[:n_target]
+
+
+def _graph_frontier_nodes(
+    adj: list[list[int]],
+    visit_count: list[int],
+    node_disag: list[float],
+    *,
+    reliable_min_visits: int,
+    top_quantile: float,
+    disagreement_weight: float,
+) -> list[int]:
+    n = len(adj)
+    if n == 0:
+        return []
+    deg = np.asarray([max(len(a), 1) for a in adj], dtype=np.float32)
+    inv_density = 1.0 / np.sqrt(deg)
+    v = np.asarray(visit_count, dtype=np.float32)
+    reliable = v >= max(1, int(reliable_min_visits))
+    d = np.maximum(np.asarray(node_disag, dtype=np.float32), 0.0)
+    if d.size and np.any(np.isfinite(d)):
+        den = float(np.nanpercentile(d, 95)) + 1e-6
+        d = np.clip(d / den, 0.0, 1.0)
+    raw = (inv_density + float(disagreement_weight) * d) * reliable.astype(np.float32)
+    valid = reliable & np.isfinite(raw)
+    if not np.any(valid):
+        return []
+    q = float(np.clip(top_quantile, 10.0, 99.5))
+    thr = float(np.percentile(raw[valid], q))
+    out = np.where(valid & (raw >= thr))[0].tolist()
+    if not out:
+        out = [int(np.argmax(raw))]
+    return out
+
+
+def _graph_distance_to_frontier(
+    adj: list[list[int]],
+    start_idx: int,
+    frontier_nodes: list[int],
+) -> float:
+    if start_idx < 0 or start_idx >= len(adj) or not frontier_nodes:
+        return float("inf")
+    frontier_set = set(int(x) for x in frontier_nodes)
+    if start_idx in frontier_set:
+        return 0.0
+    q: deque[tuple[int, int]] = deque([(int(start_idx), 0)])
+    seen = {int(start_idx)}
+    while q:
+        u, d = q.popleft()
+        for v in adj[u]:
+            vv = int(v)
+            if vv in seen:
+                continue
+            if vv in frontier_set:
+                return float(d + 1)
+            seen.add(vv)
+            q.append((vv, d + 1))
+    return float("inf")
+
+
 def rssm_latent(h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """Concatenate deterministic and stochastic Dreamer state into one latent."""
     return torch.cat([h, s], dim=-1)
@@ -587,14 +699,13 @@ def _bridge_crossing_count(geodesic, pos_seq):
 GEO_HEAD_FREEZE_AFTER_STEPS = float("inf")
 GEO_HEAD_EMA_DECAY = 0.995
 
-INTRINSIC_PRESETS: dict[str, tuple[float, float, float]] = {
+INTRINSIC_PRESETS = {
     "baseline": (0.0, 0.0, 0.0),
-    "f_only": (1.0, 0.0, 0.0),
-    "d_only": (0.0, 0.15, 0.0),
-    "f_d": (1.0, 0.15, 0.0),
-    "f_d_b": (1.0, 0.15, 0.05),
+    "knn_only": (1.0, 0.0, 0.0),
+    "dvar_only": (0.0, 0.2, 0.0),
+    "knn_dvar": (1.0, 0.2, 0.0),
+    "knn_dvar_frontier": (1.0, 0.2, 0.1),
 }
-
 
 def intrinsic_beta_linear_schedule(
     total_steps: int,
@@ -979,15 +1090,18 @@ def build_parser():
 
     # Intrinsic reward during training
     p.add_argument("--intrinsic_ablation", type=str, default="baseline",
-                   choices=["baseline", "f_only", "d_only", "f_d", "f_d_b"],
-                   help="Intrinsic preset: baseline (none); f_only (F); d_only (D); "
-                   "f_d (F+D); f_d_b (F+D+bridge). D needs --geo_mode kstep.")
+                   choices=["baseline", "knn_only", "dvar_only", "knn_dvar", "knn_dvar_frontier"],
+                   help="Intrinsic preset: baseline; knn_only; dvar_only; knn_dvar; knn_dvar_frontier.")
     p.add_argument("--int_lambda_f", type=float, default=1.0,
                    help="Weight on frontier novelty F (overridden by preset)")
     p.add_argument("--int_lambda_d", type=float, default=0.15,
                    help="Weight on raw-vs-geo disagreement D (overridden by preset)")
-    p.add_argument("--int_lambda_b", type=float, default=0.05,
-                   help="Weight on bridge crossing B (overridden by preset)")
+    p.add_argument("--lambda_knn", type=float, default=None,
+                   help="Explicit weight on kNN novelty F (defaults to preset λ_f)")
+    p.add_argument("--lambda_dvar", type=float, default=None,
+                   help="Explicit weight on one-step disagreement D (defaults to preset λ_d)")
+    p.add_argument("--lambda_frontier", type=float, default=None,
+                   help="Explicit weight on replay-graph frontier bonus (defaults to preset value)")
     p.add_argument("--intrinsic_scale", type=float, default=0.25,
                    help="Global scale beta: imagination r += beta * r_int (sweep with λs for ~0.01–0.05 r_store_bonus)")
     p.add_argument(
@@ -1005,6 +1119,34 @@ def build_parser():
     p.add_argument("--intrinsic_normalize", action="store_true",
                    help="EMA-normalize F and D before mixing (makes lambda ratios "
                    "reflect effective weight regardless of raw magnitude)")
+    p.add_argument("--novelty_knn_k", type=int, default=10,
+                   help="k for kNN novelty in contrastive embedding memory")
+    p.add_argument("--novelty_clip_min", type=float, default=0.0,
+                   help="Lower clip for kNN novelty")
+    p.add_argument("--novelty_clip_max", type=float, default=5.0,
+                   help="Upper clip for kNN novelty")
+    p.add_argument("--novelty_use_density_count", action="store_true",
+                   help="Use 1/sqrt(count-in-radius) novelty variant")
+    p.add_argument("--novelty_density_radius", type=float, default=0.25,
+                   help="Radius for density-count novelty variant")
+    p.add_argument("--novelty_memory_refresh_interval", type=int, default=15000,
+                   help="Steps between replay-memory embedding refreshes; <=0 disables")
+    p.add_argument("--novelty_memory_refresh_samples", type=int, default=4096,
+                   help="How many replay states to re-embed on each memory refresh")
+    p.add_argument("--frontier_memory_size", type=int, default=50000,
+                   help="Max replay-graph nodes kept for frontier scoring")
+    p.add_argument("--frontier_knn_k", type=int, default=6,
+                   help="Optional kNN edges per new node in embedding space (0 disables)")
+    p.add_argument("--frontier_knn_threshold", type=float, default=0.6,
+                   help="Distance threshold for adding embedding-space kNN edges")
+    p.add_argument("--frontier_reliable_min_visits", type=int, default=2,
+                   help="Min node visits to be eligible as frontier")
+    p.add_argument("--frontier_top_quantile", type=float, default=80.0,
+                   help="Top quantile of frontier raw score to keep as frontier nodes")
+    p.add_argument("--frontier_tau", type=float, default=3.0,
+                   help="Tau in exp(-d_graph/tau) frontier reward")
+    p.add_argument("--frontier_disagreement_weight", type=float, default=0.5,
+                   help="Weight on one-step disagreement in frontier-node score")
 
     # Diagnostics
     p.add_argument("--diag_interval", type=int, default=40,
@@ -1035,18 +1177,28 @@ def main(args):
     set_seed(args.seed)
     device = get_device()
 
+    if args.intrinsic_ablation in ["knn_only", "dvar_only", "knn_dvar", "knn_dvar_frontier"] and args.geo_mode != "kstep":
+        raise ValueError("Geo intrinsic variants require --geo_mode kstep")
+
     use_intrinsic = args.intrinsic_ablation != "baseline"
-    int_lf, int_ld, int_lb = INTRINSIC_PRESETS[args.intrinsic_ablation]
+    int_lf, int_ld, int_lf_frontier = INTRINSIC_PRESETS[args.intrinsic_ablation]
+    lambda_knn = float(args.lambda_knn) if args.lambda_knn is not None else float(int_lf)
+    lambda_dvar = float(args.lambda_dvar) if args.lambda_dvar is not None else float(int_ld)
+    lambda_frontier = float(args.lambda_frontier) if args.lambda_frontier is not None else float(int_lf_frontier)
     intrinsic_beta = float(args.intrinsic_scale) if use_intrinsic else 0.0
-    use_geo_head = (args.geo_mode == "kstep") or (use_intrinsic and int_ld > 0)
-    use_geo_disagreement = use_intrinsic and int_ld > 0
+    use_geo_head = (args.geo_mode == "kstep") or (use_intrinsic and (lambda_dvar > 0 or lambda_knn > 0 or lambda_frontier > 0))
+    use_geo_disagreement = use_intrinsic and lambda_dvar > 0
 
     print(f"Device: {device} Geo mode: {args.geo_mode}")
     print(f"  K-step InfoNCE on GeoHead: {use_geo_head} (weight={args.kstep_weight})")
     if use_intrinsic:
         print(
-            f"  Intrinsic: {args.intrinsic_ablation}  λ_f={int_lf} λ_d={int_ld} λ_b={int_lb}  "
+            f"  Intrinsic: {args.intrinsic_ablation}  λ_f={int_lf} λ_d={int_ld} λ_frontier={int_lf_frontier}  "
             f"β_scale={args.intrinsic_scale}"
+        )
+        print(
+            f"  Intrinsic mix override: λ_knn={lambda_knn} λ_dvar={lambda_dvar} "
+            f"λ_frontier={lambda_frontier}"
         )
         print(
             f"  Intrinsic β schedule: β=0 until step {args.kstep_min_steps}, then β={args.intrinsic_scale} "
@@ -1166,29 +1318,12 @@ def main(args):
         ).to(device)
         geo_disag_trainable = [p for p in geo_disag.parameters() if p.requires_grad]
         geo_disag_opt = torch.optim.Adam(geo_disag_trainable, lr=args.disag_lr, eps=args.adam_eps)
-        geo_disag_kstep = GeoDisagreementEnsemble(
-            args.deter_dim,
-            args.stoch_dim,
-            args.geo_dim,
-            hidden_dim=args.disag_hidden_dim,
-            ensemble_size=args.disag_ensemble_size,
-            prior_scale=float(args.disag_prior_scale),
-            prior_hidden_dim=prior_h,
-        ).to(device)
-        geo_disag_kstep_trainable = [p for p in geo_disag_kstep.parameters() if p.requires_grad]
-        geo_disag_kstep_opt = torch.optim.Adam(geo_disag_kstep_trainable, lr=args.disag_lr, eps=args.adam_eps)
         if ckpt is not None and "geo_disag" in ckpt:
             inc = geo_disag.load_state_dict(ckpt["geo_disag"], strict=False)
             if inc.missing_keys:
                 print(f"    [geo_disag] checkpoint missing {len(inc.missing_keys)} keys (re-init those modules)")
             if inc.unexpected_keys:
                 print(f"    [geo_disag] checkpoint unexpected {len(inc.unexpected_keys)} keys (ignored)")
-        if ckpt is not None and "geo_disag_kstep" in ckpt:
-            inc_k = geo_disag_kstep.load_state_dict(ckpt["geo_disag_kstep"], strict=False)
-            if inc_k.missing_keys:
-                print(f"    [geo_disag_kstep] checkpoint missing {len(inc_k.missing_keys)} keys (re-init those modules)")
-            if inc_k.unexpected_keys:
-                print(f"    [geo_disag_kstep] checkpoint unexpected {len(inc_k.unexpected_keys)} keys (ignored)")
 
     world_params = (
         list(encoder.parameters()) + list(decoder.parameters())
@@ -1216,11 +1351,6 @@ def main(args):
     pos_geo_buffer: list[np.ndarray] = []
     GEO_BUFFER_MAX = 8000
 
-    int_visit_count: dict[int, int] = defaultdict(int)
-    int_bridge_edges: set[tuple[int, int]] = set()
-    if use_intrinsic and int_lb > 0:
-        int_bridge_edges = _oracle_bridge_edges(geodesic)
-        print(f"  Bridge topology: {len(int_bridge_edges)} bridge edges (oracle, edge-crossing only)")
     int_norm_F: _EMANormalizer | None = None
     int_norm_D: _EMANormalizer | None = None
     int_norm_D_kstep: _EMANormalizer | None = None
@@ -1228,6 +1358,13 @@ def main(args):
         int_norm_F = _EMANormalizer(alpha=0.01)
         int_norm_D = _EMANormalizer(alpha=0.01)
         int_norm_D_kstep = _EMANormalizer(alpha=0.01)
+
+    # E_replay over contrastive embeddings and explicit replay-graph state.
+    embed_memory: list[np.ndarray] = []
+    graph_adj: list[list[int]] = []
+    graph_visit_count: list[int] = []
+    graph_node_disag: list[float] = []
+    prev_graph_idx = -1
 
     total_steps = 0
     geo_head_frozen = False
@@ -1312,11 +1449,34 @@ def main(args):
             e0 = encoder(obs_t)
             h_state, s_state = rssm.get_init_state(e0)
 
-        ep_used_bridge_edges: set[tuple[int, int]] = set()
-        ep_sum_int = ep_sum_F = ep_sum_D = ep_sum_D_kstep = ep_sum_B = 0.0
+        ep_sum_int = ep_sum_F = ep_sum_D = ep_sum_D_kstep = 0.0
+        ep_sum_knn_novel = ep_sum_frontier = 0.0
+        prev_graph_idx = -1
 
         while not done:
             encoder.eval(); rssm.eval(); actor.eval()
+            if (
+                geo_head_ema is not None
+                and int(args.novelty_memory_refresh_interval) > 0
+                and total_steps > 0
+                and (total_steps % int(args.novelty_memory_refresh_interval) == 0)
+                and replay.size > 32
+            ):
+                refreshed = refresh_embed_memory_from_replay(
+                    replay=replay,
+                    encoder=encoder,
+                    rssm=rssm,
+                    geo_head_ema=geo_head_ema,
+                    device=device,
+                    bit_depth=args.bit_depth,
+                    target_size=min(int(args.frontier_memory_size), int(args.novelty_memory_refresh_samples)),
+                    batch_size=min(int(args.batch_size), 256),
+                )
+                embed_memory = refreshed
+                graph_adj = [[] for _ in range(len(embed_memory))]
+                graph_visit_count = [1 for _ in range(len(embed_memory))]
+                graph_node_disag = [0.0 for _ in range(len(embed_memory))]
+                prev_graph_idx = -1
             with torch.no_grad():
                 action_t, _ = actor.get_action(h_state, s_state, deterministic=False)
                 if expl_amount > 0:
@@ -1326,22 +1486,15 @@ def main(args):
 
             # --- Intrinsic: F (frontier) and D (disagreement) before env step ---
             Fv = Dv = Dv_kstep = 0.0
-            cell_pre = 0
-            if use_intrinsic:
-                cell_pre = int(_positions_to_cell_indices(
-                    geodesic, env.agent_pos.reshape(1, -1))[0])
+            knn_novelty = frontier_bonus = 0.0
             intrinsic_needs_geo_delay = geo_head is not None
             intrinsic_mix_ready = (not intrinsic_needs_geo_delay) or (
                 total_steps >= args.kstep_min_steps
             )
-            if use_intrinsic and intrinsic_mix_ready:
-                if int_lf > 0:
-                    vc = int_visit_count[cell_pre]
-                    Fv = 1.0 / math.sqrt(vc + 1.0)
-                    int_visit_count[cell_pre] = vc + 1
 
-                # D: ensemble disagreement over next-step geo prediction in g-space.
-                geo_ready = int_ld > 0 and geo_head is not None and geo_disag is not None
+            # D: ensemble disagreement over next-step geo prediction in g-space.
+            if use_intrinsic and intrinsic_mix_ready:
+                geo_ready = lambda_dvar > 0 and geo_head is not None and geo_disag is not None
                 if geo_ready:
                     with torch.no_grad():
                         preds = geo_disag(h_state, s_state)
@@ -1349,28 +1502,77 @@ def main(args):
                     ramp_denom = 10_000.0
                     d_ramp = min(1.0, (total_steps - args.kstep_min_steps) / ramp_denom)
                     Dv *= d_ramp
-                geo_kstep_ready = int_ld > 0 and geo_head is not None and geo_disag_kstep is not None
-                if geo_kstep_ready:
-                    with torch.no_grad():
-                        preds_k = geo_disag_kstep(h_state, s_state)
-                        Dv_kstep = float(geo_disag_kstep.disagreement(preds_k).squeeze(0).item())
-                    ramp_denom = 10_000.0
-                    d_ramp = min(1.0, (total_steps - args.kstep_min_steps) / ramp_denom)
-                    Dv_kstep *= d_ramp
+
+            # Keep embedding memory updated even before intrinsic reward turns on.
+            if use_intrinsic and geo_head_ema is not None:
+                with torch.no_grad():
+                    e_curr = geo_head_ema(h_state, s_state).squeeze(0).detach().cpu().numpy().astype(np.float32)
+                if intrinsic_mix_ready and len(embed_memory) > int(args.novelty_knn_k):
+                    knn_novelty = knn_novelty_from_memory(
+                        e_curr,
+                        embed_memory,
+                        k=args.novelty_knn_k,
+                        clip_min=args.novelty_clip_min,
+                        clip_max=args.novelty_clip_max,
+                        use_density_count=bool(args.novelty_use_density_count),
+                        density_radius=args.novelty_density_radius,
+                    )
+                    Fv = knn_novelty
+                else:
+                    knn_novelty = 0.0
+
+                if len(embed_memory) < int(args.frontier_memory_size):
+                    idx_new = len(embed_memory)
+                    embed_memory.append(e_curr.copy())
+                    graph_adj.append([])
+                    graph_visit_count.append(1)
+                    graph_node_disag.append(float(Dv))
+                    if prev_graph_idx >= 0 and prev_graph_idx < idx_new:
+                        graph_adj[prev_graph_idx].append(idx_new)
+                        graph_adj[idx_new].append(prev_graph_idx)
+                    if int(args.frontier_knn_k) > 0 and idx_new > 0:
+                        prev = np.asarray(embed_memory[:-1], dtype=np.float32)
+                        d_prev = np.linalg.norm(prev - e_curr.reshape(1, -1), axis=1)
+                        order = np.argsort(d_prev)[: int(args.frontier_knn_k)]
+                        for j in order.tolist():
+                            if float(d_prev[j]) <= float(args.frontier_knn_threshold):
+                                jj = int(j)
+                                graph_adj[idx_new].append(jj)
+                                graph_adj[jj].append(idx_new)
+                    if graph_adj[idx_new]:
+                        graph_adj[idx_new] = sorted(set(int(x) for x in graph_adj[idx_new]))
+                    for nb in graph_adj[idx_new]:
+                        graph_adj[int(nb)] = sorted(set(int(x) for x in graph_adj[int(nb)]))
+                    prev_graph_idx = idx_new
+                elif embed_memory:
+                    mem = np.asarray(embed_memory, dtype=np.float32)
+                    j = int(np.argmin(np.linalg.norm(mem - e_curr.reshape(1, -1), axis=1)))
+                    graph_visit_count[j] += 1
+                    graph_node_disag[j] = 0.9 * graph_node_disag[j] + 0.1 * float(Dv)
+                    if prev_graph_idx >= 0 and prev_graph_idx != j:
+                        graph_adj[prev_graph_idx].append(j)
+                        graph_adj[j].append(prev_graph_idx)
+                        graph_adj[prev_graph_idx] = sorted(set(int(x) for x in graph_adj[prev_graph_idx]))
+                        graph_adj[j] = sorted(set(int(x) for x in graph_adj[j]))
+                    prev_graph_idx = j
+
+                if intrinsic_mix_ready:
+                    frontier_nodes = _graph_frontier_nodes(
+                        graph_adj,
+                        graph_visit_count,
+                        graph_node_disag,
+                        reliable_min_visits=args.frontier_reliable_min_visits,
+                        top_quantile=args.frontier_top_quantile,
+                        disagreement_weight=args.frontier_disagreement_weight,
+                    )
+                    d_graph = _graph_distance_to_frontier(graph_adj, prev_graph_idx, frontier_nodes)
+                    tau = max(float(args.frontier_tau), 1e-6)
+                    frontier_bonus = 0.0 if not np.isfinite(d_graph) else float(np.exp(-d_graph / tau))
+                else:
+                    frontier_bonus = 0.0
 
             next_obs, r, term, trunc, step_info = env.step(action, repeat=action_repeat)
             done = bool(term or trunc)
-
-            # --- Intrinsic: B (bridge edge crossing) after env step ---
-            Bv = 0.0
-            if use_intrinsic and int_lb > 0:
-                cell_post = int(_positions_to_cell_indices(
-                    geodesic, env.agent_pos.reshape(1, -1))[0])
-                if cell_pre != cell_post:
-                    edge = (min(cell_pre, cell_post), max(cell_pre, cell_post))
-                    if edge in int_bridge_edges and edge not in ep_used_bridge_edges:
-                        Bv = 1.0
-                        ep_used_bridge_edges.add(edge)
 
             # Optional EMA normalization before mixing
             Fv_mix, Dv_mix, Dv_kstep_mix = Fv, Dv, Dv_kstep
@@ -1381,16 +1583,24 @@ def main(args):
             if int_norm_D_kstep is not None and Dv_kstep != 0.0:
                 Dv_kstep_mix = max(0.0, int_norm_D_kstep.normalize(Dv_kstep))
 
-            d_for_reward = Dv_kstep_mix if args.disag_reward_source == "kstep" else Dv_mix
-            r_int = int_lf * Fv_mix + int_ld * d_for_reward + int_lb * Bv
+            # Keep disagreement term as one-step prediction-error variance.
+            d_for_reward = Dv_mix
+            r_int = (
+                lambda_knn * Fv_mix
+                + lambda_dvar * d_for_reward
+                + lambda_frontier * frontier_bonus
+            )
             #r_store = float(r) + intrinsic_beta * r_int
             ep_sum_int += r_int
             ep_sum_F += Fv
             ep_sum_D += Dv
             ep_sum_D_kstep += Dv_kstep
-            ep_sum_B += Bv
+            ep_sum_knn_novel += knn_novelty
+            ep_sum_frontier += frontier_bonus
 
             writer.add_scalar("intrinsic/component_D_var_ens_kstep_norm", Dv_kstep_mix, total_steps)
+            writer.add_scalar("intrinsic/component_knn_novelty", knn_novelty, total_steps)
+            writer.add_scalar("intrinsic/component_replay_frontier", frontier_bonus, total_steps)
 
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
@@ -1686,8 +1896,9 @@ def main(args):
                         pcont_imag = torch.sigmoid(cont_logits_imag).clamp(0.0, 1.0)
                         discounts_imag = effective_gamma * pcont_imag
 
+                        r_knn_imag = torch.zeros_like(rewards_imag)
                         with torch.no_grad():
-                            if geo_head is not None and geo_disag is not None and int_ld > 0:
+                            if geo_head is not None and geo_disag is not None and lambda_dvar > 0:
                                 preds_imag = geo_disag(
                                     h_imag[:, :-1].reshape(-1, Dh),
                                     s_imag[:, :-1].reshape(-1, Ds),
@@ -1705,18 +1916,43 @@ def main(args):
                                     em_s = max(disag_imag_ema_std, 1e-6)
                                     #z = (disag_imag - em_m) / (em_s + 1e-6)
                                     #z = (disag_imag - em_m) / max(em_s, 0.05)
-                                    #r_int_imag = int_ld * torch.clamp(z, 0.0, float(args.disag_reward_clip))
                                     z = torch.clamp(disag_imag - em_m, 0.0)
-                                    r_int_imag = int_ld * torch.clamp(z, 0.0, float(args.disag_reward_clip))    
+                                    r_dvar_imag = torch.clamp(z, 0.0, float(args.disag_reward_clip))
                                     a_ema = float(args.disag_imag_ema_alpha)
                                     disag_imag_ema_mean = (1.0 - a_ema) * disag_imag_ema_mean + a_ema * bm
                                     disag_imag_ema_std = (1.0 - a_ema) * disag_imag_ema_std + a_ema * max(bs, 1e-6)
                                 else:
-                                    r_int_imag = int_ld * torch.clamp(
+                                    r_dvar_imag = torch.clamp(
                                         disag_imag, 0.0, float(args.disag_reward_clip)
                                     )
                             else:
-                                r_int_imag = torch.zeros_like(rewards_imag)
+                                r_dvar_imag = torch.zeros_like(rewards_imag)
+
+                            if (
+                                geo_head_ema is not None
+                                and lambda_knn > 0
+                                and len(embed_memory) > int(args.novelty_knn_k)
+                            ):
+                                g_imag = geo_head_ema(
+                                    h_imag[:, 1:].reshape(-1, Dh),
+                                    s_imag[:, 1:].reshape(-1, Ds),
+                                )
+                                mem = torch.tensor(
+                                    np.asarray(embed_memory, dtype=np.float32),
+                                    device=device,
+                                    dtype=g_imag.dtype,
+                                )
+                                d = torch.cdist(g_imag, mem)
+                                k = min(int(args.novelty_knn_k), int(mem.size(0)))
+                                kth = torch.topk(d, k=k, dim=1, largest=False).values[:, -1]
+                                kth = torch.clamp(
+                                    kth,
+                                    float(args.novelty_clip_min),
+                                    float(args.novelty_clip_max),
+                                )
+                                r_knn_imag = kth.reshape(h_imag.size(0), -1)
+
+                            r_int_imag = lambda_knn * r_knn_imag + lambda_dvar * r_dvar_imag
 
                         rewards_total = rewards_imag + intrinsic_beta * r_int_imag
                         sum_imag_r += float(rewards_total.mean().item())
@@ -1826,12 +2062,13 @@ def main(args):
             writer.add_scalar("intrinsic/F_mean", ep_sum_F / ep_steps, total_steps)
             writer.add_scalar("intrinsic/D_mean", ep_sum_D / ep_steps, total_steps)
             writer.add_scalar("intrinsic/D_kstep_mean", ep_sum_D_kstep / ep_steps, total_steps)
-            writer.add_scalar("intrinsic/B_mean", ep_sum_B / ep_steps, total_steps)
+            writer.add_scalar("intrinsic/knn_novelty_mean", ep_sum_knn_novel / ep_steps, total_steps)
+            writer.add_scalar("intrinsic/replay_frontier_mean", ep_sum_frontier / ep_steps, total_steps)
             writer.add_scalar("intrinsic/r_store_bonus", intrinsic_beta * ep_sum_int / ep_steps, total_steps)
             writer.add_scalar("intrinsic/beta", intrinsic_beta, total_steps)
             writer.add_scalar(
                 "intrinsic/disag_reward_source_is_kstep",
-                1.0 if args.disag_reward_source == "kstep" else 0.0,
+                0.0,
                 total_steps,
             )
             writer.add_scalar(
@@ -1844,8 +2081,9 @@ def main(args):
         if use_intrinsic and ep_steps > 0:
             int_str = (
                 f"  r_int={ep_sum_int/ep_steps:.4f}(F={ep_sum_F/ep_steps:.3f} "
-                f"D={ep_sum_D/ep_steps:.3f} Dk={ep_sum_D_kstep/ep_steps:.3f} B={ep_sum_B/ep_steps:.3f}; "
-                f"Dsrc={args.disag_reward_source})"
+                f"D={ep_sum_D/ep_steps:.3f} Dk={ep_sum_D_kstep/ep_steps:.3f} "
+                f"N={ep_sum_knn_novel/ep_steps:.3f} Fr={ep_sum_frontier/ep_steps:.3f} "
+                f"Dsrc=one_step)"
             )
         print(f"  Ep {episode+1}/{args.max_episodes}  ret={ep_ret:.2f}  steps={ep_steps}  "
               f"cells={len(ep_cells)}  total={total_steps}  success={ep_success}{int_str}")
