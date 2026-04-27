@@ -974,6 +974,8 @@ def build_parser():
     p.add_argument("--imagination_horizon", type=int, default=15)
     p.add_argument("--imagination_starts", type=int, default=8)
     p.add_argument("--expl_amount", type=float, default=0.3)
+    p.add_argument("--expl_novelty_gain", type=float, default=0.0,
+                   help="Scale exploration noise by (1 + gain * r_int) at each env step")
     p.add_argument("--expl_decay", type=float, default=0.0)
     p.add_argument("--expl_min", type=float, default=0.0)
     p.add_argument("--actor_entropy_scale", type=float, default=1e-3)
@@ -1479,10 +1481,6 @@ def main(args):
                 prev_graph_idx = -1
             with torch.no_grad():
                 action_t, _ = actor.get_action(h_state, s_state, deterministic=False)
-                if expl_amount > 0:
-                    action_t = action_t + expl_amount * torch.randn_like(action_t)
-                    action_t = torch.clamp(action_t, -1.0, 1.0)
-                action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
 
             # --- Intrinsic: F (frontier) and D (disagreement) before env step ---
             Fv = Dv = Dv_kstep = 0.0
@@ -1590,6 +1588,14 @@ def main(args):
                 + lambda_dvar * d_for_reward
                 + lambda_frontier * frontier_bonus
             )
+
+            local_noise = float(expl_amount)
+            if expl_amount > 0:
+                local_noise = float(expl_amount) * (1.0 + float(args.expl_novelty_gain) * float(r_int))
+                local_noise = max(0.0, local_noise)
+                action_t = action_t + local_noise * torch.randn_like(action_t)
+                action_t = torch.clamp(action_t, -1.0, 1.0)
+            action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
             #r_store = float(r) + intrinsic_beta * r_int
             ep_sum_int += r_int
             ep_sum_F += Fv
@@ -1601,11 +1607,15 @@ def main(args):
             writer.add_scalar("intrinsic/component_D_var_ens_kstep_norm", Dv_kstep_mix, total_steps)
             writer.add_scalar("intrinsic/component_knn_novelty", knn_novelty, total_steps)
             writer.add_scalar("intrinsic/component_replay_frontier", frontier_bonus, total_steps)
+            writer.add_scalar("train/exploration_noise_local", local_noise, total_steps)
 
+            # train value model with combined reward so we dont get ood in imagination
+            #r_combined = r + intrinsic_beta * r_int
+            r_combined = float(r)
             replay.add(
                 obs=np.ascontiguousarray(obs, np.uint8),
                 action=action,
-                reward=float(r),
+                reward=r_combined,
                 next_obs=np.ascontiguousarray(next_obs, np.uint8),
                 done=done,
             )
@@ -1928,10 +1938,12 @@ def main(args):
                             else:
                                 r_dvar_imag = torch.zeros_like(rewards_imag)
 
+                            use_knn_in_imag = False
                             if (
                                 geo_head_ema is not None
                                 and lambda_knn > 0
                                 and len(embed_memory) > int(args.novelty_knn_k)
+                                and use_knn_in_imag
                             ):
                                 g_imag = geo_head_ema(
                                     h_imag[:, 1:].reshape(-1, Dh),
