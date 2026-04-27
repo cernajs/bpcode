@@ -752,6 +752,41 @@ def _bridge_crossing_count(geodesic, pos_seq):
     return n_cross
 
 
+def _visit_entropy(cells_seq: np.ndarray) -> float:
+    if cells_seq.size == 0:
+        return 0.0
+    _, cnt = np.unique(cells_seq.astype(np.int64), return_counts=True)
+    p = cnt.astype(np.float64) / max(float(cnt.sum()), 1.0)
+    h = -float(np.sum(p * np.log(p + 1e-12)))
+    h_max = math.log(max(len(cnt), 2))
+    return float(h / h_max) if h_max > 0 else 0.0
+
+
+def _outward_visit_corr(geodesic, start_cell: int, cells_seq: np.ndarray) -> float:
+    if cells_seq.size == 0:
+        return 0.0
+    uc, cnt = np.unique(cells_seq.astype(np.int64), return_counts=True)
+    d = np.asarray([float(geodesic.dist_matrix[int(start_cell), int(c)]) for c in uc], dtype=np.float64)
+    mask = np.isfinite(d)
+    if int(mask.sum()) < 3:
+        return 0.0
+    x = cnt[mask].astype(np.float64)
+    y = d[mask]
+    if float(np.std(x)) < 1e-8 or float(np.std(y)) < 1e-8:
+        return 0.0
+    r = float(np.corrcoef(x, y)[0, 1])
+    return 0.0 if not np.isfinite(r) else r
+
+
+def _distant_cells_from_start(geodesic, start_cell: int, quantile: float = 80.0) -> set[int]:
+    d = np.asarray(geodesic.dist_matrix[int(start_cell)], dtype=np.float64)
+    mask = np.isfinite(d) & (d > 0)
+    if int(mask.sum()) < 4:
+        return set()
+    thr = float(np.percentile(d[mask], float(quantile)))
+    return set(np.where(mask & (d >= thr))[0].astype(np.int64).tolist())
+
+
 # =====================================================================
 # Intrinsic reward helpers (mirrored from evaluator)
 # =====================================================================
@@ -953,6 +988,7 @@ def _oracle_bridge_edges(geodesic) -> set[tuple[int, int]]:
 def run_periodic_eval(env, encoder, rssm, actor, device, bit_depth, n_episodes, geodesic, action_repeat):
     encoder.eval(); rssm.eval(); actor.eval()
     rets, lens, uniques, bridges, successes = [], [], [], [], []
+    t_first_distant, reach_distant, visit_entropy, bridge_freq, outward_corr = [], [], [], [], []
     for _ in range(n_episodes):
         obs, _ = env.reset()
         done = False
@@ -961,6 +997,8 @@ def run_periodic_eval(env, encoder, rssm, actor, device, bit_depth, n_episodes, 
         cells = set()
         pos_traj = []
         c0 = int(_positions_to_cell_indices(geodesic, env.agent_pos.reshape(1, -1))[0])
+        far_cells = _distant_cells_from_start(geodesic, c0, quantile=80.0)
+        first_far_step = None
         cells.add(c0)
         pos_traj.append(env.agent_pos.copy())
 
@@ -979,6 +1017,8 @@ def run_periodic_eval(env, encoder, rssm, actor, device, bit_depth, n_episodes, 
             if info.get("success", False) or info.get("is_success", False):
                 ep_success = True
             c = int(_positions_to_cell_indices(geodesic, env.agent_pos.reshape(1, -1))[0])
+            if first_far_step is None and c in far_cells:
+                first_far_step = ep_steps
             cells.add(c)
             pos_traj.append(env.agent_pos.copy())
             obs_t = torch.tensor(np.ascontiguousarray(next_obs), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
@@ -991,12 +1031,24 @@ def run_periodic_eval(env, encoder, rssm, actor, device, bit_depth, n_episodes, 
         lens.append(ep_steps)
         uniques.append(float(len(cells)))
         successes.append(1.0 if ep_success else 0.0)
-        bridges.append(float(_bridge_crossing_count(geodesic, np.stack(pos_traj))) if len(pos_traj) >= 2 else 0.0)
+        bcnt = float(_bridge_crossing_count(geodesic, np.stack(pos_traj))) if len(pos_traj) >= 2 else 0.0
+        bridges.append(bcnt)
+        bridge_freq.append(float(bcnt / max(ep_steps, 1)))
+        cells_seq = _positions_to_cell_indices(geodesic, np.stack(pos_traj)).astype(np.int64) if len(pos_traj) else np.zeros((0,), dtype=np.int64)
+        visit_entropy.append(_visit_entropy(cells_seq))
+        outward_corr.append(_outward_visit_corr(geodesic, c0, cells_seq))
+        t_first_distant.append(float(first_far_step if first_far_step is not None else (ep_steps + 1)))
+        reach_distant.append(1.0 if first_far_step is not None else 0.0)
 
     return {
         "return_mean": float(np.mean(rets)), "return_std": float(np.std(rets)),
         "length_mean": float(np.mean(lens)), "unique_cells_mean": float(np.mean(uniques)),
         "bridge_crossings_mean": float(np.mean(bridges)), "success_rate": float(np.mean(successes)),
+        "time_to_first_distant_cell_mean": float(np.mean(t_first_distant)),
+        "distant_cell_reach_rate": float(np.mean(reach_distant)),
+        "visit_entropy_mean": float(np.mean(visit_entropy)),
+        "bridge_traversal_freq_mean": float(np.mean(bridge_freq)),
+        "outward_visit_corr_mean": float(np.mean(outward_corr)),
     }
 
 
@@ -2166,9 +2218,31 @@ def main(args):
         writer.add_scalar("train/episode_success", 1.0 if ep_success else 0.0, episode)
         writer.add_scalar("train/success_rate", float(cumulative_successes) / float(episode + 1), episode)
         writer.add_scalar("eval/unique_cells_episode", float(len(ep_cells)), episode)
+        cells_seq_ep = _positions_to_cell_indices(geodesic, np.stack(ep_pos_traj)).astype(np.int64) if len(ep_pos_traj) else np.zeros((0,), dtype=np.int64)
+        far_cells_ep = _distant_cells_from_start(geodesic, c0, quantile=80.0)
+        first_far_ep = None
+        for t_ep, c_ep in enumerate(cells_seq_ep.tolist()):
+            if int(c_ep) in far_cells_ep:
+                first_far_ep = t_ep
+                break
+        visit_entropy_ep = _visit_entropy(cells_seq_ep)
+        outward_corr_ep = _outward_visit_corr(geodesic, c0, cells_seq_ep)
+        writer.add_scalar(
+            "eval/time_to_first_distant_cell_episode",
+            float(first_far_ep if first_far_ep is not None else (ep_steps + 1)),
+            episode,
+        )
+        writer.add_scalar(
+            "eval/distant_cell_reach_episode",
+            1.0 if first_far_ep is not None else 0.0,
+            episode,
+        )
+        writer.add_scalar("eval/visit_entropy_episode", float(visit_entropy_ep), episode)
+        writer.add_scalar("eval/outward_visit_corr_episode", float(outward_corr_ep), episode)
         if len(ep_pos_traj) >= 2:
-            writer.add_scalar("eval/bridge_crossings_episode",
-                              float(_bridge_crossing_count(geodesic, np.stack(ep_pos_traj))), episode)
+            bridge_ep = float(_bridge_crossing_count(geodesic, np.stack(ep_pos_traj)))
+            writer.add_scalar("eval/bridge_crossings_episode", bridge_ep, episode)
+            writer.add_scalar("eval/bridge_traversal_freq_episode", bridge_ep / max(ep_steps, 1), episode)
 
         if use_intrinsic and ep_steps > 0:
             writer.add_scalar("intrinsic/r_int_mean", ep_sum_int / ep_steps, total_steps)
@@ -2256,6 +2330,9 @@ def main(args):
                 writer.add_scalar(f"eval/{k}", v, total_steps)
             print(f"    [eval] ret={ev['return_mean']:.2f}±{ev['return_std']:.2f}  "
                   f"cells={ev['unique_cells_mean']:.1f}  bridges={ev['bridge_crossings_mean']:.1f}  "
+                  f"H={ev['visit_entropy_mean']:.3f}  "
+                  f"t_far={ev['time_to_first_distant_cell_mean']:.1f}  "
+                  f"out_corr={ev['outward_visit_corr_mean']:.3f}  "
                   f"success={ev['success_rate']:.2f}")
 
         # ---- Save checkpoint ----
