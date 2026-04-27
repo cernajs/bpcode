@@ -391,6 +391,67 @@ def refresh_embed_memory_from_replay(
     return out[:n_target]
 
 
+def sample_sequences_with_priority(
+    replay: ReplayBuffer,
+    priorities: np.ndarray,
+    *,
+    batch_size: int,
+    seq_len: int,
+    alpha: float,
+    beta_is: float,
+    candidate_multiplier: int,
+) -> tuple[ReplayBuffer.Batch, np.ndarray]:
+    """Crude PER-style sequence sampler over replay start indices."""
+    if replay.size <= seq_len + 1:
+        batch = replay.sample_sequences(batch_size, seq_len)
+        return batch, np.ones((batch_size,), dtype=np.float32)
+
+    n_cand = max(int(batch_size) * max(int(candidate_multiplier), 2), int(batch_size) * 8)
+    candidates = np.random.randint(0, replay.size - seq_len, size=n_cand)
+    if replay.full:
+        wrap_mask = (candidates < replay.idx) & (replay.idx < candidates + seq_len)
+        candidates = candidates[~wrap_mask]
+
+    valid: list[int] = []
+    for start in candidates.tolist():
+        end = int(start) + int(seq_len)
+        if np.any(replay.dones[int(start) : end - 1]):
+            continue
+        valid.append(int(start))
+        if len(valid) >= max(batch_size * 4, batch_size):
+            break
+    if not valid:
+        batch = replay.sample_sequences(batch_size, seq_len)
+        return batch, np.ones((batch_size,), dtype=np.float32)
+
+    v = np.asarray(valid, dtype=np.int64)
+    p = np.maximum(priorities[v], 1e-8).astype(np.float64)
+    p = np.power(p, max(float(alpha), 0.0))
+    den = float(p.sum())
+    if not np.isfinite(den) or den <= 0:
+        prob = np.ones_like(p, dtype=np.float64) / float(len(p))
+    else:
+        prob = p / den
+
+    chosen_local = np.random.choice(len(v), size=int(batch_size), replace=True, p=prob)
+    starts = v[chosen_local]
+
+    seq_idx = starts[:, None] + np.arange(seq_len)[None, :]
+    batch = ReplayBuffer.Batch(
+        replay.obs[seq_idx],
+        replay.actions[seq_idx],
+        replay.rews[seq_idx],
+        replay.dones[seq_idx],
+    )
+
+    # Importance weights: w_i = (N * P_i)^(-beta), normalized by max.
+    p_i = prob[chosen_local]
+    n_eff = max(len(v), 1)
+    w = np.power(n_eff * np.maximum(p_i, 1e-12), -max(float(beta_is), 0.0)).astype(np.float32)
+    w /= max(float(np.max(w)), 1e-8)
+    return batch, w
+
+
 def _graph_frontier_nodes(
     adj: list[list[int]],
     visit_count: list[int],
@@ -1149,6 +1210,16 @@ def build_parser():
                    help="Tau in exp(-d_graph/tau) frontier reward")
     p.add_argument("--frontier_disagreement_weight", type=float, default=0.5,
                    help="Weight on one-step disagreement in frontier-node score")
+    p.add_argument("--prioritized_replay_enable", action="store_true",
+                   help="Use novelty-prioritized replay sampling for training sequences")
+    p.add_argument("--prioritized_replay_alpha", type=float, default=0.6,
+                   help="Priority exponent alpha in p_i=(beta*r_int+eps)^alpha")
+    p.add_argument("--prioritized_replay_beta_is", type=float, default=0.4,
+                   help="Importance-sampling exponent beta for PER correction")
+    p.add_argument("--prioritized_replay_eps", type=float, default=1e-4,
+                   help="Epsilon floor in priority p_i=(beta*r_int+eps)^alpha")
+    p.add_argument("--prioritized_replay_candidate_multiplier", type=int, default=32,
+                   help="Number of candidate starts = multiplier * batch_size before weighted resampling")
 
     # Diagnostics
     p.add_argument("--diag_interval", type=int, default=40,
@@ -1337,6 +1408,7 @@ def main(args):
     value_opt = torch.optim.Adam(value_model.parameters(), lr=args.value_lr, eps=args.adam_eps)
 
     replay = ReplayBuffer(args.replay_capacity, obs_shape=(H, W, C), act_dim=act_dim)
+    replay_priority = np.ones((args.replay_capacity,), dtype=np.float32)
     free_nats = torch.ones(1, device=device) * args.kl_free_nats
 
     tag = f"{args.geo_mode}_seed{args.seed}"
@@ -1591,7 +1663,8 @@ def main(args):
 
             local_noise = float(expl_amount)
             if expl_amount > 0:
-                local_noise = float(expl_amount) * (1.0 + float(args.expl_novelty_gain) * float(r_int))
+                nov = float(knn_novelty)
+                local_noise = float(expl_amount) * (1.0 + float(args.expl_novelty_gain) * nov)
                 local_noise = max(0.0, local_noise)
                 action_t = action_t + local_noise * torch.randn_like(action_t)
                 action_t = torch.clamp(action_t, -1.0, 1.0)
@@ -1619,6 +1692,9 @@ def main(args):
                 next_obs=np.ascontiguousarray(next_obs, np.uint8),
                 done=done,
             )
+            idx_added = (replay.idx - 1) % replay.capacity
+            pri = float(knn_novelty) + float(args.prioritized_replay_eps)
+            replay_priority[idx_added] = max(pri, args.prioritized_replay_eps) ** max(args.prioritized_replay_alpha, 0.0)
             obs = next_obs
             ep_ret += float(r)
             ep_steps += 1
@@ -1689,13 +1765,27 @@ def main(args):
                 sum_disag_kstep_kmean = 0.0
                 sum_geo_ema_absdiff = 0.0
                 kstep_info_accum: dict[str, float] = {}
+                sum_replay_is_w = 0.0
 
                 for _ in range(args.train_steps):
-                    batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
+                    if bool(args.prioritized_replay_enable):
+                        batch, is_w_np = sample_sequences_with_priority(
+                            replay,
+                            replay_priority,
+                            batch_size=args.batch_size,
+                            seq_len=args.seq_len + 1,
+                            alpha=args.prioritized_replay_alpha,
+                            beta_is=args.prioritized_replay_beta_is,
+                            candidate_multiplier=args.prioritized_replay_candidate_multiplier,
+                        )
+                    else:
+                        batch = replay.sample_sequences(args.batch_size, args.seq_len + 1)
+                        is_w_np = np.ones((args.batch_size,), dtype=np.float32)
                     obs_seq = torch.tensor(batch.obs, dtype=torch.float32, device=device)
                     act_seq = torch.tensor(batch.actions, dtype=torch.float32, device=device)
                     rew_seq = torch.tensor(batch.rews, dtype=torch.float32, device=device)
                     done_seq = torch.tensor(batch.dones, dtype=torch.float32, device=device)
+                    is_w = torch.tensor(is_w_np, dtype=torch.float32, device=device)
 
                     B, T1 = rew_seq.shape
                     T = T1 - 1
@@ -1729,13 +1819,21 @@ def main(args):
 
                     recon = bottle(decoder, h_seq, s_seq)
                     target = x[:, 1:T + 1]
-                    rec_loss = F.mse_loss(recon, target, reduction="none").sum((2, 3, 4)).mean()
-                    kld = torch.max(kl_divergence(post_dist, prior_dist).sum(-1), free_nats).mean()
+                    rec_bt = F.mse_loss(recon, target, reduction="none").sum((2, 3, 4))
+                    rec_b = rec_bt.mean(dim=1)
+                    rec_loss = (rec_b * is_w).sum() / (is_w.sum() + 1e-8)
+                    kld_tb = torch.max(kl_divergence(post_dist, prior_dist).sum(-1), free_nats)
+                    kld_b = kld_tb.transpose(0, 1).mean(dim=1)
+                    kld = (kld_b * is_w).sum() / (is_w.sum() + 1e-8)
                     rew_pred = bottle(reward_model, h_seq, s_seq)
-                    rew_loss = F.mse_loss(rew_pred, rew_seq[:, :T])
+                    rew_bt = F.mse_loss(rew_pred, rew_seq[:, :T], reduction="none")
+                    rew_b = rew_bt.mean(dim=1)
+                    rew_loss = (rew_b * is_w).sum() / (is_w.sum() + 1e-8)
                     cont_logits = bottle(cont_model, h_seq, s_seq)
                     cont_target = (1.0 - done_seq[:, :T]).clamp(0.0, 1.0)
-                    cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
+                    cont_bt = F.binary_cross_entropy_with_logits(cont_logits, cont_target, reduction="none")
+                    cont_b = cont_bt.mean(dim=1)
+                    cont_loss = (cont_b * is_w).sum() / (is_w.sum() + 1e-8)
 
                     model_loss = rec_loss + args.kl_weight * kld + rew_loss + cont_loss
 
@@ -1876,6 +1974,7 @@ def main(args):
                     sum_kstep_kmax += k_curriculum_kmax
                     sum_disag_loss += float(disag_loss.item())
                     sum_disag_kstep_loss += float(disag_kstep_loss.item())
+                    sum_replay_is_w += float(is_w.mean().item())
 
                     # ---- Actor-critic (imagination) ----
                     B_seq, T_seq = h_seq.shape[0], h_seq.shape[1]
@@ -2050,6 +2149,8 @@ def main(args):
                     writer.add_scalar("loss/disag_pred_kstep", sum_disag_kstep_loss / n_ts, total_steps)
                     writer.add_scalar("intrinsic/disag_kstep_pairs", sum_disag_kstep_pairs / n_ts, total_steps)
                     writer.add_scalar("intrinsic/disag_kstep_kmean", sum_disag_kstep_kmean / n_ts, total_steps)
+                if bool(args.prioritized_replay_enable):
+                    writer.add_scalar("replay/is_weight_mean", sum_replay_is_w / n_ts, total_steps)
 
         if args.expl_decay > 0:
             expl_amount = max(args.expl_min, expl_amount - args.expl_decay)
