@@ -1693,9 +1693,6 @@ def main(args):
                 else:
                     frontier_bonus = 0.0
 
-            next_obs, r, term, trunc, step_info = env.step(action, repeat=action_repeat)
-            done = bool(term or trunc)
-
             # Optional EMA normalization before mixing
             Fv_mix, Dv_mix, Dv_kstep_mix = Fv, Dv, Dv_kstep
             if int_norm_F is not None and Fv != 0.0:
@@ -1721,6 +1718,9 @@ def main(args):
                 action_t = action_t + local_noise * torch.randn_like(action_t)
                 action_t = torch.clamp(action_t, -1.0, 1.0)
             action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
+
+            next_obs, r, term, trunc, step_info = env.step(action, repeat=action_repeat)
+            done = bool(term or trunc)
             #r_store = float(r) + intrinsic_beta * r_int
             ep_sum_int += r_int
             ep_sum_F += Fv
